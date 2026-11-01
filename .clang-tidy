@@ -1,0 +1,21 @@
+Checks: '-*,readability-identifier-naming'
+WarningsAsErrors: 'readability-identifier-naming'
+HeaderFilterRegex: '.*PeVmProtector[/\\]src[/\\].*'
+CheckOptions:
+  readability-identifier-naming.FunctionCase: CamelCase
+  readability-identifier-naming.MethodCase: CamelCase
+  readability-identifier-naming.VariableCase: CamelCase
+  readability-identifier-naming.LocalVariableCase: CamelCase
+  readability-identifier-naming.ParameterCase: CamelCase
+  readability-identifier-naming.MemberCase: CamelCase
+  readability-identifier-naming.PrivateMemberCase: CamelCase
+  readability-identifier-naming.ProtectedMemberCase: CamelCase
+  readability-identifier-naming.PublicMemberCase: CamelCase
+  readability-identifier-naming.GlobalVariableCase: CamelCase
+  readability-identifier-naming.StaticVariableCase: CamelCase
+  readability-identifier-naming.ConstantCase: CamelCase
+  readability-identifier-naming.LocalConstantCase: CamelCase
+  readability-identifier-naming.GlobalConstantCase: CamelCase
+  readability-identifier-naming.StaticConstantCase: CamelCase
+  readability-identifier-naming.ConstexprVariableCase: CamelCase
+  readability-identifier-naming.EnumConstantCase: CamelCase

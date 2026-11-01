@@ -1,0 +1,18 @@
+# Build output
+bin/
+obj/
+out/
+
+# Visual Studio / MSBuild user state
+.vs/
+*.user
+*.suo
+
+# Local tool state
+.mimosa/
+
+# Temporary artifacts
+*.tmp
+*.payload.tmp
+*.loader-error.txt
+*.vmbridge-hit

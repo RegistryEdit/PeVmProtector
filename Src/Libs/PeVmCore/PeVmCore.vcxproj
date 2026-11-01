@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{F1E3C5A7-2B4D-4E69-8C0A-5D7E9F1A3B05}</ProjectGuid>
+    <RootNamespace>PeVmCore</RootNamespace>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ItemGroup>
+    <ClCompile Include="..\Container\PeVmContainer.cpp" />
+    <ClCompile Include="..\Crypto\PeVmCrypto.cpp" />
+    <ClCompile Include="..\Lifter\X64Lifter.cpp" />
+    <ClCompile Include="..\Vm\VmProtect.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Container\PeVmContainer.h" />
+    <ClInclude Include="..\Container\WrapperFormat.h" />
+    <ClInclude Include="..\Crypto\PeVmCrypto.h" />
+    <ClInclude Include="..\License\PeVmLicense.h" />
+    <ClInclude Include="..\Lifter\X64Lifter.h" />
+    <ClInclude Include="..\Vm\VmProtect.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

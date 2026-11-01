@@ -1,0 +1,1238 @@
+#include "VmProtect.h"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace vmprotect {
+namespace {
+
+using Bytes = std::vector<std::uint8_t>;
+
+enum class Op : std::uint8_t {
+    MovI, Mov, Add, AddI, Sub, SubI, Adc, Sbb, Mul, MulI, Xor, And, Or, AndI, Neg, Not, Bswap, Test,
+    ShlI, ShrI, ShlR, ShrR, SarI, SarR, RolI, RorI, RolR, RorR,
+    Cmp, Jmp, Jz, Jnz,
+    Ja, Jae, Jb, Jbe, Js, Jns, Jl, Jge, Jle, Jg, Jo, Jno, Jp, Jnp,
+    Push, Pop, Call, Ret, Load64, Load64D, Store64, Store64D, Nop, Halt,
+    Count
+};
+
+constexpr std::size_t KOpCount = static_cast<std::size_t>(Op::Count);
+using OpMap = std::array<std::uint8_t, KOpCount>;
+using RegisterMap = std::array<std::uint8_t, 16>;
+
+// The register file holds the 16 x64 registers plus 8 physical scratch
+// registers (indices 16..23). Scratch registers back synthetic lifter IR
+// (address computation, read-modify-write memory ops); they are never
+// permuted and never part of the native bridge.
+constexpr std::size_t KRegisterCount = 24;
+constexpr std::uint8_t KScratchBase = 16;
+
+// Each op with multiple handler implementations owns one variant slot. The
+// mapping is centralized so enum reordering cannot silently reshuffle which
+// variant executes.
+constexpr std::size_t KVariantSlots = 10;
+constexpr std::uint8_t KNoVariant = 0xFF;
+
+std::uint8_t VariantSlot(Op Operation) {
+    switch (Operation) {
+    case Op::Add: return 0; case Op::AddI: return 1;
+    case Op::Sub: return 2; case Op::SubI: return 3;
+    case Op::Xor: return 4; case Op::Mul: return 5;
+    case Op::And: return 6; case Op::Or: return 7;
+    case Op::Cmp: return 8; case Op::Test: return 9;
+    default: return KNoVariant;
+    }
+}
+
+// x86-style flag set. Pf is set for even parity of the low result byte.
+struct Flags {
+    bool Zf{}; bool Cf{}; bool Sf{}; bool Of{}; bool Pf{};
+};
+
+bool EvenParity(std::uint64_t Value) {
+    return (std::popcount(static_cast<std::uint8_t>(Value)) & 1U) == 0U;
+}
+
+void SetAddFlags(Flags& F, std::uint64_t Dst, std::uint64_t Src, std::uint64_t Result) {
+    F.Zf = Result == 0;
+    F.Sf = (Result >> 63) != 0;
+    F.Cf = Result < Dst;
+    F.Of = (((Dst ^ Result) & (Src ^ Result)) >> 63) != 0;
+    F.Pf = EvenParity(Result);
+}
+
+void SetSubFlags(Flags& F, std::uint64_t Dst, std::uint64_t Src, std::uint64_t Result) {
+    F.Zf = Result == 0;
+    F.Sf = (Result >> 63) != 0;
+    F.Cf = Dst < Src;
+    F.Of = (((Dst ^ Src) & (Dst ^ Result)) >> 63) != 0;
+    F.Pf = EvenParity(Result);
+}
+
+void SetLogicFlags(Flags& F, std::uint64_t Result) {
+    F.Zf = Result == 0;
+    F.Sf = (Result >> 63) != 0;
+    F.Cf = false;
+    F.Of = false;
+    F.Pf = EvenParity(Result);
+}
+
+std::uint64_t NextRandom(std::uint64_t& State) {
+    State ^= State >> 12;
+    State ^= State << 25;
+    State ^= State >> 27;
+    return State * 0x2545F4914F6CDD1DULL;
+}
+
+OpMap MakeMap(std::uint64_t Seed) {
+    std::array<std::uint8_t, 251> Pool{};
+    for (std::size_t I = 0; I < Pool.size(); ++I) Pool[I] = static_cast<std::uint8_t>(I + 1);
+    for (std::size_t I = Pool.size() - 1; I > 0; --I) {
+        std::swap(Pool[I], Pool[NextRandom(Seed) % (I + 1)]);
+    }
+    OpMap Map{};
+    std::copy_n(Pool.begin(), Map.size(), Map.begin());
+    return Map;
+}
+
+RegisterMap MakeRegisterMap(std::uint64_t Seed) {
+    RegisterMap Map = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+    for (std::size_t I = Map.size() - 1; I > 0; --I) {
+        std::swap(Map[I], Map[NextRandom(Seed) % (I + 1)]);
+    }
+    return Map;
+}
+
+Op Decode(std::uint8_t Encoded, const OpMap& Map) {
+    for (std::size_t I = 0; I < Map.size(); ++I) {
+        if (Map[I] == Encoded) return static_cast<Op>(I);
+    }
+    throw std::runtime_error("VM2 illegal opcode");
+}
+
+const char* Name(Op Operation) {
+    static constexpr std::array<const char*, KOpCount> Names = {
+        "MOVI","MOV","ADD","ADDI","SUB","SUBI","ADC","SBB","MUL","MULI","XOR","AND","OR","ANDI","NEG","NOT","BSWAP","TEST",
+        "SHLI","SHRI","SHLR","SHRR","SARI","SARR","ROLI","RORI","ROLR","RORR",
+        "CMP","JMP","JZ","JNZ",
+        "JA","JAE","JB","JBE","JS","JNS","JL","JGE","JLE","JG","JO","JNO","JP","JNP",
+        "PUSH","POP","CALL","RET","LOAD64","LOAD64D","STORE64","STORE64D","NOP","HALT"
+    };
+    return Names[static_cast<std::size_t>(Operation)];
+}
+
+void AppendU32(Bytes& Out, std::uint32_t Value) {
+    for (unsigned I = 0; I < 4; ++I) Out.push_back(static_cast<std::uint8_t>(Value >> (I * 8)));
+}
+
+void AppendU64(Bytes& Out, std::uint64_t Value) {
+    for (unsigned I = 0; I < 8; ++I) Out.push_back(static_cast<std::uint8_t>(Value >> (I * 8)));
+}
+
+std::uint64_t Mix64(std::uint64_t Value);
+
+std::uint32_t BranchMask(std::uint64_t Key, std::size_t OperandOffset) {
+    return static_cast<std::uint32_t>(Mix64(Key ^ (static_cast<std::uint64_t>(OperandOffset) * 0x9E3779B185EBCA87ULL)));
+}
+
+class Assembler {
+public:
+    Assembler(OpMap OpcodeMap, RegisterMap Registers, std::uint64_t Seed, std::uint64_t BranchKey)
+        : OpcodeMap(std::move(OpcodeMap)), Registers(std::move(Registers)),
+          RandomState(Seed), BranchKey(BranchKey) {}
+
+    void Label(std::string Value) {
+        if (!Labels.emplace(std::move(Value), Code.size()).second) throw std::runtime_error("duplicate VM label");
+    }
+
+    void Rr(Op Operation, std::uint8_t Dst, std::uint8_t Src) { Opcode(Operation); Reg(Dst); Reg(Src); }
+    void Ri(Op Operation, std::uint8_t Dst, std::uint64_t Imm) { Opcode(Operation); Reg(Dst); AppendU64(Code, Imm); }
+    void RrI(Op Operation, std::uint8_t Dst, std::uint8_t Src, std::uint64_t Imm) {
+        Opcode(Operation); Reg(Dst); Reg(Src); AppendU64(Code, Imm);
+    }
+    void R(Op Operation, std::uint8_t Value) { Opcode(Operation); Reg(Value); }
+    void None(Op Operation) { Opcode(Operation); }
+
+    void Junk() {
+        const auto Count = static_cast<unsigned>((NextRandom(RandomState) % 3) + 1);
+        for (unsigned I = 0; I < Count; ++I) None(Op::Nop);
+    }
+
+    void Jump(Op Operation, std::string LabelName) {
+        Opcode(Operation);
+        Fixups.push_back({Code.size(), std::move(LabelName)});
+        AppendU32(Code, 0);
+    }
+
+    Bytes Finish() {
+        for (const auto& [Offset, Target] : Fixups) {
+            const auto It = Labels.find(Target);
+            if (It == Labels.end()) throw std::runtime_error("undefined VM label: " + Target);
+            if (It->second > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("VM program too large");
+            const auto Address = static_cast<std::uint32_t>(It->second) ^ BranchMask(BranchKey, Offset);
+            for (unsigned I = 0; I < 4; ++I) Code[Offset + I] = static_cast<std::uint8_t>(Address >> (I * 8));
+        }
+        return Code;
+    }
+
+    const std::vector<std::uint32_t>& GetInstructionOffsets() const { return InstructionOffsets; }
+
+private:
+    OpMap OpcodeMap;
+    RegisterMap Registers;
+    Bytes Code;
+    std::unordered_map<std::string, std::size_t> Labels;
+    std::vector<std::pair<std::size_t, std::string>> Fixups;
+    std::vector<std::uint32_t> InstructionOffsets;
+
+    std::uint64_t RandomState;
+    std::uint64_t BranchKey;
+
+    void Opcode(Op Operation) {
+        InstructionOffsets.push_back(static_cast<std::uint32_t>(Code.size()));
+        Code.push_back(OpcodeMap[static_cast<std::size_t>(Operation)]);
+    }
+    void Reg(std::uint8_t Value) {
+        if (Value < Registers.size()) Code.push_back(Registers[Value]);
+        else if (Value < KRegisterCount) Code.push_back(Value);
+        else throw std::runtime_error("assembler invalid register");
+    }
+};
+
+std::uint64_t Mix64(std::uint64_t Value) {
+    Value += 0x9E3779B97F4A7C15ULL;
+    Value = (Value ^ (Value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    Value = (Value ^ (Value >> 27)) * 0x94D049BB133111EBULL;
+    return Value ^ (Value >> 31);
+}
+
+std::uint8_t KeystreamByte(std::uint64_t Key, std::size_t Index) {
+    const auto Block = Mix64(Key ^ (static_cast<std::uint64_t>(Index >> 3) * 0xD6E8FEB86659FD93ULL));
+    return static_cast<std::uint8_t>(Block >> ((Index & 7U) * 8));
+}
+
+void Crypt(Bytes& Data, std::uint64_t Key) {
+    for (std::size_t I = 0; I < Data.size(); ++I) {
+        Data[I] ^= KeystreamByte(Key, I);
+    }
+}
+
+std::uint64_t IntegrityTag(std::span<const std::uint8_t> Data, const OpMap& Opcodes,
+                           const RegisterMap& Registers, std::span<const std::uint8_t> Variants,
+                           std::uint64_t Key) {
+    std::uint64_t Hash = 0xCBF29CE484222325ULL ^ Key;
+    auto Add = [&](std::uint8_t Value) { Hash = (Hash ^ Value) * 0x100000001B3ULL; };
+    for (const auto Value : Data) Add(Value);
+    for (const auto Value : Opcodes) Add(Value);
+    for (const auto Value : Registers) Add(Value);
+    for (const auto Value : Variants) Add(Value);
+    return Mix64(Hash);
+}
+
+struct Program {
+    OpMap Map{};
+    RegisterMap Registers{};
+    std::array<std::uint8_t, KVariantSlots> HandlerVariants{};
+    Bytes EncryptedCode;
+    std::vector<std::uint32_t> InstructionOffsets;
+    std::vector<std::uint32_t> InstructionTags;
+    std::uint64_t Key{};
+    std::uint64_t Tag{};
+};
+
+std::uint32_t InstructionTag(std::span<const std::uint8_t> Data, std::uint32_t Offset,
+                             std::uint32_t End, std::uint64_t Key) {
+    std::uint64_t Hash = Mix64(Key ^ Offset ^ (static_cast<std::uint64_t>(End) << 32));
+    for (std::uint32_t I = Offset; I < End; ++I) Hash = Mix64(Hash ^ Data[I] ^ I);
+    return static_cast<std::uint32_t>(Hash ^ (Hash >> 32));
+}
+
+void SealProgram(Program& Program, Assembler& A) {
+    Program.EncryptedCode = A.Finish();
+    Program.InstructionOffsets = A.GetInstructionOffsets();
+    Crypt(Program.EncryptedCode, Program.Key);
+    Program.InstructionTags.reserve(Program.InstructionOffsets.size());
+    for (std::size_t I = 0; I < Program.InstructionOffsets.size(); ++I) {
+        const auto End = I + 1 < Program.InstructionOffsets.size()
+            ? Program.InstructionOffsets[I + 1]
+            : static_cast<std::uint32_t>(Program.EncryptedCode.size());
+        Program.InstructionTags.push_back(InstructionTag(Program.EncryptedCode,
+                                                          Program.InstructionOffsets[I], End, Program.Key));
+    }
+    Program.Tag = IntegrityTag(Program.EncryptedCode, Program.Map, Program.Registers,
+                               Program.HandlerVariants, Program.Key);
+}
+
+Program CompileFactorial(std::uint64_t Seed) {
+    Program Result;
+    Result.Map = MakeMap(Seed ^ 0x9E3779B185EBCA87ULL);
+    Result.Registers = MakeRegisterMap(Seed ^ 0xD1B54A32D192ED03ULL);
+    auto VariantSeed = Seed ^ 0x94D049BB133111EBULL;
+    for (auto& Variant : Result.HandlerVariants) Variant = static_cast<std::uint8_t>(NextRandom(VariantSeed) & 3U);
+    Result.Key = NextRandom(Seed);
+    Assembler A(Result.Map, Result.Registers, Seed ^ 0xA0761D6478BD642FULL, Result.Key);
+
+    // Calling convention: r0=input/result. The protected function uses a real
+    // VM loop, flags and conditional control flow.
+    A.Ri(Op::MovI, 1, 1);       // result = 1
+    A.Junk();
+    A.Ri(Op::MovI, 2, 0);       // zero constant
+    A.Label("loop");
+    A.Rr(Op::Cmp, 0, 2);        // input == 0?
+    A.Jump(Op::Jz, "done");
+    A.Rr(Op::Mul, 1, 0);        // result *= input
+    A.Junk();
+    if ((Seed & 1U) == 0) A.Ri(Op::SubI, 0, 1);                 // --input
+    else A.Ri(Op::AddI, 0, std::numeric_limits<std::uint64_t>::max());
+    A.Jump(Op::Jmp, "loop");
+    A.Label("done");
+    A.Rr(Op::Mov, 0, 1);
+    A.None(Op::Halt);
+
+    SealProgram(Result, A);
+    return Result;
+}
+
+Program CompileCallMemory(std::uint64_t Seed) {
+    Program Result;
+    Result.Map = MakeMap(Seed ^ 0x243F6A8885A308D3ULL);
+    Result.Registers = MakeRegisterMap(Seed ^ 0x13198A2E03707344ULL);
+    auto VariantSeed = Seed ^ 0xA4093822299F31D0ULL;
+    for (auto& Variant : Result.HandlerVariants) Variant = static_cast<std::uint8_t>(NextRandom(VariantSeed) & 3U);
+    Result.Key = NextRandom(Seed);
+    Assembler A(Result.Map, Result.Registers, Seed ^ 0x082EFA98EC4E6C89ULL, Result.Key);
+
+    A.Ri(Op::MovI, 1, 32);       // virtual memory offset
+    A.R(Op::Push, 0);            // marshal argument through VM data stack
+    A.Jump(Op::Call, "transform");
+    A.Rr(Op::Store64, 0, 1);     // result -> VM memory
+    A.Ri(Op::MovI, 0, 0);
+    A.Rr(Op::Load64, 0, 1);      // VM memory -> result
+    A.None(Op::Halt);
+    A.Label("transform");
+    A.R(Op::Pop, 2);
+    A.Ri(Op::AddI, 2, 7);
+    A.Ri(Op::MovI, 3, 3);
+    A.Rr(Op::Mul, 2, 3);
+    A.Ri(Op::MovI, 4, 0x55);
+    A.Rr(Op::Xor, 2, 4);
+    A.Rr(Op::Mov, 0, 2);
+    A.None(Op::Ret);
+
+    SealProgram(Result, A);
+    return Result;
+}
+
+// Covers the x86-style flag set and the extended conditional jump family.
+Program CompileBranchDemo(std::uint64_t Seed) {
+    Program Result;
+    Result.Map = MakeMap(Seed ^ 0x6C62272E07BB0142ULL);
+    Result.Registers = MakeRegisterMap(Seed ^ 0x62EB8D5E6B2C6C05ULL);
+    auto VariantSeed = Seed ^ 0x27D4EB2F165667C5ULL;
+    for (auto& Variant : Result.HandlerVariants) Variant = static_cast<std::uint8_t>(NextRandom(VariantSeed) & 3U);
+    Result.Key = NextRandom(Seed);
+    Assembler A(Result.Map, Result.Registers, Seed ^ 0x9E3779B185EBCA87ULL, Result.Key);
+
+    // Each condition group re-establishes flags with its own Cmp/Test/Add:
+    // the AddI rewards between groups would otherwise clobber them.
+    A.Ri(Op::MovI, 1, 0);                            // result accumulator
+    A.Ri(Op::MovI, 2, 100);
+    A.Rr(Op::Cmp, 0, 2);
+    A.Jump(Op::Jae, "skip1");                        // x <  100 (unsigned)
+    A.Ri(Op::AddI, 1, 1);
+    A.Label("skip1");
+    A.Rr(Op::Cmp, 0, 2);
+    A.Jump(Op::Jnz, "skip2");                        // x == 100
+    A.Ri(Op::AddI, 1, 2);
+    A.Label("skip2");
+    A.Rr(Op::Cmp, 0, 2);
+    A.Jump(Op::Jbe, "skip3");                        // x >  100 (unsigned)
+    A.Ri(Op::AddI, 1, 4);
+    A.Label("skip3");
+    A.Ri(Op::MovI, 3, 0xFFFFFFFFFFFFFFFDULL);        // -3
+    A.Rr(Op::Cmp, 0, 3);
+    A.Jump(Op::Jge, "skip4");                        // x <  -3 (signed)
+    A.Ri(Op::AddI, 1, 8);
+    A.Label("skip4");
+    A.Ri(Op::MovI, 3, 0);
+    A.Rr(Op::Cmp, 0, 3);
+    A.Jump(Op::Js, "skip5");                         // x >= 0 (signed)
+    A.Ri(Op::AddI, 1, 16);
+    A.Label("skip5");
+    A.Ri(Op::MovI, 4, 0xFF);
+    A.Rr(Op::Test, 0, 4);
+    A.Jump(Op::Jp, "parity_even");                   // Pf set = even parity
+    A.Ri(Op::AddI, 1, 64);
+    A.Jump(Op::Jmp, "parity_done");
+    A.Label("parity_even");
+    A.Ri(Op::AddI, 1, 32);
+    A.Label("parity_done");
+    A.Ri(Op::MovI, 5, 0x7FFFFFFFFFFFFFFFULL);
+    A.Rr(Op::And, 5, 0);                             // nonneg(x)
+    A.Ri(Op::MovI, 6, 0x7FFFFFFFFFFFFFFFULL);
+    A.Rr(Op::Add, 5, 6);                             // signed overflow iff x != 0
+    A.Jump(Op::Jno, "no_overflow");
+    A.Ri(Op::AddI, 1, 128);
+    A.Jump(Op::Jmp, "overflow_done");
+    A.Label("no_overflow");
+    A.Ri(Op::AddI, 1, 256);
+    A.Label("overflow_done");
+    A.Ri(Op::MovI, 3, 5);
+    A.Rr(Op::Cmp, 0, 3);
+    A.Jump(Op::Jg, "gt5");                           // x >  5 (signed)
+    A.Ri(Op::AddI, 1, 1024);
+    A.Jump(Op::Jmp, "cmp5_done");
+    A.Label("gt5");
+    A.Ri(Op::AddI, 1, 512);
+    A.Label("cmp5_done");
+    // Second pass covering the inverses: Jb/Ja/Jns/Jl/Jnp/Jo.
+    A.Rr(Op::Cmp, 0, 2);
+    A.Jump(Op::Jb, "add_b");
+    A.Jump(Op::Jmp, "b_done");
+    A.Label("add_b");
+    A.Ri(Op::AddI, 1, 2048);
+    A.Label("b_done");
+    A.Rr(Op::Cmp, 0, 2);
+    A.Jump(Op::Ja, "add_a");
+    A.Jump(Op::Jmp, "a_done");
+    A.Label("add_a");
+    A.Ri(Op::AddI, 1, 4096);
+    A.Label("a_done");
+    A.Ri(Op::MovI, 3, 0);
+    A.Rr(Op::Cmp, 0, 3);
+    A.Jump(Op::Jns, "add_ns");
+    A.Jump(Op::Jmp, "ns_done");
+    A.Label("add_ns");
+    A.Ri(Op::AddI, 1, 8192);
+    A.Label("ns_done");
+    A.Ri(Op::MovI, 3, 0xFFFFFFFFFFFFFFFDULL);
+    A.Rr(Op::Cmp, 0, 3);
+    A.Jump(Op::Jl, "add_l");
+    A.Jump(Op::Jmp, "l_done");
+    A.Label("add_l");
+    A.Ri(Op::AddI, 1, 16384);
+    A.Label("l_done");
+    A.Rr(Op::Test, 0, 4);
+    A.Jump(Op::Jnp, "add_np");
+    A.Jump(Op::Jmp, "np_done");
+    A.Label("add_np");
+    A.Ri(Op::AddI, 1, 32768);
+    A.Label("np_done");
+    A.Ri(Op::MovI, 5, 0x7FFFFFFFFFFFFFFFULL);
+    A.Rr(Op::And, 5, 0);
+    A.Ri(Op::MovI, 6, 0x7FFFFFFFFFFFFFFFULL);
+    A.Rr(Op::Add, 5, 6);
+    A.Jump(Op::Jo, "add_o");
+    A.Jump(Op::Jmp, "o_done");
+    A.Label("add_o");
+    A.Ri(Op::AddI, 1, 65536);
+    A.Label("o_done");
+    A.Rr(Op::Mov, 0, 1);
+    A.None(Op::Halt);
+
+    SealProgram(Result, A);
+    return Result;
+}
+
+// Covers the extended ALU (MulI/And/Or/Test/shift-by-register), base+disp
+// virtual memory addressing and the data stack used as a spill area.
+Program CompileArithMemDemo(std::uint64_t Seed) {
+    Program Result;
+    Result.Map = MakeMap(Seed ^ 0x85EBCA77C2B2AE63ULL);
+    Result.Registers = MakeRegisterMap(Seed ^ 0x165667B19E3779F9ULL);
+    auto VariantSeed = Seed ^ 0x7F4A7C15D1B54A32ULL;
+    for (auto& Variant : Result.HandlerVariants) Variant = static_cast<std::uint8_t>(NextRandom(VariantSeed) & 3U);
+    Result.Key = NextRandom(Seed);
+    Assembler A(Result.Map, Result.Registers, Seed ^ 0x27D4EB2F165667C5ULL, Result.Key);
+
+    A.Rr(Op::Mov, 1, 0);
+    A.Ri(Op::MovI, 2, 0xF0);
+    A.Rr(Op::Or, 1, 2);                    // a = x | 0xF0
+    A.Ri(Op::MovI, 2, 0xFF);
+    A.Rr(Op::And, 1, 2);                   // a &= 0xFF
+    A.Ri(Op::MulI, 1, 3);                  // a *= 3
+    A.Rr(Op::Mov, 3, 1);
+    A.Ri(Op::ShrI, 3, 2);                  // b = a >> 2
+    A.Rr(Op::Mov, 4, 0);
+    A.Ri(Op::SarI, 4, 3);                  // c = sar(x, 3)
+    A.Rr(Op::Mov, 5, 0);
+    A.Ri(Op::ShrI, 5, 1);
+    A.Ri(Op::MovI, 6, 7);
+    A.Rr(Op::And, 5, 6);                   // s = (x >> 1) & 7
+    A.Rr(Op::Mov, 7, 0);
+    A.Ri(Op::AddI, 7, 3);
+    A.Rr(Op::ShlR, 7, 5);                  // e = (x + 3) << s
+    A.Rr(Op::Mov, 8, 0);
+    A.Ri(Op::MulI, 8, 5);
+    A.Rr(Op::SarR, 8, 5);                  // f = sar(x * 5, s)
+    A.Ri(Op::MovI, 9, 16);                 // memory base offset
+    A.RrI(Op::Store64D, 9, 1, 0);          // mem[16] = a
+    A.RrI(Op::Store64D, 9, 7, 8);          // mem[24] = e
+    A.RrI(Op::Load64D, 10, 9, 0);          // r10 = a (roundtrip)
+    A.RrI(Op::Load64D, 11, 9, 8);          // r11 = e (roundtrip)
+    A.R(Op::Push, 10);
+    A.R(Op::Push, 11);
+    A.R(Op::Pop, 12);
+    A.R(Op::Pop, 13);                      // stack shuffle, values preserved
+    A.Jump(Op::Call, "helper");
+    A.Rr(Op::Xor, 0, 12);
+    A.Rr(Op::Xor, 0, 13);
+    A.Rr(Op::Xor, 0, 3);
+    A.Rr(Op::Xor, 0, 4);
+    A.Rr(Op::Xor, 0, 8);
+    A.None(Op::Halt);
+    A.Label("helper");
+    A.Rr(Op::Mov, 14, 0);
+    A.Ri(Op::MulI, 14, 7);
+    A.Ri(Op::AddI, 14, 1);
+    A.Rr(Op::Mov, 0, 14);
+    A.None(Op::Ret);
+
+    SealProgram(Result, A);
+    return Result;
+}
+
+class Machine {
+public:
+    std::uint64_t Run(const Program& Program, std::uint64_t Input, bool Trace,
+                      const RunConfig& Config = {}) {
+        std::array<std::uint64_t, 16> Logical{};
+        Logical[0] = Input;
+        RunRegisters(Program, Logical, Trace, Config);
+        return Logical[0];
+    }
+
+    void RunRegisters(const Program& Program, std::array<std::uint64_t, 16>& Logical, bool Trace,
+                      const RunConfig& Config = {}) {        ValidateConfig(Config);
+        if (Program.Tag != IntegrityTag(Program.EncryptedCode, Program.Map, Program.Registers,
+                                        Program.HandlerVariants, Program.Key)) {
+            throw std::runtime_error("VM2 integrity violation");
+        }
+        const auto& Code = Program.EncryptedCode;
+        Regs.fill(0);
+        Memory.assign(Config.MemoryBytes, 0);
+        Stack.clear();
+        Calls.clear();
+        for (std::size_t I = 0; I < Logical.size(); ++I) Regs[Program.Registers[I]] = Logical[I];
+        Flags = {};
+        std::size_t Pc = 0;
+        std::size_t Fuel = Config.Fuel;
+
+        auto FindInstruction = [&](std::uint32_t Address) {
+            const auto It = std::lower_bound(Program.InstructionOffsets.begin(),
+                                             Program.InstructionOffsets.end(), Address);
+            if (It == Program.InstructionOffsets.end() || *It != Address) {
+                throw std::runtime_error("VM2 CFI violation");
+            }
+            return static_cast<std::size_t>(It - Program.InstructionOffsets.begin());
+        };
+
+        auto Byte = [&]() {
+            if (Pc >= Code.size()) throw std::runtime_error("VM2 truncated operand");
+            const auto Index = Pc++;
+            return static_cast<std::uint8_t>(Code[Index] ^ KeystreamByte(Program.Key, Index));
+        };
+        auto Reg = [&]() {
+            const auto Value = Byte();
+            if (Value >= Regs.size()) throw std::runtime_error("VM2 invalid register");
+            return Value;
+        };
+        auto U32 = [&]() {
+            if (Pc > Code.size() || 4 > Code.size() - Pc) throw std::runtime_error("VM2 truncated u32");
+            std::uint32_t V = 0;
+            for (unsigned I = 0; I < 4; ++I) V |= static_cast<std::uint32_t>(Byte()) << (I * 8);
+            return V;
+        };
+        auto U64 = [&]() {
+            if (Pc > Code.size() || 8 > Code.size() - Pc) throw std::runtime_error("VM2 truncated u64");
+            std::uint64_t V = 0;
+            for (unsigned I = 0; I < 8; ++I) V |= static_cast<std::uint64_t>(Byte()) << (I * 8);
+            return V;
+        };
+        auto Target = [&](std::uint32_t Address) {
+            (void)FindInstruction(Address);
+            Pc = Address;
+        };
+        auto TakeBranch = [&](Op Operation) {
+            switch (Operation) {
+            case Op::Jz: return Flags.Zf;
+            case Op::Jnz: return !Flags.Zf;
+            case Op::Ja: return !Flags.Cf && !Flags.Zf;
+            case Op::Jae: return !Flags.Cf;
+            case Op::Jb: return Flags.Cf;
+            case Op::Jbe: return Flags.Cf || Flags.Zf;
+            case Op::Js: return Flags.Sf;
+            case Op::Jns: return !Flags.Sf;
+            case Op::Jl: return Flags.Sf != Flags.Of;
+            case Op::Jge: return Flags.Sf == Flags.Of;
+            case Op::Jle: return Flags.Zf || Flags.Sf != Flags.Of;
+            case Op::Jg: return !Flags.Zf && Flags.Sf == Flags.Of;
+            case Op::Jo: return Flags.Of;
+            case Op::Jno: return !Flags.Of;
+            case Op::Jp: return Flags.Pf;
+            case Op::Jnp: return !Flags.Pf;
+            default: throw std::runtime_error("VM2 internal: not a branch");
+            }
+        };
+        // x86 shift semantics: count is masked to 6 bits, a zero count leaves
+        // flags untouched, CF takes the last bit shifted out, OF is defined
+        // only for 1-bit shifts.
+        auto SetShiftFlags = [&](std::uint64_t Dst, unsigned Count, bool Arithmetic, std::uint64_t Result) {
+            if (Count == 0) return;
+            Flags.Zf = Result == 0;
+            Flags.Sf = (Result >> 63) != 0;
+            if (Arithmetic) {
+                Flags.Cf = (static_cast<std::uint64_t>(static_cast<std::int64_t>(Dst) >> (Count - 1)) & 1U) != 0;
+            } else {
+                Flags.Cf = ((Dst >> (64 - Count)) & 1U) != 0;
+            }
+            Flags.Of = Count == 1 ? (Flags.Sf != Flags.Cf) : false;
+            Flags.Pf = EvenParity(Result);
+        };
+        // x86 rotate semantics: ZF/SF/PF are untouched; CF takes the bit
+        // rotated around (LSB for ROL, MSB for ROR) and OF is defined only
+        // for 1-bit rotates.
+        auto SetRotateFlags = [&](unsigned Count, bool Left, std::uint64_t Result) {
+            if (Count == 0) return;
+            Flags.Cf = Left ? (Result & 1U) != 0 : (Result >> 63) != 0;
+            if (Count == 1) {
+                Flags.Of = Left
+                    ? (((Result >> 63) & 1U) != 0) != Flags.Cf
+                    : (((Result >> 63) & 1U) != ((Result >> 62) & 1U));
+            }
+        };
+        auto Bswap64 = [](std::uint64_t Value) {
+            return ((Value & 0x00000000000000FFULL) << 56) | ((Value & 0x000000000000FF00ULL) << 40) |
+                   ((Value & 0x0000000000FF0000ULL) << 24) | ((Value & 0x00000000FF000000ULL) << 8) |
+                   ((Value & 0x000000FF00000000ULL) >> 8) | ((Value & 0x0000FF0000000000ULL) >> 24) |
+                   ((Value & 0x00FF000000000000ULL) >> 40) | ((Value & 0xFF00000000000000ULL) >> 56);
+        };
+
+        while (Fuel-- != 0) {
+            const auto At = Pc;
+            const auto InstructionIndex = FindInstruction(static_cast<std::uint32_t>(At));
+            const auto InstructionEnd = InstructionIndex + 1 < Program.InstructionOffsets.size()
+                ? Program.InstructionOffsets[InstructionIndex + 1]
+                : static_cast<std::uint32_t>(Code.size());
+            if (Program.InstructionTags.size() != Program.InstructionOffsets.size() ||
+                Program.InstructionTags[InstructionIndex] !=
+                    InstructionTag(Code, static_cast<std::uint32_t>(At), InstructionEnd, Program.Key)) {
+                throw std::runtime_error("VM2 instruction authentication failed");
+            }
+            const auto Encoded = Byte();
+            const auto Op = Decode(Encoded, Program.Map);
+            if (Trace) {
+                std::cout << "vip=" << std::setw(4) << std::setfill('0') << std::hex << At
+                          << " enc=" << std::setw(2) << static_cast<unsigned>(Encoded)
+                          << " op=" << std::left << std::setw(8) << std::setfill(' ') << Name(Op)
+                          << std::right << " r0=" << Regs[Program.Registers[0]]
+                          << " r1=" << Regs[Program.Registers[1]]
+                          << " zf=" << Flags.Zf << " cf=" << Flags.Cf
+                          << " sf=" << Flags.Sf << " of=" << Flags.Of << std::dec << "\n";
+            }
+            switch (Op) {
+            case Op::MovI: { const auto D=Reg(); Regs[D]=U64(); break; }
+            case Op::Mov: { const auto D=Reg(),S=Reg(); Regs[D]=Regs[S]; break; }
+            case Op::Add: {
+                const auto D=Reg(),S=Reg(); const auto Dst=Regs[D],Src=Regs[S];
+                switch (Program.HandlerVariants[VariantSlot(Op::Add)] & 3U) {
+                case 1: Regs[D]=Dst-(~Src+1ULL); break;
+                case 2: Regs[D]=(Dst|Src)+(Dst&Src); break;
+                case 3: Regs[D]=2ULL*(Dst&Src)+(Dst^Src); break;
+                default: Regs[D]=Dst+Src; break;
+                }
+                SetAddFlags(Flags,Dst,Src,Regs[D]); break; }
+            case Op::AddI: {
+                const auto D=Reg(); const auto V=U64(); const auto Dst=Regs[D];
+                switch (Program.HandlerVariants[VariantSlot(Op::AddI)] & 3U) {
+                case 1: Regs[D]=Dst-(~V+1ULL); break;
+                case 2: Regs[D]=(Dst|V)+(Dst&V); break;
+                case 3: Regs[D]=2ULL*(Dst&V)+(Dst^V); break;
+                default: Regs[D]=Dst+V; break;
+                }
+                SetAddFlags(Flags,Dst,V,Regs[D]); break; }
+            case Op::Sub: {
+                const auto D=Reg(),S=Reg(); const auto Dst=Regs[D],Src=Regs[S];
+                switch (Program.HandlerVariants[VariantSlot(Op::Sub)] & 3U) {
+                case 1: Regs[D]=Dst+(~Src+1ULL); break;
+                case 2: Regs[D]=(Dst^Src)-2ULL*(Src&~Dst); break;
+                case 3: Regs[D]=(Dst+~Src)+1ULL; break;
+                default: Regs[D]=Dst-Src; break;
+                }
+                SetSubFlags(Flags,Dst,Src,Regs[D]); break; }
+            case Op::SubI: {
+                const auto D=Reg(); const auto V=U64(); const auto Dst=Regs[D];
+                switch (Program.HandlerVariants[VariantSlot(Op::SubI)] & 3U) {
+                case 1: Regs[D]=Dst+(~V+1ULL); break;
+                case 2: Regs[D]=(Dst^V)-2ULL*(V&~Dst); break;
+                case 3: Regs[D]=(Dst+~V)+1ULL; break;
+                default: Regs[D]=Dst-V; break;
+                }
+                SetSubFlags(Flags,Dst,V,Regs[D]); break; }
+            case Op::Adc: {
+                // x86 ADC: dst + src + carry-in; CF is the carry out of the
+                // 65-bit sum, OF the signed overflow of that sum.
+                const auto D=Reg(),S=Reg(); const auto Dst=Regs[D],Src=Regs[S];
+                const bool CarryIn = Flags.Cf;
+                const auto Result = Dst + Src + (CarryIn ? 1ULL : 0ULL);
+                Regs[D]=Result;
+                Flags.Zf = Result == 0;
+                Flags.Sf = (Result >> 63) != 0;
+                Flags.Pf = EvenParity(Result);
+                Flags.Cf = (Result < Dst) || (CarryIn && Result == Dst);
+                Flags.Of = ((~(Dst ^ Src) & (Dst ^ Result)) >> 63) != 0; break; }
+            case Op::Sbb: {
+                // x86 SBB: dst - src - borrow-in; CF is the borrow.
+                const auto D=Reg(),S=Reg(); const auto Dst=Regs[D],Src=Regs[S];
+                const bool BorrowIn = Flags.Cf;
+                const auto Result = Dst - Src - (BorrowIn ? 1ULL : 0ULL);
+                Regs[D]=Result;
+                Flags.Zf = Result == 0;
+                Flags.Sf = (Result >> 63) != 0;
+                Flags.Pf = EvenParity(Result);
+                Flags.Cf = (Dst < Src) || (BorrowIn && Dst == Src);
+                Flags.Of = (((Dst ^ Src) & (Dst ^ Result)) >> 63) != 0; break; }
+            case Op::Mul: { const auto D=Reg(),S=Reg(); Regs[D]*=Regs[S]; break; }
+            case Op::MulI: { const auto D=Reg(); Regs[D]*=U64(); break; }
+            case Op::Xor: {
+                const auto D=Reg(),S=Reg(); const auto Dst=Regs[D],Src=Regs[S];
+                switch (Program.HandlerVariants[VariantSlot(Op::Xor)] & 3U) {
+                case 1: Regs[D]=(Dst|Src)&~(Dst&Src); break;
+                case 2: Regs[D]=(Dst|Src)-(Dst&Src); break;
+                case 3: Regs[D]=(Dst+Src)-2ULL*(Dst&Src); break;
+                default: Regs[D]=Dst^Src; break;
+                }
+                SetLogicFlags(Flags,Regs[D]); break; }
+            case Op::And: {
+                const auto D=Reg(),S=Reg(); const auto Dst=Regs[D],Src=Regs[S];
+                switch (Program.HandlerVariants[VariantSlot(Op::And)] & 3U) {
+                case 1: Regs[D]=(Dst|Src)-(Dst^Src); break;
+                case 2: Regs[D]=~(~Dst|~Src); break;
+                case 3: Regs[D]=((Dst+Src)-(Dst^Src))>>1; break;
+                default: Regs[D]=Dst&Src; break;
+                }
+                SetLogicFlags(Flags,Regs[D]); break; }
+            case Op::Or: {
+                const auto D=Reg(),S=Reg(); const auto Dst=Regs[D],Src=Regs[S];
+                switch (Program.HandlerVariants[VariantSlot(Op::Or)] & 3U) {
+                case 1: Regs[D]=(Dst&Src)+(Dst^Src); break;
+                case 2: Regs[D]=~(~Dst&~Src); break;
+                case 3: Regs[D]=((Dst+Src)+(Dst^Src))>>1; break;
+                default: Regs[D]=Dst|Src; break;
+                }
+                SetLogicFlags(Flags,Regs[D]); break; }
+            case Op::AndI: {
+                const auto D=Reg(); const auto V=U64();
+                Regs[D]&=V; SetLogicFlags(Flags,Regs[D]); break; }
+            case Op::Neg: {
+                // x86 NEG: all flags as `0 - operand`; CF set iff operand != 0.
+                const auto D=Reg(); const auto Dst=Regs[D];
+                Regs[D]=0ULL-Dst; SetSubFlags(Flags,0,Dst,Regs[D]); break; }
+            case Op::Not: {
+                // x86 NOT does not modify flags.
+                const auto D=Reg(); Regs[D]=~Regs[D]; break; }
+            case Op::Test: {
+                const auto A=Reg(),B=Reg();
+                SetLogicFlags(Flags,Regs[A]&Regs[B]); break; }
+            case Op::ShlI: {
+                const auto D=Reg(); const auto Count=static_cast<unsigned>(U64()&63);
+                const auto Dst=Regs[D]; Regs[D]<<=Count;
+                SetShiftFlags(Dst,Count,false,Regs[D]); break; }
+            case Op::ShrI: {
+                const auto D=Reg(); const auto Count=static_cast<unsigned>(U64()&63);
+                const auto Dst=Regs[D]; Regs[D]>>=Count;
+                SetShiftFlags(Dst,Count,false,Regs[D]); break; }
+            case Op::ShlR: {
+                const auto D=Reg(),S=Reg(); const auto Count=static_cast<unsigned>(Regs[S]&63);
+                const auto Dst=Regs[D]; Regs[D]<<=Count;
+                SetShiftFlags(Dst,Count,false,Regs[D]); break; }
+            case Op::ShrR: {
+                const auto D=Reg(),S=Reg(); const auto Count=static_cast<unsigned>(Regs[S]&63);
+                const auto Dst=Regs[D]; Regs[D]>>=Count;
+                SetShiftFlags(Dst,Count,false,Regs[D]); break; }
+            case Op::SarI: {
+                const auto D=Reg(); const auto Count=static_cast<unsigned>(U64()&63);
+                const auto Dst=Regs[D];
+                Regs[D]=static_cast<std::uint64_t>(static_cast<std::int64_t>(Dst)>>Count);
+                SetShiftFlags(Dst,Count,true,Regs[D]); break; }
+            case Op::SarR: {
+                const auto D=Reg(),S=Reg(); const auto Count=static_cast<unsigned>(Regs[S]&63);
+                const auto Dst=Regs[D];
+                Regs[D]=static_cast<std::uint64_t>(static_cast<std::int64_t>(Dst)>>Count);
+                SetShiftFlags(Dst,Count,true,Regs[D]); break; }
+            case Op::RolI: {
+                const auto D=Reg(); const auto Count=static_cast<unsigned>(U64()&63);
+                const auto Dst=Regs[D];
+                Regs[D]= Count==0 ? Dst : (Dst<<Count)|(Dst>>(64-Count));
+                SetRotateFlags(Count,true,Regs[D]); break; }
+            case Op::RorI: {
+                const auto D=Reg(); const auto Count=static_cast<unsigned>(U64()&63);
+                const auto Dst=Regs[D];
+                Regs[D]= Count==0 ? Dst : (Dst>>Count)|(Dst<<(64-Count));
+                SetRotateFlags(Count,false,Regs[D]); break; }
+            case Op::RolR: {
+                const auto D=Reg(),S=Reg(); const auto Count=static_cast<unsigned>(Regs[S]&63);
+                const auto Dst=Regs[D];
+                Regs[D]= Count==0 ? Dst : (Dst<<Count)|(Dst>>(64-Count));
+                SetRotateFlags(Count,true,Regs[D]); break; }
+            case Op::RorR: {
+                const auto D=Reg(),S=Reg(); const auto Count=static_cast<unsigned>(Regs[S]&63);
+                const auto Dst=Regs[D];
+                Regs[D]= Count==0 ? Dst : (Dst>>Count)|(Dst<<(64-Count));
+                SetRotateFlags(Count,false,Regs[D]); break; }
+            case Op::Bswap: {
+                const auto D=Reg(); Regs[D]=Bswap64(Regs[D]); break; }
+            case Op::Cmp: {
+                const auto A=Reg(),B=Reg();
+                SetSubFlags(Flags,Regs[A],Regs[B],Regs[A]-Regs[B]); break; }
+            case Op::Jmp: { const auto Operand=Pc; Target(U32() ^ BranchMask(Program.Key, Operand)); break; }
+            case Op::Jz: case Op::Jnz: case Op::Ja: case Op::Jae: case Op::Jb: case Op::Jbe:
+            case Op::Js: case Op::Jns: case Op::Jl: case Op::Jge: case Op::Jle: case Op::Jg:
+            case Op::Jo: case Op::Jno: case Op::Jp: case Op::Jnp: {
+                const auto Operand=Pc;
+                const auto T=U32() ^ BranchMask(Program.Key, Operand);
+                if (TakeBranch(Op)) Target(T); break; }
+            case Op::Push: Stack.push_back(Regs[Reg()]); break;
+            case Op::Pop: { const auto D=Reg(); if(Stack.empty()) throw std::runtime_error("VM2 stack underflow"); Regs[D]=Stack.back(); Stack.pop_back(); break; }
+            case Op::Call: { const auto Operand=Pc; const auto T=U32() ^ BranchMask(Program.Key, Operand); Calls.push_back(Pc); Target(T); break; }
+            case Op::Ret: {
+                // An empty VM2 call stack means the lifted function is
+                // returning to its native caller: behave exactly like Halt.
+                if (Calls.empty()) {
+                    for (std::size_t I = 0; I < Logical.size(); ++I) Logical[I] = Regs[Program.Registers[I]];
+                    return;
+                }
+                Target(static_cast<std::uint32_t>(Calls.back())); Calls.pop_back(); break; }
+            case Op::Load64: {
+                const auto D=Reg(); const auto Off=Reg();
+                if (Regs[Off]>Memory.size()-8) throw std::runtime_error("VM2 load OOB");
+                std::memcpy(&Regs[D],Memory.data()+Regs[Off],8); break; }
+            case Op::Load64D: {
+                const auto D=Reg(); const auto B=Reg(); const auto Disp=U64();
+                const auto Addr=Regs[B]+Disp;
+                if (Memory.size()<8 || Addr>Memory.size()-8) throw std::runtime_error("VM2 load OOB");
+                std::memcpy(&Regs[D],Memory.data()+Addr,8); break; }
+            case Op::Store64: {
+                const auto S=Reg(); const auto Off=Reg();
+                if (Regs[Off]>Memory.size()-8) throw std::runtime_error("VM2 store OOB");
+                std::memcpy(Memory.data()+Regs[Off],&Regs[S],8); break; }
+            case Op::Store64D: {
+                const auto B=Reg(); const auto S=Reg(); const auto Disp=U64();
+                const auto Addr=Regs[B]+Disp;
+                if (Memory.size()<8 || Addr>Memory.size()-8) throw std::runtime_error("VM2 store OOB");
+                std::memcpy(Memory.data()+Addr,&Regs[S],8); break; }
+            case Op::Nop: break;
+            case Op::Halt:
+                for (std::size_t I = 0; I < Logical.size(); ++I) Logical[I] = Regs[Program.Registers[I]];
+                return;
+            case Op::Count: throw std::runtime_error("VM2 invalid sentinel opcode");
+            }
+        }
+        throw std::runtime_error("VM2 fuel exhausted");
+    }
+
+private:
+    static void ValidateConfig(const RunConfig& Config) {
+        if (Config.MemoryBytes < 8) throw std::runtime_error("VM2 memory too small");
+        if (Config.MemoryBytes > (std::size_t{1} << 26)) throw std::runtime_error("VM2 memory configuration too large");
+        if (Config.Fuel == 0) throw std::runtime_error("VM2 fuel configuration invalid");
+    }
+
+    std::array<std::uint64_t, KRegisterCount> Regs{};
+    std::vector<std::uint8_t> Memory;
+    std::vector<std::uint64_t> Stack;
+    std::vector<std::size_t> Calls;
+    Flags Flags;
+};
+
+std::uint64_t FactorialNative(std::uint64_t N) {
+    std::uint64_t Result=1;
+    while(N) Result*=N--;
+    return Result;
+}
+
+std::uint64_t CallMemoryNative(std::uint64_t Input) {
+    return ((Input + 7) * 3) ^ 0x55;
+}
+
+std::uint64_t BranchDemoNative(std::uint64_t X) {
+    std::uint64_t R = 0;
+    if (X < 100) R += 1;
+    if (X == 100) R += 2;
+    if (X > 100) R += 4;
+    if (static_cast<std::int64_t>(X) < -3) R += 8;
+    if (static_cast<std::int64_t>(X) >= 0) R += 16;
+    if ((std::popcount(static_cast<std::uint8_t>(X)) % 2) == 0) R += 32; else R += 64;
+    if ((X & 0x7FFFFFFFFFFFFFFFULL) != 0) R += 128; else R += 256;
+    if (static_cast<std::int64_t>(X) > 5) R += 512; else R += 1024;
+    if (X < 100) R += 2048;
+    if (X > 100) R += 4096;
+    if (static_cast<std::int64_t>(X) >= 0) R += 8192;
+    if (static_cast<std::int64_t>(X) < -3) R += 16384;
+    if ((std::popcount(static_cast<std::uint8_t>(X)) % 2) == 1) R += 32768;
+    if ((X & 0x7FFFFFFFFFFFFFFFULL) != 0) R += 65536;
+    return R;
+}
+
+std::uint64_t ArithMemDemoNative(std::uint64_t X) {
+    const std::uint64_t A = ((X | 0xF0ULL) & 0xFFULL) * 3ULL;
+    const std::uint64_t B = A >> 2;
+    const std::uint64_t C = static_cast<std::uint64_t>(static_cast<std::int64_t>(X) >> 3);
+    const std::uint64_t S = (X >> 1) & 7ULL;
+    const std::uint64_t E = (X + 3ULL) << (S & 63);
+    const std::uint64_t F = static_cast<std::uint64_t>(static_cast<std::int64_t>(X * 5ULL) >> (S & 63));
+    const std::uint64_t Helper = X * 7ULL + 1ULL;
+    return Helper ^ E ^ A ^ B ^ C ^ F;
+}
+
+// Covers the AndI/Neg/Not/Adc/Rol/Ror/Bswap handlers: NEG with full x86 CF
+// semantics (CF=1 unless the operand is zero), flag-preserving NOT, immediate
+// AND, the ADC carry chain read after NEG, x86 rotate flag semantics (only
+// CF/OF move) and byte-order reversal.
+std::uint64_t Bswap64Native(std::uint64_t Value) {
+    return ((Value & 0x00000000000000FFULL) << 56) | ((Value & 0x000000000000FF00ULL) << 40) |
+           ((Value & 0x0000000000FF0000ULL) << 24) | ((Value & 0x00000000FF000000ULL) << 8) |
+           ((Value & 0x000000FF00000000ULL) >> 8) | ((Value & 0x0000FF0000000000ULL) >> 24) |
+           ((Value & 0x00FF000000000000ULL) >> 40) | ((Value & 0xFF00000000000000ULL) >> 56);
+}
+
+std::uint64_t LogicDemoNative(std::uint64_t X) {
+    const std::uint64_t Negated = 0ULL - X;
+    const std::uint64_t Carry = X != 0 ? 1ULL : 0ULL;  // CF left by NEG
+    const std::uint64_t Inverted = ~Negated;
+    const std::uint64_t Rotated = std::rotl(X, 7) ^ std::rotr(X, 3);
+    return (Inverted & 0xFFFFFFFFULL) ^ (Negated << 1) ^ Carry ^ Rotated ^ Bswap64Native(X);
+}
+
+Program CompileLogicDemo(std::uint64_t Seed) {
+    Program Result;
+    Result.Map = MakeMap(Seed ^ 0x9E3779B97F4A7C15ULL);
+    Result.Registers = MakeRegisterMap(Seed ^ 0x2545F4914F6CDD1DULL);
+    auto VariantSeed = Seed ^ 0x84222325CBF29CE4ULL;
+    for (auto& Variant : Result.HandlerVariants) Variant = static_cast<std::uint8_t>(NextRandom(VariantSeed) & 3U);
+    Result.Key = NextRandom(Seed);
+    Assembler A(Result.Map, Result.Registers, Seed ^ 0x1B8735932BFE6A21ULL, Result.Key);
+
+    A.Ri(Op::MovI, 3, 0);                    // r3 = 0 (carry accumulator)
+    A.Rr(Op::Mov, 1, 0);                     // r1 = x
+    A.R(Op::Neg, 1);                         // r1 = -x, CF = x != 0
+    A.Rr(Op::Adc, 3, 3);                     // r3 = 0 + 0 + CF
+    A.Rr(Op::Mov, 2, 1);                     // r2 = -x
+    A.R(Op::Not, 2);                         // r2 = ~(-x)
+    A.Ri(Op::AndI, 2, 0xFFFFFFFFULL);        // r2 &= mask
+    A.Ri(Op::ShlI, 1, 1);                    // r1 = (-x) << 1
+    A.Rr(Op::Xor, 2, 1);
+    A.Rr(Op::Xor, 2, 3);                     // fold in the NEG carry
+    A.Rr(Op::Mov, 4, 0);                     // r4 = x
+    A.Ri(Op::RolI, 4, 7);                    // r4 = rotl(x, 7)
+    A.Rr(Op::Mov, 5, 0);                     // r5 = x
+    A.Ri(Op::RorI, 5, 3);                    // r5 = rotr(x, 3)
+    A.Rr(Op::Xor, 4, 5);
+    A.Rr(Op::Mov, 6, 0);                     // r6 = x
+    A.R(Op::Bswap, 6);                       // r6 = bswap(x)
+    A.Rr(Op::Xor, 2, 4);
+    A.Rr(Op::Xor, 2, 6);
+    A.Rr(Op::Mov, 0, 2);
+    A.None(Op::Halt);
+
+    SealProgram(Result, A);
+    return Result;
+}
+
+// Loads from a base that lands far outside VM memory; used for the OOB test.
+Program CompileOobDemo(std::uint64_t Seed) {
+    Program Result;
+    Result.Map = MakeMap(Seed ^ 0x2545F4914F6CDD1DULL);
+    Result.Registers = MakeRegisterMap(Seed ^ 0x9E3779B97F4A7C15ULL);
+    auto KeySeed = Seed ^ 0xD6E8FEB86659FD93ULL;
+    Result.Key = NextRandom(KeySeed);
+    Assembler A(Result.Map, Result.Registers, Seed, Result.Key);
+    A.Ri(Op::MovI, 1, 0xFFFFFFFFFFFFFF00ULL);
+    A.RrI(Op::Load64D, 0, 1, 0xFFULL);
+    A.None(Op::Halt);
+    SealProgram(Result, A);
+    return Result;
+}
+
+// Endless jump; used for the fuel-limit test.
+Program CompileSpinDemo(std::uint64_t Seed) {
+    Program Result;
+    Result.Map = MakeMap(Seed ^ 0x165667B19E3779F9ULL);
+    Result.Registers = MakeRegisterMap(Seed ^ 0x85EBCA77C2B2AE63ULL);
+    auto KeySeed = Seed ^ 0x6C62272E07BB0142ULL;
+    Result.Key = NextRandom(KeySeed);
+    Assembler A(Result.Map, Result.Registers, Seed, Result.Key);
+    A.Label("spin");
+    A.Jump(Op::Jmp, "spin");
+    SealProgram(Result, A);
+    return Result;
+}
+
+} // namespace
+
+void InvokeLiftedProgram(const LiftedProgram& Lifted, VmBridgeContext& Context,
+                         std::uint64_t Seed, bool Trace, const RunConfig& Config) {
+    if (Lifted.Instructions.empty()) throw std::runtime_error("VM bridge received an empty program");
+
+    Program Result;
+    Result.Map = MakeMap(Seed ^ 0xB7E151628AED2A6BULL);
+    Result.Registers = MakeRegisterMap(Seed ^ 0xC6EF372FE94F82BEULL);
+    auto VariantSeed = Seed ^ 0x9E3779B97F4A7C15ULL;
+    for (auto& Variant : Result.HandlerVariants) Variant = static_cast<std::uint8_t>(NextRandom(VariantSeed) & 3U);
+    Result.Key = NextRandom(VariantSeed);
+    Assembler A(Result.Map, Result.Registers, Seed ^ 0xD1B54A32D192ED03ULL, Result.Key);
+
+    std::unordered_map<std::uint32_t, std::string> Labels;
+    for (const auto& Instruction : Lifted.Instructions) {
+        if (!Labels.emplace(Instruction.Address, "B_" + std::to_string(Instruction.Address)).second) {
+            throw std::runtime_error("VM bridge duplicate lifted address");
+        }
+    }
+    if (!Labels.contains(Lifted.EntryAddress)) throw std::runtime_error("VM bridge entry is not an instruction boundary");
+
+    const auto Register = [](std::uint8_t Value) {
+        if (Value >= KRegisterCount) throw std::runtime_error("VM bridge register outside VM2 register file");
+        return Value;
+    };
+    const auto Target = [&](std::uint32_t Address) -> const std::string& {
+        const auto It = Labels.find(Address);
+        if (It == Labels.end()) throw std::runtime_error("VM bridge branch target is not a lifted boundary");
+        return It->second;
+    };
+    const auto Branch = [&](LiftedOp Lifted, std::uint32_t Destination) {
+        switch (Lifted) {
+        case LiftedOp::Jmp: A.Jump(Op::Jmp, Target(Destination)); break;
+        case LiftedOp::Jz: A.Jump(Op::Jz, Target(Destination)); break;
+        case LiftedOp::Jnz: A.Jump(Op::Jnz, Target(Destination)); break;
+        case LiftedOp::Ja: A.Jump(Op::Ja, Target(Destination)); break;
+        case LiftedOp::Jae: A.Jump(Op::Jae, Target(Destination)); break;
+        case LiftedOp::Jb: A.Jump(Op::Jb, Target(Destination)); break;
+        case LiftedOp::Jbe: A.Jump(Op::Jbe, Target(Destination)); break;
+        case LiftedOp::Js: A.Jump(Op::Js, Target(Destination)); break;
+        case LiftedOp::Jns: A.Jump(Op::Jns, Target(Destination)); break;
+        case LiftedOp::Jl: A.Jump(Op::Jl, Target(Destination)); break;
+        case LiftedOp::Jge: A.Jump(Op::Jge, Target(Destination)); break;
+        case LiftedOp::Jle: A.Jump(Op::Jle, Target(Destination)); break;
+        case LiftedOp::Jg: A.Jump(Op::Jg, Target(Destination)); break;
+        case LiftedOp::Jo: A.Jump(Op::Jo, Target(Destination)); break;
+        case LiftedOp::Jno: A.Jump(Op::Jno, Target(Destination)); break;
+        case LiftedOp::Jp: A.Jump(Op::Jp, Target(Destination)); break;
+        case LiftedOp::Jnp: A.Jump(Op::Jnp, Target(Destination)); break;
+        default: throw std::runtime_error("VM bridge internal: not a branch");
+        }
+    };
+
+    for (const auto& Instruction : Lifted.Instructions) {
+        A.Label(Labels.at(Instruction.Address));
+        switch (Instruction.Op) {
+        case LiftedOp::MovI: A.Ri(Op::MovI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::Mov: A.Rr(Op::Mov, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::Add: A.Rr(Op::Add, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::AddI: A.Ri(Op::AddI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::Sub: A.Rr(Op::Sub, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::SubI: A.Ri(Op::SubI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::Adc: A.Rr(Op::Adc, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::Sbb: A.Rr(Op::Sbb, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::Mul: A.Rr(Op::Mul, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::MulI: A.Ri(Op::MulI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::Xor: A.Rr(Op::Xor, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::And: A.Rr(Op::And, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::AndI: A.Ri(Op::AndI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::Neg: A.R(Op::Neg, Register(Instruction.Dst)); break;
+        case LiftedOp::Not: A.R(Op::Not, Register(Instruction.Dst)); break;
+        case LiftedOp::Or: A.Rr(Op::Or, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::Test: A.Rr(Op::Test, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::ShlI: A.Ri(Op::ShlI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::ShrI: A.Ri(Op::ShrI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::ShlR: A.Rr(Op::ShlR, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::ShrR: A.Rr(Op::ShrR, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::SarI: A.Ri(Op::SarI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::SarR: A.Rr(Op::SarR, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::RolI: A.Ri(Op::RolI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::RorI: A.Ri(Op::RorI, Register(Instruction.Dst), Instruction.Immediate); break;
+        case LiftedOp::RolR: A.Rr(Op::RolR, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::RorR: A.Rr(Op::RorR, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::Bswap: A.R(Op::Bswap, Register(Instruction.Dst)); break;
+        case LiftedOp::Cmp: A.Rr(Op::Cmp, Register(Instruction.Dst), Register(Instruction.Src)); break;
+        case LiftedOp::Push: A.R(Op::Push, Register(Instruction.Dst)); break;
+        case LiftedOp::Pop: A.R(Op::Pop, Register(Instruction.Dst)); break;
+        case LiftedOp::LoadMem: A.RrI(Op::Load64D, Register(Instruction.Dst), Register(Instruction.Src), Instruction.Immediate); break;
+        case LiftedOp::StoreMem: A.RrI(Op::Store64D, Register(Instruction.Dst), Register(Instruction.Src), Instruction.Immediate); break;
+        case LiftedOp::Call: A.Jump(Op::Call, Target(Instruction.Target)); break;
+        case LiftedOp::Ret: A.None(Op::Ret); break;
+        case LiftedOp::Nop: A.None(Op::Nop); break;
+        case LiftedOp::Halt: A.None(Op::Halt); break;
+        default: Branch(Instruction.Op, Instruction.Target); break;
+        }
+    }
+    SealProgram(Result, A);
+
+    Machine Vm;
+    Vm.RunRegisters(Result, Context.Registers, Trace, Config);
+}
+
+std::uint64_t RunDemo(std::uint64_t Input, std::uint64_t Seed, bool Trace) {
+    if(Input>20) throw std::runtime_error("factorial demo accepts 0..20");
+    const auto Program=CompileFactorial(Seed);
+    Machine Vm;
+    const auto Output=Vm.Run(Program,Input,Trace);
+    std::cout<<"VM2 program: "<<Program.EncryptedCode.size()<<" encrypted bytes\n"
+             <<"opcode fingerprint: ";
+    for(const auto X:Program.Map) std::cout<<std::hex<<std::setw(2)<<std::setfill('0')<<static_cast<unsigned>(X);
+    std::cout<<"\nregister map: ";
+    for(const auto X:Program.Registers) std::cout<<static_cast<unsigned>(X);
+    std::cout<<"\nhandler variants: ";
+    for(const auto X:Program.HandlerVariants) std::cout<<static_cast<unsigned>(X);
+    std::cout<<std::dec<<"\nintegrity tag: 0x"<<std::hex<<Program.Tag<<std::dec<<"\n";
+    return Output;
+}
+
+std::uint64_t RunCallMemoryDemo(std::uint64_t Input, std::uint64_t Seed, bool Trace) {
+    const auto Program = CompileCallMemory(Seed);
+    Machine Vm;
+    const auto Output = Vm.Run(Program, Input, Trace);
+    std::cout << "VM2 call/memory program: " << Program.EncryptedCode.size() << " encrypted bytes\n"
+              << "instruction boundaries: " << Program.InstructionOffsets.size() << "\n"
+              << "integrity tag: 0x" << std::hex << Program.Tag << std::dec << "\n";
+    return Output;
+}
+
+void SelfTest() {
+    std::size_t BranchCases = 0, ArithMemCases = 0, LogicCases = 0;
+    for(std::uint64_t Seed: {1ULL,2ULL,0x123456789abcdef0ULL}) {
+        const auto Program=CompileFactorial(Seed);
+        const auto CallProgram=CompileCallMemory(Seed);
+        Machine Vm;
+        for(std::uint64_t N=0;N<=20;++N) {
+            const auto Actual=Vm.Run(Program,N,false);
+            const auto Expected=FactorialNative(N);
+            if(Actual!=Expected) throw std::runtime_error("VM2 differential test failed");
+        }
+        for(std::uint64_t N=0;N<=100;++N) {
+            const auto Actual=Vm.Run(CallProgram,N,false);
+            const auto Expected=CallMemoryNative(N);
+            if(Actual!=Expected) throw std::runtime_error("VM2 call/memory differential test failed");
+        }
+
+        const auto BranchProgram=CompileBranchDemo(Seed);
+        const auto ArithProgram=CompileArithMemDemo(Seed);
+        const auto LogicProgram=CompileLogicDemo(Seed);
+        for (std::uint64_t N = 0; N <= 255; ++N) {
+            const auto Actual=Vm.Run(BranchProgram,N,false);
+            const auto Expected=BranchDemoNative(N);
+            if(Actual!=Expected) throw std::runtime_error("VM2 branch/flags differential test failed");
+            ++BranchCases;
+            const auto ArithActual=Vm.Run(ArithProgram,N,false);
+            const auto ArithExpected=ArithMemDemoNative(N);
+            if(ArithActual!=ArithExpected) throw std::runtime_error("VM2 arith/memory differential test failed");
+            ++ArithMemCases;
+            const auto LogicActual=Vm.Run(LogicProgram,N,false);
+            const auto LogicExpected=LogicDemoNative(N);
+            if(LogicActual!=LogicExpected) throw std::runtime_error("VM2 logic differential test failed");
+            ++LogicCases;
+        }
+        for (std::uint64_t N : {99ULL,100ULL,101ULL,0x7FFFFFFFFFFFFFFFULL,
+                                0x8000000000000000ULL,0xFFFFFFFFFFFFFFFDULL,
+                                0xFFFFFFFFFFFFFFFEULL,0xFFFFFFFFFFFFFFFFULL}) {
+            const auto Actual=Vm.Run(BranchProgram,N,false);
+            const auto Expected=BranchDemoNative(N);
+            if(Actual!=Expected) throw std::runtime_error("VM2 branch/flags differential test failed");
+            ++BranchCases;
+            const auto ArithActual=Vm.Run(ArithProgram,N,false);
+            const auto ArithExpected=ArithMemDemoNative(N);
+            if(ArithActual!=ArithExpected) throw std::runtime_error("VM2 arith/memory differential test failed");
+            ++ArithMemCases;
+            const auto LogicActual=Vm.Run(LogicProgram,N,false);
+            const auto LogicExpected=LogicDemoNative(N);
+            if(LogicActual!=LogicExpected) throw std::runtime_error("VM2 logic differential test failed");
+            ++LogicCases;
+        }
+
+        // Handler variant identities must hold for every variant value, not
+        // just the seeds' random picks: pin all slots to each value 0..3 and
+        // re-run the factorial/call-memory differentials.
+        for (std::uint64_t VariantValue = 0; VariantValue < 4; ++VariantValue) {
+            auto VariantFactorial = Program;
+            VariantFactorial.HandlerVariants.fill(static_cast<std::uint8_t>(VariantValue));
+            auto VariantCall = CallProgram;
+            VariantCall.HandlerVariants.fill(static_cast<std::uint8_t>(VariantValue));
+            // The integrity tag covers the variants; pinning them changes it.
+            VariantFactorial.Tag = IntegrityTag(VariantFactorial.EncryptedCode,
+                                                VariantFactorial.Map,
+                                                VariantFactorial.Registers,
+                                                VariantFactorial.HandlerVariants,
+                                                VariantFactorial.Key);
+            VariantCall.Tag = IntegrityTag(VariantCall.EncryptedCode,
+                                           VariantCall.Map,
+                                           VariantCall.Registers,
+                                           VariantCall.HandlerVariants,
+                                           VariantCall.Key);
+            for (std::uint64_t N = 0; N <= 20; ++N) {
+                if (Vm.Run(VariantFactorial, N, false) != FactorialNative(N)) {
+                    throw std::runtime_error("VM2 variant factorial differential failed");
+                }
+            }
+            for (std::uint64_t N = 0; N <= 100; ++N) {
+                if (Vm.Run(VariantCall, N, false) != CallMemoryNative(N)) {
+                    throw std::runtime_error("VM2 variant call/memory differential failed");
+                }
+            }
+        }
+
+        auto Tampered = Program;
+        Tampered.EncryptedCode[Tampered.EncryptedCode.size()/2] ^= 1;
+        bool Rejected = false;
+        try { (void)Vm.Run(Tampered, 5, false); }
+        catch (const std::runtime_error&) { Rejected = true; }
+        if (!Rejected) throw std::runtime_error("VM2 tamper test failed");
+
+        auto InstructionTampered = CallProgram;
+        InstructionTampered.EncryptedCode.back() ^= 1;
+        InstructionTampered.Tag = IntegrityTag(InstructionTampered.EncryptedCode,
+                                               InstructionTampered.Map,
+                                               InstructionTampered.Registers,
+                                               InstructionTampered.HandlerVariants,
+                                               InstructionTampered.Key);
+        Rejected = false;
+        try { (void)Vm.Run(InstructionTampered, 5, false); }
+        catch (const std::runtime_error&) { Rejected = true; }
+        if (!Rejected) throw std::runtime_error("VM2 instruction tag test failed");
+
+        // Out-of-bounds VM memory access must fail closed.
+        {
+            const auto OobProgram = CompileOobDemo(Seed);
+            bool OobRejected = false;
+            try { (void)Vm.Run(OobProgram, 0, false); }
+            catch (const std::runtime_error&) { OobRejected = true; }
+            if (!OobRejected) throw std::runtime_error("VM2 OOB memory test failed");
+        }
+        // Configurable fuel must cut off runaway programs.
+        {
+            const auto LoopProgram = CompileSpinDemo(Seed);
+            bool FuelRejected = false;
+            try { (void)Vm.Run(LoopProgram, 0, false, RunConfig{10, 4096}); }
+            catch (const std::runtime_error&) { FuelRejected = true; }
+            if (!FuelRejected) throw std::runtime_error("VM2 fuel limit test failed");
+        }
+    }
+    std::cout<<"VM2 self-test: OK (63 factorial, 303 call/memory, "
+             <<BranchCases<<" branch/flags, "<<ArithMemCases<<" arith/memory, "
+             <<LogicCases<<" logic (AndI/Neg/Not/Adc/Rol/Ror/Bswap), "
+             <<"variant sweep 0..3, 6 tamper cases, oob+fuel)\n";
+}
+
+} // namespace vmprotect

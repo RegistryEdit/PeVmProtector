@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Solution>
+  <Project Path="Src\Libs\PeVmCore\PeVmCore.vcxproj" />
+  <Project Path="Src\Apps\Cli\PeVmCli.vcxproj" />
+  <Project Path="Src\Apps\Stub\PeVmStub.vcxproj" />
+  <Project Path="Src\Apps\Gui\PeVmProtectorGui.vcxproj" />
+  <Project Path="Tests\LifterFixture\LifterFixture.vcxproj" />
+  <Project Path="Tests\DependencyFixture\DepFixture.vcxproj" />
+  <Project Path="Tests\DependencyFixture\DependencyApp.vcxproj" />
+</Solution>
