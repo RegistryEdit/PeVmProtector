@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "VmProtect.h"
+#include "PeImage.h"
 
 namespace x64lift {
 
@@ -35,6 +36,8 @@ struct FunctionCandidate {
 // them. MinimumBytes filters tiny thunks.
 std::vector<FunctionCandidate> ScanFunctions(const std::filesystem::path& Input,
                                              std::size_t MinimumBytes = 16);
+std::vector<FunctionCandidate> ScanFunctions(const pevm::pe::ImageView& Image,
+                                             std::size_t MinimumBytes = 16);
 
 // Per-function failures when lifting a candidate list; the successes still
 // lift and serialize normally.
@@ -47,6 +50,8 @@ struct MultiLiftAttempt {
 // were rejected (fail closed per function instead of the whole batch).
 MultiLiftAttempt LiftPeFunctionsTolerant(const std::filesystem::path& Input,
                                          const std::vector<std::uint32_t>& FunctionRvas);
+MultiLiftAttempt LiftPeFunctionsTolerant(const pevm::pe::ImageView& Image,
+                                         const std::vector<std::uint32_t>& FunctionRvas);
 
 // VMP-style mutation pass over a lifted program: algebraic rewrites whose
 // result is provably identical and junk instructions written to scratch
@@ -56,6 +61,8 @@ void MutateProgram(vmprotect::LiftedProgram& Program, std::uint64_t Seed);
 
 LiftResult LiftPeFunction(const std::filesystem::path& Input, std::uint32_t FunctionRva,
                           std::size_t MaximumBytes = 4096);
+LiftResult LiftPeFunction(const pevm::pe::ImageView& Image, std::uint32_t FunctionRva,
+                          std::size_t MaximumBytes = 4096);
 // Lifts a bare machine-code blob (no PE container); FunctionRva only names
 // the entry boundary. Used by `lift-raw` for direct ISA decode testing.
 LiftResult LiftRawCode(const std::vector<std::uint8_t>& Code, std::uint32_t FunctionRva,
@@ -63,21 +70,23 @@ LiftResult LiftRawCode(const std::vector<std::uint8_t>& Code, std::uint32_t Func
 void WriteManifest(const std::filesystem::path& Output, const LiftResult& Result);
 MultiLiftResult LiftPeFunctions(const std::filesystem::path& Input,
                                 const std::vector<std::uint32_t>& FunctionRvas);
+MultiLiftResult LiftPeFunctions(const pevm::pe::ImageView& Image,
+                                const std::vector<std::uint32_t>& FunctionRvas);
 
-// Serializes one lifted program to .vmp3 v3 (single entry): the instruction
-// table is XTEA-CTR encrypted with a key derived from the build secret, seed
-// and handler profile and authenticated by a trailing tag; decoy bytes
-// (anti-disassembly) follow.
+// Serializes a lifted program into the authenticated VM image. The loader
+// verifies HMAC-SHA256 over the header, entries, ciphertext and decoys before
+// decrypting the XTEA-CTR instruction table. Key purposes are separated.
 std::vector<std::uint8_t> SerializeVmp3(const LiftResult& Result, std::uint64_t Seed,
                                         std::string_view BuildSecret,
                                         std::span<const std::uint8_t> HandlerProfile,
                                         bool AntiDisassembly = false);
-// Serializes several lifted programs into one .vmp3 v3 container: a plain
+// Serializes several lifted programs into one authenticated VM image: a plain
 // entry table (RVA, offset, count) precedes the concatenated encrypted
 // instruction table, so the loader can install one bridge per function.
 std::vector<std::uint8_t> SerializeVmp3Multi(const MultiLiftResult& Results, std::uint64_t Seed,
                                              std::string_view BuildSecret,
                                              std::span<const std::uint8_t> HandlerProfile,
-                                             bool AntiDisassembly = false);
+                                             bool AntiDisassembly = false,
+                                             std::vector<vmprotect::CompilationStats>* Statistics = nullptr);
 
 } // namespace x64lift

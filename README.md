@@ -35,18 +35,28 @@ Src\
   Apps\Stub\                Stub.cpp + PeVmStub.vcxproj        (loader)
   Apps\Gui\                 QtGui.cpp + PeVmProtectorGui.vcxproj (Qt6 GUI)
   Libs\Container\           .pvm container format/crypto/key-VM (PeVmContainer)
+  Libs\Pe\                  validated PE file views and transactional file I/O
   Libs\Crypto\              SHA-256/HMAC/scrypt/XTEA-CTR/LZSS/Base64
-  Libs\License\             machine-locked licensing (HMAC)
+  Libs\License\             product/device-bound ECDSA P-256 licenses (PEVM-LICENSE)
   Libs\Lifter\              x64 decoder/IR lifter/mutation
   Libs\Vm\                  VM2 runtime
   Libs\PeVmCore\            static-library project aggregating the libs
 Tests\
-  LifterFixture\  DependencyFixture\  RunTests.ps1
+  LifterFixture\  DependencyFixture\  VmRegression\  PeRegression\  RunTests.ps1
 ```
 
-`PeVmCore.vcxproj` is a static library linked by the three executable
-projects via `ProjectReference`; header directories are injected by
+`PeVmCore.vcxproj` is a static library linked by the CLI, loader and VM
+regression project via `ProjectReference`; the GUI launches the CLI as a
+subprocess. Header directories are injected by
 `Directory.Build.props` so `#include`s stay flat.
+
+The PE build pipeline shares one immutable input snapshot across inspection,
+batch lifting and in-memory container construction. Bounded RVA views reject
+zero-fill and cross-section reads; output replacement preserves the previous
+file when commit fails. Section layout is planned with checked arithmetic;
+relocations are preflighted and mapped memory has exception-safe ownership.
+See [PE architecture](Docs/PeArchitecture.md) for
+module boundaries, compatibility changes and regression coverage.
 
 ```powershell
 # Full build (or open PeVmProtector.slnx in Visual Studio)
@@ -54,6 +64,9 @@ msbuild PeVmProtector.slnx -p:Configuration=Release -m
 
 # Tests
 powershell -ExecutionPolicy Bypass -File Tests\RunTests.ps1 -Configuration Release
+
+# Repeated VM-call microbenchmark (compile each call / reuse, median of 5)
+bin\Release\VmRegression.exe --benchmark
 ```
 
 - Output lands in `bin\Release\`: `PeVm.exe` (CLI), `PeVmStub.exe` (loader),
@@ -91,8 +104,9 @@ bin\Release\PeVm.exe protect-functions app.exe app.multi.exe "build key" 0x1000 
 bin\Release\PeVm.exe protect-all app.exe app.all.exe "build key" 0x1234 --anti-disasm
 bin\Release\PeVm.exe scan-functions app.exe scan.json
 bin\Release\PeVm.exe lift-raw 4887D14889D0C3 0 --rcx=0x11 --rdx=0x22   # lift raw hex machine code
-bin\Release\PeVm.exe machine-id
-bin\Release\PeVm.exe make-license <secret-hex-64> 30
+bin\Release\PeVm.exe license-machine-id
+bin\Release\PeVm.exe license-keygen issuer.private issuer.pub
+bin\Release\PeVm.exe license-issue issuer.private 30 --machine=<64hex> --product=my-product --output=customer.license
 ```
 
 The GUI is a Qt6 front-end (QProcess driving the sibling `PeVm.exe`):
@@ -103,6 +117,19 @@ VM Demo), a monospace log pane, busy indicator and a status bar with per-step
 timing. The function page accepts multiple RVAs (comma-separated switches to
 `protect-functions`) and offers Scan functions (auto-discovery) and Protect
 ALL (full virtualization) buttons.
+
+`pack`, `wrap` and `protect-*` print a detailed build transcript by default.
+Stages flush immediately, including when the CLI is launched by the GUI:
+PE architecture/subsystem/entry and section layout; compression request and
+actual result; cipher/KDF settings; function selection, skip reasons and
+instruction counts before/after mutation; public license policy; wrapper
+layout; final file size, output/input ratio, SHA-256 and elapsed times.
+The selection rate counts discovered candidates, not all code in the PE.
+Compression ratios describe stored payload bytes; the final executable also
+includes the loader and metadata. Passwords, signing keys, full license tokens
+and raw watermark text are excluded. `[complete]` appears only after the final
+output is committed; failures identify the active stage and retain a nonzero
+exit code. A nested temporary container does not emit a completion message.
 
 Protected PEs use `.vmp0` as the loader/runtime section, `.vmp1` as the
 read-only encrypted payload/VM data section. The original `.text` never
@@ -123,27 +150,30 @@ the container itself.
 ### VMP feature comparison
 
 - **Mutation**: `--mutate` performs per-build random mutation on the VM IR —
-  `ADDI/SUBI` two's-complement swaps (only when the next instruction
-  overwrites the flags, making the carry difference unobservable), exact
-  power-of-two `MULI` → shift demotion, and junk instructions writing scratch
+  `ADDI/SUBI` two's-complement swaps and power-of-two `MULI` → shift demotion
+  both require an immediate successor that overwrites all flags without
+  reading them. ADC/SBB, shifts/rotates and CALL/RET do not qualify.
+  Junk instructions write scratch
   registers between real instructions (unique synthetic addresses, never
   branch targets). Seeded: one seed reproduces one mutation layout.
 - **Watermark**: `--watermark=text` embeds a customer watermark XOR-obfuscated
-  into the `.vmp2` metadata (v4); `inspect` decodes it. Not greppable in the
+  into the `.vmp2` metadata (v5); `inspect` decodes it. Not greppable in the
   binary.
 - **Payload compression**: `pack --compress` (same option on wrap/protect-*)
   LZSS-compresses before encryption (4 KiB window, 3..18 byte matches);
   decompression happens before the SHA-256 check; incompressible inputs stay
   stored, so containers never grow.
-- **Licensing**: `--license --license-secret=<64hex>` makes the wrapper verify
-  a license before running the payload — `PeVm make-license <secret> [days]
-  [--machine=<hex8>]` issues machine-locked, optionally expiring
-  `PEVML1.<base64>` keys (HMAC-SHA256 signed); the loader reads them from the
-  `PEVM_LICENSE` environment variable or a sidecar `.license` file. Missing,
-  forged, foreign-machine and expired keys all fail uniformly with "license
-  check failed". `PeVm machine-id` prints the local lock ID. Prototype
-  strength: the HMAC secret is symmetric and embedded in the loader — it
-  raises the bar rather than being unforgeable.
+- **Licensing**: `--license --license-public-key=<file> --license-product=<id>`
+  enables ECDSA P-256/SHA-256 verification before payload execution.
+  The wrapper contains a public key; the signing key stays in a DPAPI-protected
+  file on the issuing machine. Licenses bind a case-sensitive product ID and
+  a 64-hex-digit device ID, with optional expiry. Only `PEVM-LICENSE` is accepted;
+  reissue all old cards and rebuild/distribute wrappers. There is no legacy
+  compatibility switch. See [license issuance and migration](Docs/Licensing.md).
+  `PEVM_LICENSE` takes precedence over `<wrapper.exe>.license`; only an absent
+  variable allows sidecar fallback. Invalid, empty or oversized values fail closed.
+  Verification runs at startup. This offline scheme has no trusted time source
+  or online revocation and does not prevent arbitrary clock rollback or client patching.
 - **Import protection**: manual mapping plus runtime resolution means the
   on-disk IAT is never used — import protection is inherent.
 - **Anti-debug / anti-dump**: see below.
@@ -178,9 +208,7 @@ native, never mistranslating.
 
 Container v5 adds a Compression byte (0=stored, 1=LZSS) over v4 and
 redefines OriginalSize as the decompressed size; only v5 is accepted, older
-containers fail with "unsupported container version". `.vmp2` metadata v4
-adds licensing fields (LicenseRequired + 32-byte HMAC secret) on top of the
-watermark.
+containers fail with "unsupported container version". `.vmp2` metadata v5 replaces the shared license secret with a public verification key and product digest; older wrapper metadata is rejected.
 
 The wrapper runs by double-click without a password. The build password is
 sealed into per-build salt + stub/payload fingerprint key material with its
@@ -262,6 +290,44 @@ key material must ultimately be recoverable by the local loader, so this
 raises the cost of static extraction — it does not claim unbreakable
 client-side protection.
 
+## VM image authentication and execution validation
+
+VM images now use a full 32-byte HMAC-SHA256 tag over the header, function
+entry table, encrypted instructions and decoy bytes. The loader authenticates
+before allocating or decrypting the instruction table. Encryption,
+authentication and per-function runtime seeds use separate derivation
+purposes, bound to the build secret, seed and handler profile. XTEA-CTR
+remains the instruction-table cipher.
+
+The shared codec rejects unsupported internal formats, reserved fields,
+empty/overlapping/gapped function ranges, duplicate function entries,
+unclaimed bytes and truncated data. Functions are published to the bridge
+only after every function has compiled successfully. The decoder wipes its
+temporary decrypted table when it leaves scope, including exception paths.
+
+Runtime checks bind instruction offsets and 64-bit instruction tags to the
+whole-program checksum, validate opcode/register maps and handler variants,
+and enforce exact operand lengths before dispatch. Lifted entry addresses
+are honored even when the entry is not the first instruction. These runtime
+checksums detect corruption; they are not cryptographic MACs or a guarantee
+against an attacker controlling the running process. Lifted IR is still kept
+for the bridge's existing digest check.
+
+The compiler now shuffles basic blocks by function seed and reconnects
+fallthrough and call-continuation edges. An explicit trap closes paths past
+the last source instruction. Each instruction has an address-bound rolling
+decode state with plaintext-prefix feedback; existing arithmetic handler
+variants are selected per instruction. This is interpreter obfuscation;
+whole-image HMAC authentication remains a separate layer.
+
+On a same-machine Release microbenchmark, a four-IR instruction cached call
+rose from about 265 ns to 287 ns; compiling on every call costs about 2,516 ns.
+A cached sum loop with 16 iterations costs about 2.76 microseconds. Generated
+link instructions consume fuel, so limits count emitted VM instructions.
+These measurements are not whole-application estimates. Build output lists
+authentication, decoding mode and per-function block/relocation/link/bytecode
+counts. See `Docs/VmProtection.md` for implementation and verification details.
+
 ## VM instruction set
 
 The VM has 16 64-bit logical registers (x64-numbered) + 8 physical scratch
@@ -275,7 +341,8 @@ borrow), `MUL/MULI`, `XOR`, `AND`, `ANDI`, `OR`, `NEG`, `NOT`, `BSWAP`,
 
 `ADD/ADDI/SUB/SUBI/XOR/AND/OR` each have **4 equivalent handler
 implementations** (algebraic identities such as
-`a+b = (a|b)+(a&b) = 2*(a&b)+(a^b)`), picked randomly per build; rotates
+`a+b = (a|b)+(a&b) = 2*(a&b)+(a^b)`), selected from the function profile and
+each instruction's decoding context; rotates
 follow x86 rotate semantics (only CF/OF move, ZF/SF/PF preserved), `BSWAP` is
 a pure byte-order reversal.
 
@@ -288,18 +355,18 @@ boundaries (CFI).
 Memory: `LOAD64/STORE64` (register offset) and `LOAD64D/STORE64D` (base
 register + immediate displacement); out-of-bounds fails closed.
 
-Every VM instruction carries an independent authentication tag — tampering
+Every VM instruction carries an independent 64-bit corruption-check tag — tampering
 with a single instruction fails before the dispatcher. `ADD/ADDI/SUB/SUBI/
-XOR/AND/OR` have randomly chosen equivalent handler implementations per
-build; `Cmp/Test/Add/Sub/Adc/Sbb` and shifts derive all flags from operands
+XOR/AND/OR` have equivalent handler implementations selected per
+instruction; `Cmp/Test/Add/Sub/Adc/Sbb` and shifts derive all flags from operands
 and result. Fuel (default 100000) and memory size are configurable per run.
 
 `vm2-self-test` runs differential tests over 3 opcode maps: factorial (63
 cases), call/memory (303), branch/flags (792, all 16 condition codes),
 arith/memory (792, extended ALU + base+displacement addressing + data stack +
 scratch), logic (792, AndI/Neg/Not/Adc/Rol/Ror/Bswap), a handler-variant
-sweep (each variant value 0..3 pinned, factorial/call-memory reruns) and 6
-tamper/OOB/fuel cases.
+sweep (each variant value 0..3 pinned, factorial/call-memory reruns), 39
+tamper/layout cases, and OOB/fuel rejection.
 
 ## VMProtect-style virtualization core
 
@@ -307,7 +374,7 @@ The factorial logic in `virtualize-demo` never executes as a native loop — it
 is assembled into VM2 bytecode first:
 
 1. every seed gets its own opcode and register mapping;
-2. the bytecode is stream-encrypted as a whole;
+2. each bytecode record is encoded with an address-bound rolling state;
 3. the runtime decrypts and executes it through a handler dispatcher;
 4. the VM maintains VIP, 16 virtual registers, full flags, data/call stacks
    and virtual memory;
@@ -317,6 +384,26 @@ is assembled into VM2 bytecode first:
 targets, virtual memory `STORE64/LOAD64` and instruction-boundary CFI.
 
 ## x64 function lifting (VM2)
+
+The loader calls `CompileLiftedProgram` once per function when loading
+`.vmp3`; subsequent bridge calls reuse immutable encrypted bytecode through
+`InvokeCompiledProgram`. Registers, flags, stacks and VM memory remain local
+to each invocation. IR digest, bytecode integrity, instruction tags, CFI and
+fuel checks remain active. `InvokeLiftedProgram` remains the one-shot API.
+Caching adds resident bytecode storage per loaded function in exchange for
+avoiding repeated assembly and encryption. The authenticated VM image format
+has changed; rebuild existing protected wrappers with the matching CLI and
+loader. Public command names remain unchanged.
+
+`VmRegression.exe` checks reuse, snapshot independence from modified source
+IR, 4,000 concurrent calls, state isolation, OOB/fuel rejection, a non-first
+entry address, 5,808 image tamper/truncation/structural rejections, and 4,608
+mutation/flags differential cases. Another 9,536 native-result/control-flow
+checks cover all conditional branches, shuffled loops, nested calls and
+terminal fallthrough; 64 seeds produce 23 distinct loop layouts.
+`--benchmark` compares compilation per call against reuse for four IR
+instructions and reports a cached loop workload; it is not an application-level
+speedup measurement. GUI command logs redact build passwords. License settings accept only a public key file and product ID; private signing keys are never passed to protection commands.
 
 The conservative x64 lifter accepts an RVA in a PE32+ x64 executable, decodes
 basic blocks (linear sweep plus a branch-target worklist so code past an
@@ -390,4 +477,4 @@ end-to-end that protect-function trampolines reach VM2;
 with both trampolines hitting VM2 correctly; `protect_all_virtualization`
 covers the full-virtualization pipeline; `mutation_and_watermark` covers
 mutation differentials and watermark round-trips; `licensing_and_compression`
-covers license reject/accept and compression round-trips.
+covers signed license issuance, all protection commands, sidecar precedence, invalid/legacy license rejection, public-only wrapper metadata, and compression round-trips. `LicenseRegression.exe` additionally covers cryptographic tampering, time boundaries, malformed inputs, and DPAPI key lifecycle; tests require access to the current Windows user DPAPI profile.

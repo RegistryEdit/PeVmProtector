@@ -21,16 +21,30 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ItemGroup>
+    <ClCompile Include="..\Pe\PeImage.cpp" />
+    <ClCompile Include="..\Pe\PeLayout.cpp" />
+    <ClCompile Include="..\Pe\PeRelocations.cpp" />
+    <ClCompile Include="..\Pe\FileIo.cpp" />
     <ClCompile Include="..\Container\PeVmContainer.cpp" />
+    <ClCompile Include="..\Container\VmImageCodec.cpp" />
     <ClCompile Include="..\Crypto\PeVmCrypto.cpp" />
+    <ClCompile Include="..\License\PeVmLicense.cpp" />
     <ClCompile Include="..\Lifter\X64Lifter.cpp" />
     <ClCompile Include="..\Vm\VmProtect.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\Pe\PeImage.h" />
+    <ClInclude Include="..\Pe\PeLayout.h" />
+    <ClInclude Include="..\Pe\PeRelocations.h" />
+    <ClInclude Include="..\Pe\WindowsResources.h" />
+    <ClInclude Include="..\Pe\FileIo.h" />
     <ClInclude Include="..\Container\PeVmContainer.h" />
+    <ClInclude Include="..\Container\BuildLog.h" />
     <ClInclude Include="..\Container\WrapperFormat.h" />
+    <ClInclude Include="..\Container\VmImageCodec.h" />
     <ClInclude Include="..\Crypto\PeVmCrypto.h" />
     <ClInclude Include="..\License\PeVmLicense.h" />
+    <ClInclude Include="..\License\PeVmLicenseFormat.h" />
     <ClInclude Include="..\Lifter\X64Lifter.h" />
     <ClInclude Include="..\Vm\VmProtect.h" />
   </ItemGroup>

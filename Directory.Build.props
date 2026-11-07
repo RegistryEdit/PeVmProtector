@@ -17,7 +17,7 @@
       <WarningLevel>Level4</WarningLevel>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/utf-8 /permissive- %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)Src\Libs\Container;$(MSBuildThisFileDirectory)Src\Libs\Crypto;$(MSBuildThisFileDirectory)Src\Libs\License;$(MSBuildThisFileDirectory)Src\Libs\Lifter;$(MSBuildThisFileDirectory)Src\Libs\Vm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)Src\Libs\Pe;$(MSBuildThisFileDirectory)Src\Libs\Container;$(MSBuildThisFileDirectory)Src\Libs\Crypto;$(MSBuildThisFileDirectory)Src\Libs\License;$(MSBuildThisFileDirectory)Src\Libs\Lifter;$(MSBuildThisFileDirectory)Src\Libs\Vm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>

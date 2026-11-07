@@ -1,3 +1,6 @@
+#include "VmImageCodec.h"
+#include "PeRelocations.h"
+#include "WindowsResources.h"
 #include <windows.h>
 
 #include <array>
@@ -637,9 +640,10 @@ VmpMetadata ValidateProtectionMetadata(std::span<const std::uint8_t> Image, cons
     }
     VmpMetadata Metadata{};
     std::memcpy(&Metadata, Image.data() + Footer.MetadataOffset, sizeof(Metadata));
-    if (Metadata.Magic != KVmpMetadataMagic || Metadata.Version != 4) {
+    if (Metadata.Magic != KVmpMetadataMagic || Metadata.Version != KVmpMetadataVersion) {
         throw std::runtime_error(PEVM_TEXT(".vmp2 metadata invalid"));
     }
+    pevm::license::ValidatePolicy(Metadata.License);
     const auto ValidateRange = [&](std::uint32_t Offset, std::uint32_t Size, const char* Name) {
         if (Offset > Image.size() || Size > Image.size() - Offset) {
             throw std::runtime_error(std::string(Name) + PEVM_TEXT(" range invalid"));
@@ -671,6 +675,7 @@ VmpMetadata ValidateProtectionMetadata(std::span<const std::uint8_t> Image, cons
 
 struct VmProgram {
     vmprotect::LiftedProgram Program;
+    vmprotect::CompiledProgram Compiled;
     std::uint64_t Seed{};
     std::uint64_t Digest{};
 };
@@ -713,88 +718,25 @@ extern "C" std::uint64_t VirtualizedFunctionBridge(std::uint64_t Rcx, std::uint6
     Context.Registers[2] = Rdx;
     Context.Registers[8] = R8;
     Context.Registers[9] = R9;
-    vmprotect::InvokeLiftedProgram(Virtualized.Program, Context, Virtualized.Seed, false);
+    vmprotect::InvokeCompiledProgram(Virtualized.Compiled, Context, false);
     return Context.Registers[0];
 }
 
 void LoadVmp3(std::span<const std::uint8_t> Data, std::string_view BuildSecret,
               std::span<const std::uint8_t> HandlerProfile) {
-    using namespace pevm::crypto;
-    if (Data.size() < sizeof(Vmp3Header)) throw std::runtime_error(PEVM_TEXT(".vmp3 header truncated"));
-    Vmp3Header Header{}; std::memcpy(&Header, Data.data(), sizeof(Header));
-    if (Header.Magic != KVmp3Magic || Header.Version != 3) {
-        throw std::runtime_error(PEVM_TEXT(".vmp3 header invalid (unsupported version)"));
-    }
-    if (Header.FunctionCount == 0 ||
-        Header.FunctionCount > (Data.size() - sizeof(Vmp3Header)) / sizeof(Vmp3Entry)) {
-        throw std::runtime_error(PEVM_TEXT(".vmp3 entry table invalid"));
-    }
-    const auto EntriesBytes = static_cast<std::size_t>(Header.FunctionCount) * sizeof(Vmp3Entry);
-    const auto Entries = reinterpret_cast<const Vmp3Entry*>(Data.data() + sizeof(Vmp3Header));
-    std::size_t TotalInstructions = 0;
-    for (std::size_t I = 0; I < Header.FunctionCount; ++I) {
-        TotalInstructions = std::max<std::size_t>(
-            TotalInstructions, static_cast<std::size_t>(Entries[I].InstructionOffset) +
-                                   Entries[I].InstructionCount);
-    }
-    const auto TableSize = TotalInstructions * sizeof(Vmp3Instruction);
-    if (sizeof(Vmp3Header) + EntriesBytes + TableSize + 16 > Data.size()) {
-        throw std::runtime_error(PEVM_TEXT(".vmp3 instruction table invalid"));
-    }
-    Bytes Table(TableSize);
-    std::memcpy(Table.data(), Data.data() + sizeof(Vmp3Header) + EntriesBytes,
-                static_cast<std::size_t>(TableSize));
-
-    Sha256 KeyHash;
-    static constexpr std::array<std::uint8_t, 13> KeyDomain = {'P','E','V','M','-','V','M','P','3','-','v','3',0};
-    KeyHash.Update(KeyDomain);
-    KeyHash.Update(std::span(reinterpret_cast<const std::uint8_t*>(BuildSecret.data()), BuildSecret.size()));
-    KeyHash.Update(std::span(reinterpret_cast<const std::uint8_t*>(&Header.Seed), sizeof(Header.Seed)));
-    KeyHash.Update(HandlerProfile);
-    const auto KeyMaterial = KeyHash.Finish();
-    XteaKey Key{};
-    for (std::size_t I = 0; I < 4; ++I) {
-        Key[I] = static_cast<std::uint32_t>(KeyMaterial[I * 4]) |
-                 (static_cast<std::uint32_t>(KeyMaterial[I * 4 + 1]) << 8) |
-                 (static_cast<std::uint32_t>(KeyMaterial[I * 4 + 2]) << 16) |
-                 (static_cast<std::uint32_t>(KeyMaterial[I * 4 + 3]) << 24);
-    }
-    XteaCtr(Table, Key, Header.Seed);
-
-    Sha256 TagHash;
-    static constexpr std::array<std::uint8_t, 13> TagDomain = {'P','E','V','M','-','V','M','P','3','-','T','A','G'};
-    TagHash.Update(TagDomain);
-    TagHash.Update(std::span(KeyMaterial).subspan(16, 16));
-    TagHash.Update(Table);
-    const auto TagFull = TagHash.Finish();
-    if (!ConstantEqual(std::span(TagFull).first(16),
-                       Data.subspan(sizeof(Header) + EntriesBytes + static_cast<std::size_t>(TableSize), 16))) {
-        throw std::runtime_error(PEVM_TEXT(".vmp3 integrity violation"));
-    }
-
-    GVirtualizedPrograms.clear();
-    GVirtualizedPrograms.reserve(Header.FunctionCount);
-    const auto* Instructions = reinterpret_cast<const Vmp3Instruction*>(Table.data());
-    for (std::size_t F = 0; F < Header.FunctionCount; ++F) {
-        const auto& Entry = Entries[F];
-        if (static_cast<std::size_t>(Entry.InstructionOffset) + Entry.InstructionCount > TotalInstructions) {
-            throw std::runtime_error(PEVM_TEXT(".vmp3 entry range invalid"));
-        }
+    auto Decoded = pevm::DecodeVmImage(Data, BuildSecret, HandlerProfile);
+    std::vector<VmProgram> Programs;
+    Programs.reserve(Decoded.size());
+    for (auto& Function : Decoded) {
         VmProgram Virtualized{};
-        Virtualized.Program.EntryAddress = Entry.FunctionRva;
-        Virtualized.Seed = Header.Seed;
-        Virtualized.Program.Instructions.reserve(Entry.InstructionCount);
-        for (std::uint32_t I = 0; I < Entry.InstructionCount; ++I) {
-            const auto& Record = Instructions[Entry.InstructionOffset + I];
-            if (Record.Op >= static_cast<std::uint8_t>(vmprotect::LiftedOp::Count)) {
-                throw std::runtime_error(PEVM_TEXT(".vmp3 opcode invalid"));
-            }
-            Virtualized.Program.Instructions.push_back({static_cast<vmprotect::LiftedOp>(Record.Op),
-                Record.Dst, Record.Src, Record.Immediate, Record.Address, Record.Target});
-        }
+        Virtualized.Program = std::move(Function.Program);
+        Virtualized.Seed = Function.Seed;
         Virtualized.Digest = ProgramDigest(Virtualized.Program);
-        GVirtualizedPrograms.push_back(std::move(Virtualized));
+        Virtualized.Compiled = vmprotect::CompileLiftedProgram(Virtualized.Program, Virtualized.Seed);
+        Programs.push_back(std::move(Virtualized));
     }
+    // Publish only after every function has passed decoding and compilation.
+    GVirtualizedPrograms = std::move(Programs);
     // Test-only hook: corrupts the first loaded program AFTER its digest is
     // computed, so the bridge's per-call verification must reject the run.
     if (HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_CORRUPT_VM").c_str()) != 0 && !GVirtualizedPrograms.empty()) {
@@ -954,17 +896,14 @@ DWORD SectionProtection(DWORD Characteristics) {
 class MappedImage {
 public:
     explicit MappedImage(std::span<const std::uint8_t> File) {
-        if (File.size() < sizeof(IMAGE_DOS_HEADER)) throw std::runtime_error(PEVM_TEXT("payload DOS header missing"));
-        const auto Dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(File.data());
-        if (Dos->e_magic != IMAGE_DOS_SIGNATURE || Dos->e_lfanew < 0) throw std::runtime_error(PEVM_TEXT("payload DOS header invalid"));
-        if (static_cast<std::size_t>(Dos->e_lfanew) > File.size() - sizeof(IMAGE_NT_HEADERS64)) {
-            throw std::runtime_error(PEVM_TEXT("payload NT header truncated"));
-        }
-        const auto Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(File.data() + Dos->e_lfanew);
-        if (Nt->Signature != IMAGE_NT_SIGNATURE || Nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-            Nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-            throw std::runtime_error(PEVM_TEXT("only x64 PE32+ payloads are supported"));
-        }
+        const pevm::pe::ImageView Parsed(File);
+        Parsed.RequireX64();
+        if (Parsed.OptionalHeaderSize() < sizeof(IMAGE_OPTIONAL_HEADER64))
+            throw std::runtime_error("payload requires a full PE32+ optional header");
+        const auto Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(File.data() + Parsed.NtOffset());
+        FixupTargets = pevm::pe::RelocationTargets(Parsed);
+        HasRelocationTable = Parsed.Directory(IMAGE_DIRECTORY_ENTRY_BASERELOC).Size != 0;
+        PreferredBase = Nt->OptionalHeader.ImageBase;
         NtHeaders = Nt;
         Base = static_cast<std::uint8_t*>(HideAlloc(reinterpret_cast<LPVOID>(Nt->OptionalHeader.ImageBase),
                                                     Nt->OptionalHeader.SizeOfImage,
@@ -974,6 +913,7 @@ public:
                                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         }
         if (!Base) throw std::runtime_error(PEVM_TEXT("cannot allocate mapped image"));
+        ImageMemory.reset(Base);
         if (Nt->OptionalHeader.SizeOfHeaders > File.size()) throw std::runtime_error(PEVM_TEXT("payload headers truncated"));
         std::memcpy(Base, File.data(), Nt->OptionalHeader.SizeOfHeaders);
 
@@ -1000,7 +940,7 @@ public:
                 }
             }
         }
-        NtHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(Base + Dos->e_lfanew);
+        NtHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(Base + Parsed.NtOffset());
         EntryPointRva = NtHeaders->OptionalHeader.AddressOfEntryPoint;
         if (std::memcmp(Base, File.data(), NtHeaders->OptionalHeader.SizeOfHeaders) != 0) {
             throw std::runtime_error(PEVM_TEXT("mapped header verification failed"));
@@ -1009,8 +949,7 @@ public:
 
     ~MappedImage() {
         if (FunctionTable) RtlDeleteFunctionTable(FunctionTable);
-        if (ThunkBase) VirtualFree(ThunkBase, 0, MEM_RELEASE);
-        if (Base) VirtualFree(Base, 0, MEM_RELEASE);
+        // Member owners release the thunk and image after unwind deregistration.
     }
 
     void Prepare() {
@@ -1038,6 +977,7 @@ public:
                                                              MEM_RESERVE | MEM_COMMIT,
                                                              PAGE_EXECUTE_READWRITE));
             if (!ThunkBase) throw std::runtime_error(PEVM_TEXT("cannot allocate VM bridge thunk page"));
+            ThunkMemory.reset(ThunkBase);
         }
         if (ThunkUsed + 29 > ThunkPageBytes) throw std::runtime_error(PEVM_TEXT("VM bridge thunk page exhausted"));
         const auto Thunk = ThunkBase + ThunkUsed;
@@ -1111,6 +1051,12 @@ public:
     const IMAGE_NT_HEADERS64* NtHeadersView() const { return NtHeaders; }
 
 private:
+    // Declared first, released last; raw pointers below only borrow these owners.
+    pevm::platform::VirtualAllocation ImageMemory;
+    pevm::platform::VirtualAllocation ThunkMemory;
+    std::vector<std::uint32_t> FixupTargets;
+    std::uint64_t PreferredBase{};
+    bool HasRelocationTable{};
     std::uint8_t* Base{};
     const IMAGE_NT_HEADERS64* NtHeaders{};
     std::uint32_t EntryPointRva{};
@@ -1119,35 +1065,21 @@ private:
     std::size_t ThunkUsed{};
     static constexpr std::size_t ThunkPageBytes = 64 * 1024;
 
-    const IMAGE_DATA_DIRECTORY& Directory(std::size_t Index) const {
+    IMAGE_DATA_DIRECTORY Directory(std::size_t Index) const {
+        if (Index >= IMAGE_NUMBEROF_DIRECTORY_ENTRIES || Index >= NtHeaders->OptionalHeader.NumberOfRvaAndSizes) return {};
         return NtHeaders->OptionalHeader.DataDirectory[Index];
     }
 
     void ApplyRelocations() {
-        const auto Delta = reinterpret_cast<std::intptr_t>(Base) -
-                           static_cast<std::intptr_t>(NtHeaders->OptionalHeader.ImageBase);
+        // Unsigned subtraction intentionally computes the modulo-2^64 delta.
+        const auto Delta = reinterpret_cast<std::uint64_t>(Base) - PreferredBase;
         if (Delta == 0) return;
-        const auto& Data = Directory(IMAGE_DIRECTORY_ENTRY_BASERELOC);
-        if (Data.VirtualAddress == 0 || Data.Size == 0) throw std::runtime_error(PEVM_TEXT("payload cannot be relocated"));
-        std::size_t Consumed = 0;
-        while (Consumed < Data.Size) {
-            const auto Block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(Base + Data.VirtualAddress + Consumed);
-            if (Block->SizeOfBlock < sizeof(*Block) || Block->SizeOfBlock > Data.Size - Consumed) {
-                throw std::runtime_error(PEVM_TEXT("relocation block invalid"));
-            }
-            const auto Count = (Block->SizeOfBlock - sizeof(*Block)) / sizeof(std::uint16_t);
-            const auto Entries = reinterpret_cast<std::uint16_t*>(Block + 1);
-            for (std::size_t I = 0; I < Count; ++I) {
-                const auto Type = Entries[I] >> 12;
-                const auto Offset = Entries[I] & 0x0fff;
-                if (Type == IMAGE_REL_BASED_DIR64) {
-                    auto Target = reinterpret_cast<std::uint64_t*>(Base + Block->VirtualAddress + Offset);
-                    *Target += static_cast<std::uint64_t>(Delta);
-                } else if (Type != IMAGE_REL_BASED_ABSOLUTE) {
-                    throw std::runtime_error(PEVM_TEXT("unsupported relocation type"));
-                }
-            }
-            Consumed += Block->SizeOfBlock;
+        if (!HasRelocationTable) throw std::runtime_error(PEVM_TEXT("payload cannot be relocated"));
+        for (const auto Rva : FixupTargets) {
+            std::uint64_t Value;
+            std::memcpy(&Value, Base + Rva, sizeof(Value));
+            Value += Delta;
+            std::memcpy(Base + Rva, &Value, sizeof(Value));
         }
     }
 
@@ -1244,49 +1176,16 @@ private:
 // VMP-style license gate: the key arrives via the PEVM_LICENSE environment
 // variable or a .license file next to the wrapper. Anything missing, forged,
 // locked to another machine or expired fails closed with one message.
-void VerifyLicense(std::span<const std::uint8_t, 32> Secret) {
-    std::string Key;
-    wchar_t EnvBuffer[4096]{};
-    if (GetEnvironmentVariableW(L"PEVM_LICENSE", EnvBuffer, 4096) != 0) {
-        const int Length = WideCharToMultiByte(CP_ACP, 0, EnvBuffer, -1, nullptr, 0, nullptr, nullptr);
-        if (Length > 1) {
-            Key.resize(static_cast<std::size_t>(Length - 1));
-            WideCharToMultiByte(CP_ACP, 0, EnvBuffer, -1, Key.data(), Length, nullptr, nullptr);
-        }
-    }
-    if (Key.empty()) {
-        std::ifstream LicenseFile(SelfPath().wstring() + L".license", std::ios::binary);
-        if (LicenseFile) {
-            std::ostringstream Buffer;
-            Buffer << LicenseFile.rdbuf();
-            Key = Buffer.str();
-        }
-    }
-    auto Failure = [&]([[maybe_unused]] const char* Reason) {
-        throw std::runtime_error(PEVM_TEXT("license check failed"));
-    };
-    const auto Trimmed = Key.find("PEVML1.");
-    if (Trimmed == std::string::npos) Failure("missing");
-    Key = Key.substr(Trimmed);
-
-    std::vector<std::uint8_t> Raw;
+void VerifyLicense(const LicensePolicy& Policy) {
     try {
-        Raw = pevm::crypto::Base64Decode(Key.substr(std::char_traits<char>::length(KLicensePrefix)));
+        const auto Payload = pevm::license::ParseLicense(pevm::license::ReadRuntimeLicense(SelfPath()));
+        const auto Reason = pevm::license::VerifyPayload(Payload, Policy,
+            pevm::license::MachineId(), pevm::license::CurrentFileTime());
+        if (!Reason.empty()) throw std::runtime_error(Reason);
     } catch (const std::exception&) {
-        Failure("malformed");
+        throw std::runtime_error(PEVM_TEXT("license check failed"));
     }
-    if (Raw.size() != sizeof(LicensePayload)) Failure("malformed");
-    LicensePayload Payload{};
-    std::memcpy(&Payload, Raw.data(), sizeof(Payload));
-
-    FILETIME Now{};
-    GetSystemTimeAsFileTime(&Now);
-    const auto NowFileTime = (static_cast<std::uint64_t>(Now.dwHighDateTime) << 32) | Now.dwLowDateTime;
-    const auto Reason = pevm::license::VerifyPayload(Payload, Secret,
-                                                     pevm::license::MachineId(), NowFileTime);
-    if (!Reason.empty()) Failure(Reason.c_str());
 }
-
 [[noreturn]] void RunWrapped() {
     RunAntiDebugChecks();
     const auto WrapperPath = SelfPath();
@@ -1302,7 +1201,7 @@ void VerifyLicense(std::span<const std::uint8_t, 32> Secret) {
     if (Footer.PayloadOffset > Image.size() || Footer.PayloadSize > Image.size() - PayloadOffset ||
         Footer.StubSize != SecretOffset) throw std::runtime_error(PEVM_TEXT("invalid wrapper payload location"));
     const auto Metadata = ValidateProtectionMetadata(Image, Footer);
-    if (Metadata.LicenseRequired != 0) VerifyLicense(Metadata.LicenseSecret);
+    if (Metadata.License.Required != 0) VerifyLicense(Metadata.License);
     auto Password = RecoverBuildSecret(Image, Footer, PayloadOffset, SecretOffset);
 
     const auto WrapperDirectory = WrapperPath.parent_path();

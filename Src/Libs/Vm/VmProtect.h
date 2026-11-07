@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,36 @@ struct RunConfig {
     std::size_t MemoryBytes = 4096;
 };
 
+// Non-secret build metrics; no bytecode, keys or address maps are exposed.
+struct CompilationStats {
+    std::size_t BasicBlocks{};
+    std::size_t RelocatedBlocks{};
+    std::size_t LinkInstructions{};
+    std::size_t BytecodeInstructions{};
+    std::size_t BytecodeBytes{};
+};
+
+// Immutable encrypted bytecode, reusable across calls and threads. Registers,
+// flags, stacks and VM memory belong to each invocation, never to this handle.
+class CompiledProgram {
+public:
+    CompiledProgram() = default;
+
+private:
+    struct Storage;
+    std::shared_ptr<const Storage> Data;
+    friend CompiledProgram CompileLiftedProgram(const LiftedProgram&, std::uint64_t);
+    friend CompilationStats GetCompilationStats(const CompiledProgram&);
+    friend void InvokeCompiledProgram(const CompiledProgram&, VmBridgeContext&, bool,
+                                       const RunConfig&);
+};
+
+CompiledProgram CompileLiftedProgram(const LiftedProgram& Program, std::uint64_t Seed);
+CompilationStats GetCompilationStats(const CompiledProgram& Program);
+void InvokeCompiledProgram(const CompiledProgram& Program, VmBridgeContext& Context,
+                            bool Trace, const RunConfig& Config = {});
+
+// Convenience entry for one-shot callers; hot paths should compile once.
 void InvokeLiftedProgram(const LiftedProgram& Program, VmBridgeContext& Context,
                          std::uint64_t Seed, bool Trace,
                          const RunConfig& Config = {});

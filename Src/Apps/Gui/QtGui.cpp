@@ -8,6 +8,7 @@
 // Qt Linguist toolchain is needed either.
 
 #include <QApplication>
+#include "PeVmLicenseFormat.h"
 #include <QButtonGroup>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -24,6 +25,7 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QSettings>
+#include <QScrollArea>
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QTabWidget>
@@ -105,7 +107,9 @@ private:
     CheckBox* CompressCheck{};
     CheckBox* LicenseCheck{};
     LineEdit* WatermarkEdit{};
-    LineEdit* LicenseSecretEdit{};
+    LineEdit* LicensePublicKeyEdit{};
+    LineEdit* LicenseProductEdit{};
+    PushButton* BrowseLicenseKeyBtn{};
 
     LineEdit* FunctionRvaEdit{};
     LineEdit* LiftSeedEdit{};
@@ -122,7 +126,8 @@ private:
     QLabel* PasswordLabel{};
     QLabel* LanguageLabel{};
     QLabel* WatermarkLabel{};
-    QLabel* LicenseSecretLabel{};
+    QLabel* LicensePublicKeyLabel{};
+    QLabel* LicenseProductLabel{};
     QLabel* LogLabel{};
     QLabel* RvaLabel{};
     QLabel* SeedLabel{};
@@ -207,7 +212,22 @@ private:
         CompressCheck = new CheckBox;
         LicenseCheck = new CheckBox;
         WatermarkEdit = new LineEdit;
-        LicenseSecretEdit = new LineEdit;
+        LicensePublicKeyEdit = new LineEdit;
+        LicenseProductEdit = new LineEdit;
+        BrowseLicenseKeyBtn = new PushButton(QString(), Fluent::IconType::FOLDER);
+        connect(BrowseLicenseKeyBtn, &QPushButton::clicked, this, [this] {
+            const auto Path = QFileDialog::getOpenFileName(this,
+                T({"Select license public key", "选择卡密公钥文件"}), QString(), "Public keys (*.pub);;All files (*)");
+            if (!Path.isEmpty()) LicensePublicKeyEdit->setText(Path);
+        });
+        LicensePublicKeyEdit->setEnabled(false);
+        LicenseProductEdit->setEnabled(false);
+        BrowseLicenseKeyBtn->setEnabled(false);
+        connect(LicenseCheck, &QCheckBox::toggled, this, [this](bool Enabled) {
+            LicensePublicKeyEdit->setEnabled(Enabled);
+            LicenseProductEdit->setEnabled(Enabled);
+            BrowseLicenseKeyBtn->setEnabled(Enabled);
+        });
 
         BrowseInputBtn = new PushButton(QString(), Fluent::IconType::FOLDER);
         BrowseOutputBtn = new PushButton(QString(), Fluent::IconType::FOLDER);
@@ -242,6 +262,14 @@ private:
         Shared->addWidget(PasswordLabel, ++Row, 0);
         Shared->addWidget(PasswordEdit, Row, 1);
         Shared->addWidget(ShowPassword, Row, 2);
+        Shared->addWidget(LicenseCheck, ++Row, 0, 1, 3);
+        LicensePublicKeyLabel = new QLabel;
+        Shared->addWidget(LicensePublicKeyLabel, ++Row, 0);
+        Shared->addWidget(LicensePublicKeyEdit, Row, 1);
+        Shared->addWidget(BrowseLicenseKeyBtn, Row, 2);
+        LicenseProductLabel = new QLabel;
+        Shared->addWidget(LicenseProductLabel, ++Row, 0);
+        Shared->addWidget(LicenseProductEdit, Row, 1, 1, 2);
         LanguageLabel = new QLabel;
         Shared->addWidget(LanguageLabel, ++Row, 0);
         LangToggleBtn = new PushButton;
@@ -305,7 +333,14 @@ private:
         const auto Body = new QWidget;
         const auto BodyLayout = new QVBoxLayout(Body);
         BodyLayout->addLayout(Shared);
-        BodyLayout->addWidget(Pages, 1);
+        const auto PageScroll = new QScrollArea;
+        PageScroll->setWidgetResizable(true);
+        PageScroll->setFrameShape(QFrame::NoFrame);
+        PageScroll->setMinimumHeight(180);
+        PageScroll->setVerticalScrollBar(new ScrollBar(PageScroll));
+        PageScroll->setHorizontalScrollBar(new ScrollBar(PageScroll));
+        PageScroll->setWidget(Pages);
+        BodyLayout->addWidget(PageScroll, 1);
 
         LogLabel = new QLabel;
         const auto LogRow = new QHBoxLayout;
@@ -399,14 +434,19 @@ private:
         AntiDisasmCheck->setText(T({"Anti-Disasm decoys", "Anti-Disasm \u9677\u9631\u5b57\u8282"}));
         MutateCheck->setText(T({"Mutation pass", "\u53d8\u5f02\u5904\u7406"}));
         CompressCheck->setText(T({"Compress payload", "\u538b\u7f29 payload"}));
-        LicenseCheck->setText(T({"Require license", "\u9700\u8981\u8bb8\u53ef\u8bc1"}));
+        LicenseCheck->setText(T({"Require signed license (wrap / virtualize)", "启用签名卡密（封装 / 虚拟化）"}));
         LicenseCheck->setToolTip(T({
-            "The loader verifies a machine-locked license (env PEVM_LICENSE or <exe>.license)",
-            "loader \u9a8c\u8bc1\u673a\u5668\u9501\u5b9a\u7684\u8bb8\u53ef\u8bc1\uff08\u73af\u5883\u53d8\u91cf PEVM_LICENSE \u6216 <exe>.license\uff09"}));
-        LicenseSecretLabel->setText(T({"License secret (hex)", "\u8bb8\u53ef\u8bc1\u5bc6\u94a5\uff08hex\uff09"}));
-        LicenseSecretEdit->setToolTip(T({
-            "64 hex characters; generate keys with `PeVm make-license`",
-            "64 \u4f4d hex\uff1b\u7528 `PeVm make-license` \u751f\u6210\u5bc6\u94a5"}));
+            "Require a signed license. Existing licenses must be reissued. Does not apply to pack/unpack.",
+            "仅接受 签名卡密，旧卡需重新签发。此设置不影响打包 / 解包。"}));
+        LicensePublicKeyLabel->setText(T({"License public key", "卡密公钥"}));
+        LicensePublicKeyEdit->setPlaceholderText(T({"Select a .pub file", "选择 .pub 公钥文件"}));
+        LicensePublicKeyEdit->setToolTip(T({"Generate keys with PeVm license-keygen; select the public file.",
+                                           "使用 PeVm license-keygen 生成密钥，然后选择公钥文件。"}));
+        BrowseLicenseKeyBtn->setText(T({"Browse...", "浏览..."}));
+        LicenseProductLabel->setText(T({"Product ID", "产品 ID"}));
+        LicenseProductEdit->setPlaceholderText("my-product");
+        LicenseProductEdit->setToolTip(T({"Case-sensitive; must match the product used when issuing licenses.",
+                                         "区分大小写，必须与签发卡密时的产品 ID 一致。"}));
         AnalyzeBtn->setText(T({"Analyze / bridge test", "\u5206\u6790 / \u6865\u63a5\u6d4b\u8bd5"}));
         VirtualizeBtn->setText(T({"Virtualize function(s)", "\u865a\u62df\u5316\u51fd\u6570"}));
         MultiJsonBtn->setText(T({"Multi-function JSON", "\u591a\u51fd\u6570 JSON"}));
@@ -440,14 +480,16 @@ private:
     }
 
     // Shared tail options appended to every protection command.
-    QStringList ProtectionOptions() const {
+    QStringList ProtectionOptions(bool Virtualize = true) const {
         QStringList Options;
-        if (AntiDisasmCheck->isChecked()) Options << "--anti-disasm";
-        if (MutateCheck->isChecked()) Options << "--mutate";
+        if (Virtualize && AntiDisasmCheck->isChecked()) Options << "--anti-disasm";
+        if (Virtualize && MutateCheck->isChecked()) Options << "--mutate";
         if (CompressCheck->isChecked()) Options << "--compress";
-        if (LicenseCheck->isChecked()) Options << "--license";
+        if (LicenseCheck->isChecked()) {
+            Options << "--license" << "--license-public-key=" + LicensePublicKeyEdit->text()
+                    << "--license-product=" + LicenseProductEdit->text();
+        }
         if (!WatermarkEdit->text().isEmpty()) Options << "--watermark=" + WatermarkEdit->text();
-        if (!LicenseSecretEdit->text().isEmpty()) Options << "--license-secret=" + LicenseSecretEdit->text();
         return Options;
     }
 
@@ -525,12 +567,6 @@ private:
         OptionsRow->addWidget(WatermarkLabel);
         OptionsRow->addWidget(WatermarkEdit, 1);
         Layout->addLayout(OptionsRow);
-        const auto LicenseRow = new QHBoxLayout;
-        LicenseRow->addWidget(LicenseCheck);
-        LicenseSecretLabel = new QLabel;
-        LicenseRow->addWidget(LicenseSecretLabel);
-        LicenseRow->addWidget(LicenseSecretEdit, 1);
-        Layout->addLayout(LicenseRow);
 
         const auto Buttons = new QGridLayout;
         AnalyzeBtn = new PushButton(QString(), Fluent::IconType::CODE);
@@ -707,7 +743,7 @@ private:
         return true;
     }
 
-    bool RequireProtection() {
+    bool RequireProtection(bool UsesLicense = true) {
         if (!RequireInput()) return false;
         if (OutputEdit->text().trimmed().isEmpty() || PasswordEdit->text().isEmpty()) {
             NotifyError({"Missing input", "\u7f3a\u5c11\u8f93\u5165"},
@@ -715,12 +751,28 @@ private:
                          "\u51fd\u6570\u4fdd\u62a4\u9700\u8981\u8f93\u51fa EXE \u548c\u6784\u5efa\u53e3\u4ee4\u3002"});
             return false;
         }
+        if (UsesLicense && LicenseCheck->isChecked()) {
+            QFile PublicFile(LicensePublicKeyEdit->text());
+            const QRegularExpression ProductPattern("^[A-Za-z0-9._-]{1,64}$");
+            if (!QFileInfo(LicensePublicKeyEdit->text()).isFile() ||
+                !PublicFile.open(QIODevice::ReadOnly) || PublicFile.size() > 4096 ||
+                !PublicFile.readAll().trimmed().startsWith(pevm::license::KPublicKeyPrefix) ||
+                !ProductPattern.match(LicenseProductEdit->text()).hasMatch()) {
+                NotifyError({"Invalid license settings", "卡密设置无效"},
+                            {"Select a license public key file and enter a product ID (1-64 ASCII letters/digits/._-).",
+                             "请选择卡密公钥文件，并填写产品 ID（1-64 位英文字母、数字或 ._-）。"});
+                return false;
+            }
+        }
         return true;
     }
 
     void RunProtection(const QString& Verb) {
-        if (!RequireInput() || !RequireProtection()) return;
-        Start({ Verb, Quote(InputEdit->text()), Quote(OutputEdit->text()), Quote(PasswordEdit->text()) }, Verb);
+        if (!RequireProtection(Verb == "wrap")) return;
+        QStringList Arguments{ Verb, Quote(InputEdit->text()), Quote(OutputEdit->text()), Quote(PasswordEdit->text()) };
+        if (Verb == "wrap") Arguments << ProtectionOptions(false);
+        else if (Verb == "pack" && CompressCheck->isChecked()) Arguments << "--compress";
+        Start(Arguments, Verb);
     }
 
     void Start(const QStringList& Arguments, const QString& Title) {
@@ -739,7 +791,16 @@ private:
         Running = true;
         Ring->show();
         statusBar()->showMessage(T({"Running: ", "\u8fd0\u884c\u4e2d: "}) + Title);
-        AppendLog("PeVm " + Arguments.join(' ') + "\n");
+        auto LogArguments = Arguments;
+        if (!LogArguments.isEmpty()) {
+            const auto& Command = LogArguments.front();
+            if ((Command == "pack" || Command == "unpack" || Command == "wrap" ||
+                 Command == "protect-function" || Command == "protect-functions" ||
+                 Command == "protect-all") && LogArguments.size() > 3) {
+                LogArguments[3] = "<redacted>";
+            }
+        }
+        AppendLog("PeVm " + LogArguments.join(' ') + "\n");
         Started = std::chrono::steady_clock::now();
         Runner->start(Program, Arguments);
     }

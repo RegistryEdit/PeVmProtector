@@ -1,4 +1,4 @@
-﻿# PeVmProtector
+# PeVmProtector
 
 一个 C++20 的 PE 保护器研究原型：
 
@@ -11,6 +11,9 @@
 
 当前版本包含可运行 wrapper、手工 PE 映射、VM2 runtime，以及 x64 decoder/IR lifter。用户可按函数 RVA 把受支持的基本块翻译到 VM2，并通过 `.vmp3` 与运行时 trampoline 执行。
 
+PE 构建流程现已统一使用经过校验的 `ImageView`：容器、Lifter、构建日志和加载器共用结构规则；批量虚拟化从同一份输入快照解码，禁止把零填充区或下一个节当作当前代码读取。`PackContainer()` 在内存中传递容器，wrapper 不再读写 `.payload.tmp`。最终输出采用独占临时文件、刷盘和替换提交，提交失败保留旧文件。模块职责、兼容性变化与测试说明见 [PE 架构文档](Docs/PeArchitecture.md)。
+新增节区先完成整数边界和布局检查；构建端与运行时共享重定位校验，映射内存通过 RAII 在异常路径自动释放。
+
 ## 构建
 
 工程形式为 MSBuild `vcxproj` + XML 解决方案（`PeVmProtector.slnx`，VS 2022 17.13+ / VS 2026 原生格式），目录按组件分层：
@@ -22,16 +25,17 @@ Src\
   Apps\Stub\                Stub.cpp + PeVmStub.vcxproj        （loader）
   Apps\Gui\                 QtGui.cpp + PeVmProtectorGui.vcxproj（Qt6 界面）
   Libs\Container\           .pvm 容器格式/加解密/key-VM（PeVmContainer）
+  Libs\Pe\                  PE 文件视图、边界校验与文件提交
   Libs\Crypto\              SHA-256/HMAC/scrypt/XTEA-CTR/LZSS/Base64
-  Libs\License\             机器锁定许可（HMAC）
+  Libs\License\             产品/机器绑定签名卡密（ECDSA P-256）
   Libs\Lifter\              x64 解码器/IR lifter/变异
   Libs\Vm\                  VM2 runtime
   Libs\PeVmCore\            静态库工程（聚合以上库源）
 Tests\
-  LifterFixture\  DependencyFixture\  RunTests.ps1
+  LifterFixture\  DependencyFixture\  VmRegression\  PeRegression\  RunTests.ps1
 ```
 
-`PeVmCore.vcxproj` 是静态库，三个可执行工程经 `ProjectReference` 链接它；头文件目录由 `Directory.Build.props` 统一注入，`#include` 保持平铺文件名。
+`PeVmCore.vcxproj` 是静态库，CLI、loader 与 VM 回归测试经 `ProjectReference` 链接它；GUI 通过子进程调用 CLI。头文件目录由 `Directory.Build.props` 统一注入，`#include` 保持平铺文件名。
 
 ```powershell
 # 全量构建（或用 Visual Studio 打开 PeVmProtector.slnx）
@@ -39,6 +43,9 @@ msbuild PeVmProtector.slnx -p:Configuration=Release -m
 
 # 测试
 powershell -ExecutionPolicy Bypass -File Tests\RunTests.ps1 -Configuration Release
+
+# VM 重复调用微基准（每次编译 / 复用编译结果，5 轮中位数）
+bin\Release\VmRegression.exe --benchmark
 ```
 
 - 输出位于 `bin\Release\`（`PeVm.exe`、`PeVmStub.exe`、`PeVmProtectorGui.exe` 与测试夹具）。
@@ -66,11 +73,21 @@ bin\Release\PeVm.exe protect-functions app.exe app.multi.exe "build key" 0x1000 
 bin\Release\PeVm.exe protect-all app.exe app.all.exe "build key" 0x1234 --anti-disasm
 bin\Release\PeVm.exe scan-functions app.exe scan.json
 bin\Release\PeVm.exe lift-raw 4887D14889D0C3 0 --rcx=0x11 --rdx=0x22   # 直接提升十六进制机器码
-bin\Release\PeVm.exe machine-id
-bin\Release\PeVm.exe make-license <secret-hex-64> 30
+bin\Release\PeVm.exe license-machine-id
+bin\Release\PeVm.exe license-keygen issuer.private issuer.pub
+bin\Release\PeVm.exe license-issue issuer.private 30 --machine=<64hex> --product=my-product --output=customer.license
 ```
 
 GUI 为 Qt6 界面（QProcess 驱动同目录的 `PeVm.exe`）：顶部是输入/输出/口令共享区（支持把文件直接拖到输入框，自动建议输出路径，口令可切换明文显示），左侧为 Fluent 导航列，右侧按「Container & Wrapper / Function Virtualization / VM Demo」三个页面组织操作，底部是等宽字体的运行日志、忙碌指示环与状态栏（显示每步用时）。函数虚拟化页的 RVA 输入框可填多个（逗号分隔时自动走多函数 `protect-functions`），并提供 Scan functions（自动发现函数）与 Protect ALL（全量虚拟化）按钮。
+
+`pack`、`wrap` 和 `protect-*` 默认输出详细构建日志，各阶段即时刷新到终端或 GUI 日志区：
+
+- 输入 PE 的大小、架构、子系统、入口 RVA，以及各节的地址、文件偏移、大小和读写执行属性。
+- 压缩是否启用、实际采用 LZSS 还是原样存储、压缩后大小与节省字节数，加密算法与 KDF 参数。
+- 函数候选数、选中数、跳过原因、基本块数、变异前后指令数，以及卡密公钥指纹和产品摘要。
+- wrapper 布局、最终文件大小、相对输入的比例、SHA-256、阶段耗时及总耗时。
+
+函数选择率仅针对已发现候选，不代表整个 PE 的代码覆盖率；压缩比例针对载荷，最终 EXE 还包含 loader 和元数据。日志不输出口令、签发私钥、完整卡密或原始水印。只有最终文件成功写入才输出一次 `[complete]`；失败会标出当前阶段、输出原因并返回非零退出码，中间临时容器不会误报整个任务完成。
 
 保护后的 PE 使用 `.vmp0` 作为 loader/runtime 代码节，`.vmp1` 作为只读加密 payload/VM 数据节。原始程序的 `.text` 不以原 section 形式出现在 wrapper 中。
 
@@ -80,10 +97,10 @@ GUI 为 Qt6 界面（QProcess 驱动同目录的 `PeVm.exe`）：顶部是输入
 
 ### VMP 对照功能
 
-- **Mutation 变异**：`--mutate` 在 VM IR 层做逐构建随机变异——`ADDI/SUBI` 按补码互换（仅当下一条指令会覆写 flags，进位差异不可观测）、2 的幂 `MULI` 精确降为移位，并在真实指令之间注入写 scratch 的垃圾指令（唯一合成地址、永不被分支引用）。种子化：同一 seed 复现同一变异布局。
-- **水印**：`--watermark=text` 把客户水印以 XOR 混淆写入 `.vmp2` 元数据（v4），`inspect` 解码显示；二进制里 grep 不到明文。
+- **Mutation 变异**：`--mutate` 在 VM IR 层做逐构建随机变异——`ADDI/SUBI` 按补码互换、2 的幂 `MULI` 降为移位；两者都要求紧接的指令不读取旧 flags 且完整覆写 flags。`ADC/SBB`、移位/循环移位、`CALL/RET` 不满足此条件。另在真实指令之间注入写 scratch 的垃圾指令（唯一合成地址、永不被分支引用）。种子化：同一 seed 复现同一变异布局。
+- **水印**：`--watermark=text` 把客户水印以 XOR 混淆写入 `.vmp2` 元数据（v5），`inspect` 解码显示；二进制里 grep 不到明文。
 - **payload 压缩**：`pack --compress`（wrap/protect-* 同名选项）在加密前做 LZSS 压缩（4 KiB 窗口、3..18 字节匹配）；解密后先解压再校验 SHA-256；不可压的输入自动保持存储形态，容器永不膨胀。
-- **许可系统**：`--license --license-secret=<64hex>` 使 wrapper 在运行 payload 前验证许可——`PeVm make-license <secret-hex> [days] [--machine=<hex8>]` 生成机器锁定、可选有效期的 `PEVML1.<base64>` 密钥（HMAC-SHA256 签名），loader 从环境变量 `PEVM_LICENSE` 或旁挂 `.license` 文件读取并验证；缺失/伪造/换机/过期统一 "license check failed"。`PeVm machine-id` 打印本机锁定 ID。原型强度说明：密钥为对称 HMAC 内嵌于 loader，提升门槛而非不可伪造。
+- **许可系统**：`--license --license-public-key=<file> --license-product=<id>` 启用 ECDSA P-256/SHA-256 签名验证。wrapper 仅嵌入公钥和产品摘要，签发私钥由签发端 Windows 用户 DPAPI 保护；卡密绑定产品 ID、64 位十六进制机器码和可选有效期。仅接受 `PEVM-LICENSE`，旧卡需重新签发，旧 EXE 需重新构建并分发，没有兼容开关。环境变量 `PEVM_LICENSE` 优先，只有变量不存在才读取 `<完整EXE文件名>.license`；错误/空值/超长输入拒绝执行。离线校验在启动时进行，不提供在线吊销或完整防时钟回拨能力。详见[签发与迁移说明](Docs/Licensing.md)。
 - **导入保护**：手工映射 + 运行期解析意味着磁盘 IAT 从不使用，导入保护天然成立。
 - **反调试/反 dump**：见下节。
 - 差距（诚实声明）：虚拟文件系统（VFS）、native 级 mutation（我们变异的是 VM IR）尚未实现；内存访问函数的全量虚拟化需要指针模拟层。
@@ -100,7 +117,7 @@ GUI 为 Qt6 界面（QProcess 驱动同目录的 `PeVm.exe`）：顶部是输入
 
 `--min-bytes=N`（默认 16）过滤微小的 IAT thunk 级候选。
 
-`.pvm` 容器 v5 在 v4 基础上增加了 Compression 字节（0=存储，1=LZSS）并重定义 OriginalSize 为解压后大小；只接受 v5，v4 及更早容器会得到明确的 "unsupported container version" 错误。`.vmp2` 元数据 v4 在水印基础上增加了许可字段（LicenseRequired + 32 字节 HMAC secret）。
+`.pvm` 容器 v5 在 v4 基础上增加了 Compression 字节（0=存储，1=LZSS）并重定义 OriginalSize 为解压后大小；只接受 v5，v4 及更早容器会得到明确的 "unsupported container version" 错误。`.vmp2` 元数据 v5 用公钥和产品摘要替代旧共享密钥字段，拒绝旧版 wrapper 元数据。
 
 Wrapper 双击直接运行，不要求最终用户输入口令。构建口令经逐构建 salt、stub 指纹和 payload 指纹封装为运行密钥材料，并带独立完整性标签；stub 自动恢复后立即解密内存 payload 与 `.vmp3` 指令表，再清零密钥缓冲与整段 wrapper 镜像。随后处理重定位/import/TLS/unwind 后执行，不创建临时 `Payload.exe`。依赖 DLL 从 wrapper 原目录加载，工作目录和命令行参数保持兼容。
 
@@ -160,7 +177,23 @@ VM 有 16 个 64-bit 逻辑寄存器（x64 编号映射）+ 8 个物理 scratch 
 
 `call-memory-demo` 覆盖虚拟数据栈、CALL/RET、加密分支目标、虚拟内存 `STORE64/LOAD64` 和 instruction-boundary CFI。
 
+## VM 数据认证与执行检查
+
+VM 镜像使用完整的 32 字节 HMAC-SHA256 标签，覆盖头部、函数入口表、加密指令和干扰区；加载器在分配、解密指令表之前验证标签。加密、认证和各函数的运行时种子分别派生，并绑定构建口令、种子和 handler profile。磁盘指令表仍使用 XTEA-CTR。
+
+共享编解码器拒绝保留字段异常、空函数、范围重叠或空洞、重复入口、未归属字节和截断数据。所有函数编译成功后才发布到桥接表；临时解密表在正常返回及异常退出时清零。
+
+运行时把指令边界表和 64 位逐指令标签纳入整段校验，验证 opcode/register 映射与 handler 变体，执行前检查指令长度，操作数读取限定在当前指令内。入口不在首条指令时也从指定入口执行。运行时校验属于损坏检测，不是密码学 MAC；原有 IR 摘要检查仍保留。
+
+VM 编译器按函数种子重排基本块，并连接条件分支的未跳转路径、CALL 返回位置与其他顺序执行边。末尾没有合法后继时生成终止陷阱，避免重排后意外执行相邻块。每条指令建立独立解码状态，opcode 与操作数前缀逐字节参与后续解码；已有算术 handler 的选择也随指令位置变化。这些属于运行时混淆，整段 HMAC 认证继续独立生效。
+
+新增 9,536 个控制流结果/边界用例，64 个种子下观察到 23 种循环布局；原有 5,808 个镜像拒绝用例、39 个运行时篡改/布局场景和 4,608 个变异差分继续通过。一次同机 Release 基准中，4 条 IR 的缓存调用从约 265 ns 增至 287 ns；固定 16 次迭代的求和循环约 2.76 微秒。构建日志逐函数显示块数、重排块数、连接指令数和加密字节数。实现细节及验证命令见 `Docs/VmProtection.md`。
+
 ## x64 function lifting (VM2)
+
+loader 在加载 `.vmp3` 时为每个函数调用一次 `CompileLiftedProgram`，后续桥接通过 `InvokeCompiledProgram` 复用不可变的加密字节码。每次调用仍独立创建寄存器、flags、数据栈、调用栈和 VM 内存，并保留 IR 摘要、字节码完整性、逐指令标签、CFI 与 fuel 检查。`InvokeLiftedProgram` 保留为一次性编译并执行的兼容入口。缓存会增加每个已加载函数的常驻字节码内存，换取重复调用时省去组装和加密的开销。本次块重排与滚动解码沿用已升级的认证镜像格式；已有 wrapper 需要重新生成才会使用新 loader，命令名称保持不变。
+
+`VmRegression.exe` 覆盖编译结果复用、源 IR 修改后的快照独立性、4,000 次并发调用、跨调用状态隔离、越界/fuel 拒绝，以及 4,608 组变异 flags 差分。`--benchmark` 对 4 条 IR 指令比较每次编译与复用执行，不能据此推算完整应用的加速倍数。GUI 的命令日志将构建口令显示为 `<redacted>`；卡密设置使用公钥文件和产品 ID，签发私钥不传给保护命令。
 
 The conservative x64 lifter accepts an RVA in a PE32+ x64 executable, decodes
 basic blocks (linear sweep plus branch-target worklist so code past an early
@@ -193,4 +226,4 @@ flat memory（`--rcx=N` 传给 bridge 的值即 VM 内存偏移）。SIB 地址�
 
 `protect-function` 将 lifted program 序列化到加密的 `.vmp3`；`protect-functions` 一次虚拟化多个函数到同一个 wrapper（同一 `.vmp3` 内每个函数一条入口记录，loader 为每条入口安装独立 trampoline 并通过第 5 参数函数下标分发到同一个 VM2 桥）。原始 PE 被手工映射后，loader 在指定函数 RVA 写入 12-byte `mov rax, imm64; jmp rax` trampoline，调用进入 thunk 再进入 VM2 runtime。当前落地 ABI 支持 Windows x64 前四个整数/指针参数：`RCX/RDX/R8/R9` 输入、`RAX` 返回。
 
-测试运行器（`Tests/RunTests.ps1`）会让 fixture 自报告各函数 RVA，逐个做 bridge 差分（含循环、分支、移位、VM 内存访问、MOVZX/MOVSX/MOVSXD、NEG/NOT、SETcc、Group1 内存+立即数、累加器短形式），并通过 `lift-raw` 对 35 组手工汇编字节做确定性解码差分（XCHG、PUSH imm、SETcc、ADC/SBB 进位链、LOCK 前缀等），验证含栈参数与 CPUID 的函数会以明确的 fail-closed 错误拒绝提升；`protected_function_vm_bridge` 端到端验证 protect-function 产物中的 trampoline 确实调用了 VM2；`protected_multi_vm_bridge` 端到端验证一条命令虚拟化两个函数后两个 trampoline 都进入 VM2 且结果正确；`protect_all_virtualization` 验证全量虚拟化管线；`mutation_and_watermark` 验证变异差分与水印往返；`licensing_and_compression` 验证许可拒绝/接受与压缩往返。
+测试运行器（`Tests/RunTests.ps1`）会让 fixture 自报告各函数 RVA，逐个做 bridge 差分（含循环、分支、移位、VM 内存访问、MOVZX/MOVSX/MOVSXD、NEG/NOT、SETcc、Group1 内存+立即数、累加器短形式），并通过 `lift-raw` 对 35 组手工汇编字节做确定性解码差分（XCHG、PUSH imm、SETcc、ADC/SBB 进位链、LOCK 前缀等），验证含栈参数与 CPUID 的函数会以明确的 fail-closed 错误拒绝提升；`protected_function_vm_bridge` 端到端验证 protect-function 产物中的 trampoline 确实调用了 VM2；`protected_multi_vm_bridge` 端到端验证一条命令虚拟化两个函数后两个 trampoline 都进入 VM2 且结果正确；`protect_all_virtualization` 验证全量虚拟化管线；`mutation_and_watermark` 验证变异差分与水印往返；`licensing_and_compression` 验证 签名卡密签发、各保护命令、旁挂优先级、旧卡/错误卡拒绝、公钥元数据和压缩往返；`LicenseRegression.exe` 覆盖逐位篡改、时间边界、输入校验及 DPAPI 密钥生命周期。测试需要访问当前 Windows 用户的 DPAPI 状态。

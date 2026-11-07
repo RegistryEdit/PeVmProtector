@@ -4,14 +4,20 @@
 // integrity verification of .pvm containers, shared by the CLI and the loader.
 
 #include <array>
+#include <bit>
+#include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <span>
 #include <string>
 #include <string_view>
+#include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include "PeVmCrypto.h"
+#include "PeImage.h"
+#include "FileIo.h"
 
 using Bytes = pevm::crypto::Bytes;
 namespace crypto = pevm::crypto;
@@ -51,8 +57,6 @@ void AppendLe(Bytes& Out, T Value) {
     Out.insert(Out.end(), P, P + sizeof(T));
 }
 
-Bytes ReadFile(const std::filesystem::path& Path);
-void WriteFileAtomic(const std::filesystem::path& Path, std::span<const std::uint8_t> Data);
 std::string Hex(std::span<const std::uint8_t> Data);
 Bytes FromHex(std::string_view Text);
 
@@ -91,13 +95,7 @@ std::array<std::uint32_t, 4> DeriveKey(std::string_view Password, std::span<cons
                                        std::span<const std::uint8_t> Program,
                                        const OpcodeMap& Map, const KdfParams& Params);
 
-struct PeInfo {
-    std::uint16_t Machine{};
-    std::uint16_t Sections{};
-    std::uint32_t EntryRva{};
-    bool Pe64{};
-    std::uint16_t Subsystem{};
-};
+using PeInfo = pevm::pe::ImageInfo;
 
 // IMAGE_SUBSYSTEM values the tool talks about by name.
 constexpr std::uint16_t KSubsystemNative = 1;
@@ -138,8 +136,13 @@ constexpr std::uint8_t KCompressionLzss = 1;
 
 ContainerHeader ParseContainer(std::span<const std::uint8_t> File);
 
+namespace pevm::build { class Log; }
+// In-memory build stage: no file I/O or completion event. Callers can reuse
+// the same immutable input snapshot for inspection, lifting and packing.
+Bytes PackContainer(std::span<const std::uint8_t> Plain, std::string_view Password,
+                    bool Compress = false, pevm::build::Log* Progress = nullptr);
 void CmdPack(const std::filesystem::path& Input, const std::filesystem::path& Output,
-             std::string_view Password, bool Compress = false);
+             std::string_view Password, bool Compress = false, pevm::build::Log* Progress = nullptr);
 void CmdUnpack(const std::filesystem::path& Input, const std::filesystem::path& Output,
                std::string_view Password);
 std::vector<std::uint8_t> UnpackContainer(std::span<const std::uint8_t> Container,

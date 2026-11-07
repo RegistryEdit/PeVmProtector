@@ -5,6 +5,12 @@
 #include <span>
 
 #pragma pack(push, 1)
+struct LicensePolicy {
+    std::uint32_t Required{};
+    std::array<std::uint8_t, 72> PublicKey{}; // P-256 BCRYPT_ECCPUBLIC_BLOB
+    std::array<std::uint8_t, 32> ProductId{};
+};
+
 struct WrapperFooter {
     std::array<char, 8> Magic;
     std::uint32_t Version;
@@ -34,10 +40,8 @@ struct VmpMetadata {
     std::array<std::uint8_t, 32> HandlerProfile;
     // v3: customer watermark, XOR-obfuscated UTF-8, NUL-padded.
     std::array<std::uint8_t, 64> Watermark;
-    // v4: licensing. When LicenseRequired is nonzero the loader verifies a
-    // license before running the payload (machine-locked, optional expiry).
-    std::uint32_t LicenseRequired;
-    std::array<std::uint8_t, 32> LicenseSecret;
+    // v5: public verification policy replaces the embedded HMAC secret.
+    LicensePolicy License;
 };
 
 struct Vmp3Header {
@@ -49,7 +53,7 @@ struct Vmp3Header {
     std::uint32_t Reserved;
 };
 
-// One .vmp3 v3 entry per virtualized function. InstructionOffset indexes the
+// One VM image entry per virtualized function. InstructionOffset indexes the
 // concatenated (still encrypted) instruction table in instruction units.
 struct Vmp3Entry {
     std::uint32_t FunctionRva;
@@ -68,24 +72,18 @@ struct Vmp3Instruction {
     std::uint32_t Target;
 };
 #pragma pack(pop)
+static_assert(sizeof(LicensePolicy) == 108);
+static_assert(sizeof(VmpMetadata) == 272);
+static_assert(sizeof(WrapperFooter) == 76);
+static_assert(sizeof(Vmp3Header) == 32);
+static_assert(sizeof(Vmp3Entry) == 16);
+static_assert(sizeof(Vmp3Instruction) == 20);
 
 inline constexpr std::array<char, 8> KWrapperMagic = {'P','E','V','M','R','U','N','2'};
 inline constexpr std::array<char, 8> KVmpMetadataMagic = {'V','M','P','M','E','T','A','2'};
 inline constexpr std::array<char, 8> KVmp3Magic = {'P','E','V','M','V','M','3','\0'};
 
-inline constexpr char KLicensePrefix[] = "PEVML1.";
-inline constexpr std::size_t KLicenseSecretBytes = 32;
-
-// Binary license payload wrapped inside a "PEVML1.<base64>" text key. The
-// tag is HMAC-SHA256(secret, machineId/days/issued) truncated to 8 bytes.
-#pragma pack(push, 1)
-struct LicensePayload {
-    std::uint32_t MachineId;
-    std::uint32_t Days;              // validity days from issue; 0 = unlimited
-    std::uint64_t IssuedFileTime;
-    std::uint8_t Tag[8];
-};
-#pragma pack(pop)
+inline constexpr std::uint32_t KVmpMetadataVersion = 5;
 
 inline std::uint64_t WrapperMix64(std::uint64_t Value) {
     Value += 0x9E3779B97F4A7C15ULL;

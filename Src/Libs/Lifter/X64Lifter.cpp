@@ -1,4 +1,6 @@
+#include "VmImageCodec.h"
 #include "X64Lifter.h"
+#include "FileIo.h"
 
 #include <algorithm>
 #include <cstring>
@@ -16,29 +18,9 @@ namespace x64lift {
 namespace {
 using Bytes = std::vector<std::uint8_t>;
 
-template <typename T> T Read(const Bytes& Data, std::size_t Offset) {
+template <typename T> T Read(std::span<const std::uint8_t> Data, std::size_t Offset) {
     if (Offset > Data.size() || sizeof(T) > Data.size() - Offset) throw std::runtime_error("x64 decoder: truncated PE");
     T Value{}; std::memcpy(&Value, Data.data() + Offset, sizeof(Value)); return Value;
-}
-Bytes ReadFile(const std::filesystem::path& Path) {
-    std::ifstream File(Path, std::ios::binary | std::ios::ate);
-    if (!File) throw std::runtime_error("x64 decoder: cannot open input");
-    const auto Size = static_cast<std::size_t>(File.tellg()); Bytes Result(Size); File.seekg(0);
-    if (Size && !File.read(reinterpret_cast<char*>(Result.data()), static_cast<std::streamsize>(Size))) throw std::runtime_error("x64 decoder: read failure");
-    return Result;
-}
-std::size_t RvaToOffset(const Bytes& Data, std::uint32_t Rva) {
-    const auto Nt = Read<std::uint32_t>(Data, 0x3c);
-    if (Read<std::uint32_t>(Data, Nt) != IMAGE_NT_SIGNATURE || Read<std::uint16_t>(Data, Nt + 4) != IMAGE_FILE_MACHINE_AMD64 || Read<std::uint16_t>(Data, Nt + 24) != IMAGE_NT_OPTIONAL_HDR64_MAGIC) throw std::runtime_error("x64 decoder: PE32+ x64 executable required");
-    const auto Count = Read<std::uint16_t>(Data, Nt + 6), OptionalSize = Read<std::uint16_t>(Data, Nt + 20);
-    const std::size_t SectionStart = Nt + 24 + OptionalSize;
-    for (unsigned I = 0; I < Count; ++I) {
-        const auto At = SectionStart + I * sizeof(IMAGE_SECTION_HEADER);
-        const auto Va = Read<std::uint32_t>(Data, At + 12), Vs = Read<std::uint32_t>(Data, At + 8), Raw = Read<std::uint32_t>(Data, At + 20), Rs = Read<std::uint32_t>(Data, At + 16);
-        const auto Span = std::max(Vs, Rs);
-        if (Rva >= Va && static_cast<std::uint64_t>(Rva - Va) < Span) return static_cast<std::size_t>(Raw) + (Rva - Va);
-    }
-    throw std::runtime_error("x64 decoder: function RVA is outside file-backed sections");
 }
 std::string OpName(vmprotect::LiftedOp Op) {
     using O = vmprotect::LiftedOp;
@@ -122,7 +104,7 @@ struct MemOperand {
 };
 
 struct DecodeContext {
-    const Bytes& Data;
+    std::span<const std::uint8_t> Data;
     std::size_t At{};
     std::size_t Limit{};
     std::uint32_t FunctionRva{};
@@ -203,16 +185,27 @@ void RequireRexW(bool RexW, const char* What) {
 
 } // namespace
 
+static LiftResult LiftCode(std::span<const std::uint8_t> Code, std::uint32_t FunctionRva,
+                           std::size_t MaximumBytes);
+
 LiftResult LiftPeFunction(const std::filesystem::path& Input, std::uint32_t FunctionRva, std::size_t MaximumBytes) {
-    const auto Data = ReadFile(Input); const auto Start = RvaToOffset(Data, FunctionRva);
-    if (Start >= Data.size()) throw std::runtime_error("x64 decoder: start outside input");
-    return LiftRawCode({Data.begin() + static_cast<std::ptrdiff_t>(Start), Data.end()}, FunctionRva, MaximumBytes);
+    const auto Data = util::ReadFile(Input);
+    return LiftPeFunction(pevm::pe::ImageView(Data), FunctionRva, MaximumBytes);
 }
 
-// Lifts a bare code blob (no PE container). FunctionRva is purely a label:
-// it names the entry boundary and must match the blob's logical placement.
+LiftResult LiftPeFunction(const pevm::pe::ImageView& Image, std::uint32_t FunctionRva, std::size_t MaximumBytes) {
+    Image.RequireX64();
+    const auto Code = Image.CodeAtRva(FunctionRva, MaximumBytes);
+    return LiftCode(Code, FunctionRva, Code.size());
+}
+
 LiftResult LiftRawCode(const std::vector<std::uint8_t>& Code, std::uint32_t FunctionRva,
                        std::size_t MaximumBytes) {
+    return LiftCode(Code, FunctionRva, MaximumBytes);
+}
+
+static LiftResult LiftCode(std::span<const std::uint8_t> Code, std::uint32_t FunctionRva,
+                           std::size_t MaximumBytes) {
     const auto& Data = Code;
     const auto Start = std::size_t{0};
     if (Data.empty()) throw std::runtime_error("x64 decoder: start outside input");
@@ -293,7 +286,7 @@ LiftResult LiftRawCode(const std::vector<std::uint8_t>& Code, std::uint32_t Func
     // yet (branching over an early RET). Returns false when none is left.
     auto ResumeAtPendingTarget = [&]() {
         for (const auto T : Targets) {
-            if (T >= FunctionRva + static_cast<std::uint32_t>(MaximumBytes)) continue;
+            if (T < FunctionRva || std::uint64_t{T} >= std::uint64_t{FunctionRva} + Limit) continue;
             if (SkippedAddresses.count(T) != 0) continue;
             const auto Decoded = std::ranges::any_of(Program.Instructions, [&](const auto& I){ return I.Address == T; });
             if (Decoded) continue;
@@ -928,12 +921,18 @@ LiftResult LiftRawCode(const std::vector<std::uint8_t>& Code, std::uint32_t Func
 }
 void WriteManifest(const std::filesystem::path& Output, const LiftResult& Result) { std::ofstream File(Output,std::ios::binary|std::ios::trunc); if(!File) throw std::runtime_error("x64 decoder: cannot create manifest"); File << Result.Json; if(!File) throw std::runtime_error("x64 decoder: manifest write failed"); }
 MultiLiftResult LiftPeFunctions(const std::filesystem::path& Input, const std::vector<std::uint32_t>& FunctionRvas) {
+    const auto Data = util::ReadFile(Input);
+    return LiftPeFunctions(pevm::pe::ImageView(Data), FunctionRvas);
+}
+
+MultiLiftResult LiftPeFunctions(const pevm::pe::ImageView& Image, const std::vector<std::uint32_t>& FunctionRvas) {
+    Image.RequireX64();
     if (FunctionRvas.empty()) throw std::runtime_error("multi-lift requires at least one function RVA");
     MultiLiftResult Result;
     std::ostringstream Json;
     Json << "{\n  \"format\": \"pevm-x64-lift-manifest\",\n  \"functions\": [\n";
     for (std::size_t I = 0; I < FunctionRvas.size(); ++I) {
-        auto Lifted = LiftPeFunction(Input, FunctionRvas[I]);
+        auto Lifted = LiftPeFunction(Image, FunctionRvas[I]);
         Json << "    {\"rva\":\"0x" << std::hex << FunctionRvas[I] << "\",\"basicBlocks\":"
              << std::dec << Lifted.BasicBlockCount << ",\"instructions\":"
              << Lifted.Program.Instructions.size() << "}" << (I + 1 == FunctionRvas.size() ? "\n" : ",\n");
@@ -946,13 +945,20 @@ MultiLiftResult LiftPeFunctions(const std::filesystem::path& Input, const std::v
 
 MultiLiftAttempt LiftPeFunctionsTolerant(const std::filesystem::path& Input,
                                          const std::vector<std::uint32_t>& FunctionRvas) {
+    const auto Data = util::ReadFile(Input);
+    return LiftPeFunctionsTolerant(pevm::pe::ImageView(Data), FunctionRvas);
+}
+
+MultiLiftAttempt LiftPeFunctionsTolerant(const pevm::pe::ImageView& Image,
+                                         const std::vector<std::uint32_t>& FunctionRvas) {
+    Image.RequireX64();
     MultiLiftAttempt Attempt;
     std::ostringstream Json;
     Json << "{\n  \"format\": \"pevm-x64-lift-manifest\",\n  \"functions\": [\n";
     bool First = true;
     for (const auto Rva : FunctionRvas) {
         try {
-            auto Lifted = LiftPeFunction(Input, Rva);
+            auto Lifted = LiftPeFunction(Image, Rva);
             if (!First) Json << ",\n";
             First = false;
             Json << "    {\"rva\":\"0x" << std::hex << Rva << "\",\"basicBlocks\":"
@@ -972,59 +978,55 @@ MultiLiftAttempt LiftPeFunctionsTolerant(const std::filesystem::path& Input,
 // annotates exported ones with their names. PE32+ only, matching the lifter.
 std::vector<FunctionCandidate> ScanFunctions(const std::filesystem::path& Input,
                                              std::size_t MinimumBytes) {
-    const auto Data = ReadFile(Input);
-    const auto Nt = Read<std::uint32_t>(Data, 0x3c);
-    if (Read<std::uint32_t>(Data, Nt) != IMAGE_NT_SIGNATURE ||
-        Read<std::uint16_t>(Data, Nt + 4) != IMAGE_FILE_MACHINE_AMD64 ||
-        Read<std::uint16_t>(Data, Nt + 24) != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        throw std::runtime_error("x64 decoder: PE32+ x64 executable required");
-    }
-    // PE32+ data directories start 112 bytes into the optional header.
-    const auto Directories = Nt + 24 + 112;
-    const auto DirectoryEntry = [&](std::size_t Index) {
-        return std::pair{Read<std::uint32_t>(Data, Directories + Index * 8),
-                         Read<std::uint32_t>(Data, Directories + Index * 8 + 4)};
-    };
+    const auto Data = util::ReadFile(Input);
+    return ScanFunctions(pevm::pe::ImageView(Data), MinimumBytes);
+}
 
+std::vector<FunctionCandidate> ScanFunctions(const pevm::pe::ImageView& Image,
+                                             std::size_t MinimumBytes) {
+    Image.RequireX64();
     std::map<std::uint32_t, FunctionCandidate> Candidates;
-    const auto [ExceptionRva, ExceptionSize] = DirectoryEntry(IMAGE_DIRECTORY_ENTRY_EXCEPTION);
-    if (ExceptionRva != 0 && ExceptionSize >= 12) {
-        const auto Offset = RvaToOffset(Data, ExceptionRva);
-        const auto Count = ExceptionSize / 12;
-        for (std::uint32_t I = 0; I < Count; ++I) {
-            const auto Begin = Read<std::uint32_t>(Data, Offset + I * 12);
-            const auto End = Read<std::uint32_t>(Data, Offset + I * 12 + 4);
-            if (End <= Begin || static_cast<std::size_t>(End - Begin) < MinimumBytes) continue;
-            Candidates[Begin] = {Begin, End - Begin, {}};
-        }
+    const auto Exceptions = Image.DirectoryBytes(IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+    if (Exceptions.size() % 12) throw std::runtime_error("PE exception table has a partial record");
+    for (std::size_t At = 0; At < Exceptions.size(); At += 12) {
+        const auto Begin = Read<std::uint32_t>(Exceptions, At);
+        const auto End = Read<std::uint32_t>(Exceptions, At + 4);
+        const auto* Section = Image.SectionAt(Begin);
+        if (End <= Begin || !Section || !Section->Executable() || Image.SectionAt(End - 1) != Section)
+            throw std::runtime_error("PE exception function range invalid");
+        Image.FileBytesAtRva(Begin, End - Begin);
+        if (End - Begin >= MinimumBytes) Candidates[Begin] = {Begin, End - Begin, {}};
     }
 
-    const auto [ExportRva, ExportSize] = DirectoryEntry(IMAGE_DIRECTORY_ENTRY_EXPORT);
-    if (ExportRva != 0 && ExportSize >= sizeof(IMAGE_EXPORT_DIRECTORY)) {
-        const auto Offset = RvaToOffset(Data, ExportRva);
-        const auto NumberOfNames = Read<std::uint32_t>(Data, Offset + 24);
-        const auto NamesRva = Read<std::uint32_t>(Data, Offset + 32);
-        const auto OrdinalsRva = Read<std::uint32_t>(Data, Offset + 36);
-        const auto FunctionsRva = Read<std::uint32_t>(Data, Offset + 28);
-        for (std::uint32_t I = 0; I < NumberOfNames; ++I) {
-            const auto NameRva = Read<std::uint32_t>(Data, RvaToOffset(Data, NamesRva) + I * 4);
-            const auto NameOffset = RvaToOffset(Data, NameRva);
-            const auto NameEnd = std::find(Data.begin() + static_cast<std::ptrdiff_t>(NameOffset),
-                                           Data.end(), static_cast<char>(0));
-            const std::string Name(reinterpret_cast<const char*>(Data.data()) + NameOffset,
-                                   static_cast<std::size_t>(NameEnd - (Data.begin() + static_cast<std::ptrdiff_t>(NameOffset))));
-            const auto Ordinal = Read<std::uint16_t>(Data, RvaToOffset(Data, OrdinalsRva) + I * 2);
-            const auto FunctionRva = Read<std::uint32_t>(Data, RvaToOffset(Data, FunctionsRva) + Ordinal * 4);
-            if (FunctionRva == 0) continue;
-            auto Match = Candidates.find(FunctionRva);
-            if (Match != Candidates.end()) {
-                Match->second.Name = Name;
-            } else {
-                Candidates[FunctionRva] = {FunctionRva, 0U, Name};
-            }
+    const auto Exports = Image.DirectoryBytes(IMAGE_DIRECTORY_ENTRY_EXPORT);
+    if (!Exports.empty()) {
+        if (Exports.size() < sizeof(IMAGE_EXPORT_DIRECTORY)) throw std::runtime_error("PE export directory truncated");
+        const auto NumberOfFunctions = Read<std::uint32_t>(Exports, 20);
+        const auto NumberOfNames = Read<std::uint32_t>(Exports, 24);
+        const auto FunctionsRva = Read<std::uint32_t>(Exports, 28);
+        const auto NamesRva = Read<std::uint32_t>(Exports, 32);
+        const auto OrdinalsRva = Read<std::uint32_t>(Exports, 36);
+        if (NumberOfNames && !NumberOfFunctions) throw std::runtime_error("PE export names without functions");
+        const auto Functions = NumberOfFunctions ? Image.FileBytesAtRva(FunctionsRva, std::size_t{NumberOfFunctions} * 4) : std::span<const std::uint8_t>{};
+        const auto Names = NumberOfNames ? Image.FileBytesAtRva(NamesRva, std::size_t{NumberOfNames} * 4) : std::span<const std::uint8_t>{};
+        const auto Ordinals = NumberOfNames ? Image.FileBytesAtRva(OrdinalsRva, std::size_t{NumberOfNames} * 2) : std::span<const std::uint8_t>{};
+        const auto ExportDirectory = Image.Directory(IMAGE_DIRECTORY_ENTRY_EXPORT);
+        for (std::size_t I = 0; I < NumberOfNames; ++I) {
+            const auto Ordinal = Read<std::uint16_t>(Ordinals, I * 2);
+            if (Ordinal >= NumberOfFunctions) throw std::runtime_error("PE export ordinal outside function table");
+            const auto Name = Image.StringAtRva(Read<std::uint32_t>(Names, I * 4));
+            const auto Rva = Read<std::uint32_t>(Functions, std::size_t{Ordinal} * 4);
+            if (Rva == 0) continue;
+            if (Rva >= ExportDirectory.Address && Rva - ExportDirectory.Address < ExportDirectory.Size) continue;
+            const auto* Section = Image.SectionAt(Rva);
+            // Data exports and forwarders are not executable candidates.
+            if (!Section || !Section->Executable()) continue;
+            Image.FileBytesAtRva(Rva, 1);
+            auto Match = Candidates.find(Rva);
+            if (Match != Candidates.end()) Match->second.Name = Name;
+            else Candidates[Rva] = {Rva, 0U, Name};
         }
     }
-
     std::vector<FunctionCandidate> Result;
     Result.reserve(Candidates.size());
     for (auto& [Rva, Candidate] : Candidates) Result.push_back(std::move(Candidate));
@@ -1042,74 +1044,12 @@ std::vector<std::uint8_t> SerializeVmp3(const LiftResult& Result, std::uint64_t 
 std::vector<std::uint8_t> SerializeVmp3Multi(const MultiLiftResult& Results, std::uint64_t Seed,
                                              std::string_view BuildSecret,
                                              std::span<const std::uint8_t> HandlerProfile,
-                                             bool AntiDisassembly) {
-    using namespace pevm::crypto;
-    if (Results.Functions.empty()) throw std::runtime_error("VM3 serialization requires at least one function");
-    std::size_t TotalInstructions = 0;
-    for (const auto& Function : Results.Functions) TotalInstructions += Function.Program.Instructions.size();
-    if (TotalInstructions > UINT32_MAX) throw std::runtime_error("VM3 instruction count overflow");
-    const std::uint32_t DecoySize = AntiDisassembly ? 128U : 0U;
-    Vmp3Header Header{KVmp3Magic, 3, static_cast<std::uint32_t>(Results.Functions.size()), Seed,
-                      DecoySize, 0};
-    const auto EntryTableSize = Results.Functions.size() * sizeof(Vmp3Entry);
-    Bytes Table(TotalInstructions * sizeof(Vmp3Instruction));
-    auto* Output = reinterpret_cast<Vmp3Instruction*>(Table.data());
-    Bytes EntryTable(EntryTableSize);
-    auto* Entries = reinterpret_cast<Vmp3Entry*>(EntryTable.data());
-    std::size_t Cursor = 0;
-    for (std::size_t F = 0; F < Results.Functions.size(); ++F) {
-        const auto& Function = Results.Functions[F];
-        Entries[F] = {Function.Program.EntryAddress, static_cast<std::uint32_t>(Cursor),
-                      static_cast<std::uint32_t>(Function.Program.Instructions.size()), 0};
-        for (std::size_t I = 0; I < Function.Program.Instructions.size(); ++I) {
-            const auto& Input = Function.Program.Instructions[I];
-            Output[Cursor + I] = {static_cast<std::uint8_t>(Input.Op), Input.Dst, Input.Src, 0,
-                                  Input.Immediate, Input.Address, Input.Target};
-        }
-        Cursor += Function.Program.Instructions.size();
-    }
-    // Key material: SHA-256 over a domain tag, the build secret, the seed and
-    // the .vmp2 handler profile. The loader re-derives both the XTEA-CTR key
-    // and the tag seed, so the VM program is bound to the validated metadata.
-    Sha256 KeyHash;
-    static constexpr std::array<std::uint8_t, 13> KeyDomain = {'P','E','V','M','-','V','M','P','3','-','v','3',0};
-    KeyHash.Update(KeyDomain);
-    KeyHash.Update(std::span(reinterpret_cast<const std::uint8_t*>(BuildSecret.data()), BuildSecret.size()));
-    const auto SeedBytes = std::span(reinterpret_cast<const std::uint8_t*>(&Seed), sizeof(Seed));
-    KeyHash.Update(SeedBytes);
-    KeyHash.Update(HandlerProfile);
-    const auto KeyMaterial = KeyHash.Finish();
-    XteaKey Key{};
-    for (std::size_t I = 0; I < 4; ++I) {
-        Key[I] = static_cast<std::uint32_t>(KeyMaterial[I * 4]) |
-                 (static_cast<std::uint32_t>(KeyMaterial[I * 4 + 1]) << 8) |
-                 (static_cast<std::uint32_t>(KeyMaterial[I * 4 + 2]) << 16) |
-                 (static_cast<std::uint32_t>(KeyMaterial[I * 4 + 3]) << 24);
-    }
-    Sha256 TagHash;
-    static constexpr std::array<std::uint8_t, 13> TagDomain = {'P','E','V','M','-','V','M','P','3','-','T','A','G'};
-    TagHash.Update(TagDomain);
-    TagHash.Update(std::span(KeyMaterial).subspan(16, 16));
-    TagHash.Update(Table);
-    const auto TagFull = TagHash.Finish();
-    XteaCtr(Table, Key, Seed);
-
-    Bytes Data(sizeof(Header) + EntryTable.size() + Table.size() + 16 + DecoySize);
-    std::memcpy(Data.data(), &Header, sizeof(Header));
-    std::memcpy(Data.data() + sizeof(Header), EntryTable.data(), EntryTable.size());
-    std::memcpy(Data.data() + sizeof(Header) + EntryTable.size(), Table.data(), Table.size());
-    std::memcpy(Data.data() + sizeof(Header) + EntryTable.size() + Table.size(), TagFull.data(), 16);
-    if (DecoySize != 0) {
-        auto State = Seed ^ 0xA5F1523D9E3779B9ULL;
-        auto* Decoys = Data.data() + sizeof(Header) + EntryTable.size() + Table.size() + 16;
-        for (std::uint32_t I = 0; I < DecoySize; ++I) {
-            State = WrapperMix64(State + I);
-            static constexpr std::array<std::uint8_t, 4> Patterns = {0x90, 0xCC, 0x0F, 0x0B};
-            Decoys[I] = (I + 1 < DecoySize && (I % 11U) == 0) ? 0x0F : Patterns[State & 3U];
-            if (Decoys[I] == 0x0F && I + 1 < DecoySize && (I % 11U) == 0) Decoys[++I] = 0x0B;
-        }
-    }
-    return Data;
+                                             bool AntiDisassembly,
+                                             std::vector<vmprotect::CompilationStats>* Statistics) {
+    std::vector<vmprotect::LiftedProgram> Programs;
+    Programs.reserve(Results.Functions.size());
+    for (const auto& Function : Results.Functions) Programs.push_back(Function.Program);
+    return pevm::EncodeVmImage(Programs, Seed, BuildSecret, HandlerProfile, AntiDisassembly, Statistics);
 }
 
 void MutateProgram(vmprotect::LiftedProgram& Program, std::uint64_t Seed) {
@@ -1122,15 +1062,14 @@ void MutateProgram(vmprotect::LiftedProgram& Program, std::uint64_t Seed) {
         return State * 0x2545F4914F6CDD1DULL;
     };
 
-    // Only these may directly follow an AddI/SubI rewrite: they overwrite the
-    // flags before anything could observe the swapped carry semantics.
-    const auto SetsFlags = [](O Op) {
+    // A rewrite may change flags only when the immediate successor overwrites
+    // all of them without reading any. ADC/SBB consume CF; shifts can have a
+    // zero count; rotates preserve ZF/SF/PF; CALL/RET propagate flags.
+    const auto OverwritesFlagsWithoutReading = [](O Op) {
         switch (Op) {
-        case O::Add: case O::AddI: case O::Sub: case O::SubI: case O::Adc: case O::Sbb:
+        case O::Add: case O::AddI: case O::Sub: case O::SubI:
         case O::Xor: case O::And: case O::AndI: case O::Or: case O::Neg: case O::Test:
-        case O::Cmp: case O::ShlI: case O::ShrI: case O::ShlR: case O::ShrR:
-        case O::SarI: case O::SarR: case O::RolI: case O::RorI: case O::RolR: case O::RorR:
-        case O::Call: case O::Ret: case O::Halt:
+        case O::Cmp:
             return true;
         default:
             return false;
@@ -1150,16 +1089,17 @@ void MutateProgram(vmprotect::LiftedProgram& Program, std::uint64_t Seed) {
                                 ? Program.Instructions[I + 1].Op
                                 : O::Halt;
 
-        // addi/subi swap: identical result, identical ZF/SF/OF/PF; the carry
-        // semantics differ, which is unobservable when the next instruction
-        // overwrites the flags anyway.
+        const bool FlagsDead = OverwritesFlagsWithoutReading(NextOp);
+        // ADD/SUB with a negated immediate produce the same value, but may
+        // differ in flags; rewrite only when those flags cannot be observed.
         if ((Instruction.Op == O::AddI || Instruction.Op == O::SubI) &&
-            Instruction.Immediate != 0 && SetsFlags(NextOp) && (Next() & 1U) != 0) {
+            Instruction.Immediate != 0 && FlagsDead && (Next() & 1U) != 0) {
             Instruction.Op = Instruction.Op == O::AddI ? O::SubI : O::AddI;
             Instruction.Immediate = ~Instruction.Immediate + 1ULL;
         }
-        // muli by a power of two is an exact shift; neither form touches flags.
-        if (Instruction.Op == O::MulI && IsPowerOfTwo(Instruction.Immediate) && (Next() & 1U) != 0) {
+        // VM MULI preserves flags; SHLI updates them for nonzero counts.
+        if (Instruction.Op == O::MulI && IsPowerOfTwo(Instruction.Immediate) &&
+            FlagsDead && (Next() & 1U) != 0) {
             unsigned Shift = 0;
             for (auto Value = Instruction.Immediate; Value > 1; ++Shift) Value >>= 1;
             Instruction.Op = O::ShlI;

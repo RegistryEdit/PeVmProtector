@@ -1,4 +1,5 @@
 #include "PeVmContainer.h"
+#include "BuildLog.h"
 
 #include <algorithm>
 #include <bit>
@@ -7,47 +8,13 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace fs = std::filesystem;
 namespace crypto = pevm::crypto;
 
 namespace util {
-
-Bytes ReadFile(const fs::path& Path) {
-    std::ifstream File(Path, std::ios::binary | std::ios::ate);
-    if (!File) throw std::runtime_error("cannot open input: " + Path.string());
-    const auto End = File.tellg();
-    if (End < 0) throw std::runtime_error("cannot determine input size");
-    const auto Size = static_cast<std::uint64_t>(End);
-    if (Size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        throw std::runtime_error("input too large");
-    }
-    Bytes Data(static_cast<std::size_t>(Size));
-    File.seekg(0);
-    if (!Data.empty() && !File.read(reinterpret_cast<char*>(Data.data()), static_cast<std::streamsize>(Data.size()))) {
-        throw std::runtime_error("cannot read input");
-    }
-    return Data;
-}
-
-void WriteFileAtomic(const fs::path& Path, std::span<const std::uint8_t> Data) {
-    const fs::path Tmp = Path.string() + ".tmp";
-    {
-        std::ofstream File(Tmp, std::ios::binary | std::ios::trunc);
-        if (!File) throw std::runtime_error("cannot create output: " + Tmp.string());
-        if (!Data.empty()) File.write(reinterpret_cast<const char*>(Data.data()), static_cast<std::streamsize>(Data.size()));
-        if (!File) throw std::runtime_error("cannot write output");
-    }
-    std::error_code Ec;
-    fs::remove(Path, Ec);
-    Ec.clear();
-    fs::rename(Tmp, Path, Ec);
-    if (Ec) {
-        fs::remove(Tmp);
-        throw std::runtime_error("cannot commit output: " + Ec.message());
-    }
-}
 
 std::string Hex(std::span<const std::uint8_t> Data) {
     return crypto::Hex(Data);
@@ -264,23 +231,7 @@ const char* SubsystemName(std::uint16_t Subsystem) {
 }
 
 PeInfo ParsePe(std::span<const std::uint8_t> Data) {
-    if (Data.size()<0x40 || Data[0]!='M' || Data[1]!='Z') throw std::runtime_error("input is not an MZ executable");
-    const auto Nt=util::LoadLe<std::uint32_t>(Data,0x3c);
-    if (Nt>Data.size() || 24>Data.size()-Nt) throw std::runtime_error("invalid e_lfanew");
-    if (util::LoadLe<std::uint32_t>(Data,Nt)!=0x00004550) throw std::runtime_error("missing PE signature");
-    PeInfo Info;
-    Info.Machine=util::LoadLe<std::uint16_t>(Data,Nt+4);
-    Info.Sections=util::LoadLe<std::uint16_t>(Data,Nt+6);
-    const auto OptionalSize=util::LoadLe<std::uint16_t>(Data,Nt+20);
-    if (OptionalSize<20 || Nt+24>Data.size() || OptionalSize>Data.size()-(Nt+24)) throw std::runtime_error("invalid optional header");
-    const auto Magic=util::LoadLe<std::uint16_t>(Data,Nt+24);
-    if (Magic!=0x10b && Magic!=0x20b) throw std::runtime_error("unsupported PE optional header");
-    Info.Pe64=Magic==0x20b;
-    Info.EntryRva=util::LoadLe<std::uint32_t>(Data,Nt+24+16);
-    // Subsystem sits at optional-header offset 68 (PE32 and PE32+ agree).
-    if (OptionalSize<70) throw std::runtime_error("optional header truncated before subsystem");
-    Info.Subsystem=util::LoadLe<std::uint16_t>(Data,Nt+24+68);
-    return Info;
+    return pevm::pe::ImageView(Data).Info();
 }
 
 ContainerHeader ParseContainer(std::span<const std::uint8_t> File) {
@@ -303,22 +254,30 @@ ContainerHeader ParseContainer(std::span<const std::uint8_t> File) {
     return H;
 }
 
-void CmdPack(const fs::path& Input, const fs::path& Output, std::string_view Password,
-             bool Compress) {
-    if(Password.size()<8) throw std::runtime_error("password must be at least 8 characters");
-    auto Plain=util::ReadFile(Input);
-    const auto Pe=ParsePe(Plain);
+Bytes PackContainer(std::span<const std::uint8_t> Plain, std::string_view Password,
+                    bool Compress, pevm::build::Log* Progress) {
+    if (Password.size() < 8) throw std::runtime_error("password must be at least 8 characters");
+    const auto Pe = ParsePe(Plain);
+    if(Plain.size()>std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("PE larger than 4 GiB is unsupported");
+    if (Progress) Progress->Step("Hash input and prepare key program");
     const auto Nonce=MakeNonce(Plain);
     const auto PlainHash=crypto::Sha256::Digest(Plain);
     const auto Map=MakeOpcodeMap(Nonce,PlainHash);
     const auto Program=KeyProgram(Map);
+    if (Progress) Progress->Detail("plain SHA-256", util::Hex(PlainHash));
+    if (Progress) Progress->Detail("key VM bytecode", pevm::build::Size(Program.size()));
+    if (Progress) Progress->Step("Derive payload encryption key");
+    if (Progress) Progress->Detail("KDF", "scrypt N=" + std::to_string(std::uint32_t{1} << KDefaultKdf.LogN) +
+               " r=" + std::to_string(KDefaultKdf.R) + " p=" + std::to_string(KDefaultKdf.P));
+    if (Progress) Progress->Detail("cipher", "XTEA-CTR, 128-bit key");
     const auto Key=DeriveKey(Password,Nonce,Program,Map,KDefaultKdf);
     const auto Check=PasswordCheck(Password,Nonce);
-    if(Plain.size()>std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("PE larger than 4 GiB is unsupported");
 
     // Compression is applied before encryption; incompressible inputs stay
     // stored so the container never grows.
     std::uint8_t Compression = KCompressionNone;
+    if (Progress) Progress->Step("Prepare payload storage");
+    if (Progress) Progress->Detail("compression requested", Compress ? "LZSS" : "off");
     Bytes Stored(Plain.begin(), Plain.end());
     if (Compress) {
         auto Packed = crypto::LzssCompress(Plain);
@@ -328,7 +287,13 @@ void CmdPack(const fs::path& Input, const fs::path& Output, std::string_view Pas
         }
     }
     if(Stored.size()>std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("PE larger than 4 GiB is unsupported");
+    if (Progress) Progress->Detail("compression result", Compression == KCompressionLzss ? "lzss" :
+               Compress ? "stored (compression did not reduce size)" : "stored (compression disabled)");
+    if (Progress) Progress->Detail("stored payload", pevm::build::Size(Stored.size()));
+    if (Progress) Progress->Detail("stored/original", pevm::build::Ratio(Stored.size(), Plain.size()));
+    if (Progress) Progress->Detail("compression saved", pevm::build::Size(Plain.size() - Stored.size()));
 
+    if (Progress) Progress->Step("Encrypt payload and assemble container");
     ContainerHeader H{};
     std::copy(KMagic.begin(),KMagic.end(),H.Magic);
     H.Version=KContainerVersion; H.HeaderSize=sizeof(H); H.Machine=Pe.Machine; H.SectionCount=Pe.Sections;
@@ -346,14 +311,24 @@ void CmdPack(const fs::path& Input, const fs::path& Output, std::string_view Pas
     std::memcpy(Container.data(),&H,sizeof(H));
     Container.insert(Container.end(),Program.begin(),Program.end());
     Container.insert(Container.end(),Stored.begin(),Stored.end());
-    util::WriteFileAtomic(Output,Container);
-    std::cout<<"packed: "<<Input<<" -> "<<Output<<"\n"
-             <<"PE: "<<(Pe.Pe64?"PE32+":"PE32")<<", machine=0x"<<std::hex<<Pe.Machine<<std::dec
-             <<", subsystem="<<SubsystemName(Pe.Subsystem)
-             <<", sections="<<Pe.Sections<<", entry RVA=0x"<<std::hex<<Pe.EntryRva<<std::dec<<"\n"
-             <<"stored: "<<Stored.size()<<" bytes (original "<<Plain.size()<<", "
-             <<(Compression==KCompressionLzss ? "lzss" : "stored")<<")\n"
-             <<"plain SHA-256: "<<util::Hex(PlainHash)<<"\n";
+    if (Progress) Progress->Detail("container header", pevm::build::Size(sizeof(H)));
+    if (Progress) Progress->Detail("encrypted payload", pevm::build::Size(Stored.size()));
+    if (Progress) Progress->Detail("container size", pevm::build::Size(Container.size()));
+    return Container;
+}
+
+void CmdPack(const fs::path& Input, const fs::path& Output, std::string_view Password,
+             bool Compress, pevm::build::Log* Progress) {
+    std::optional<pevm::build::Log> OwnLog;
+    if (!Progress) { OwnLog.emplace("pack", Input, Output); Progress = &*OwnLog; }
+    auto& Log = *Progress;
+    Log.Step("Read PE payload");
+    const auto Plain = util::ReadFile(Input);
+    if (OwnLog) Log.InputInfo(Plain);
+    const auto Container = PackContainer(Plain, Password, Compress, Progress);
+    Log.Step("Write container");
+    util::WriteFileAtomic(Output, Container);
+    if (OwnLog) Log.Finish(Container, Plain.size());
 }
 
 void CmdUnpack(const fs::path& Input, const fs::path& Output, std::string_view Password) {
@@ -381,6 +356,6 @@ std::vector<std::uint8_t> UnpackContainer(std::span<const std::uint8_t> Containe
     const auto Hash=crypto::Sha256::Digest(Plain);
     if(!crypto::ConstantEqual(Hash,std::span(H.PlainSha256,32))) throw std::runtime_error("integrity check failed");
     const auto Pe=ParsePe(Plain);
-    if(Pe.Machine!=H.Machine || Pe.EntryRva!=H.EntryRva || Pe.Subsystem!=H.Subsystem) throw std::runtime_error("metadata check failed");
+    if(Pe.Machine!=H.Machine || Pe.EntryRva!=H.EntryRva || Pe.Subsystem!=H.Subsystem || Pe.Sections!=H.SectionCount) throw std::runtime_error("metadata check failed");
     return Plain;
 }

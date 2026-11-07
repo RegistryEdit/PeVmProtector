@@ -1,5 +1,5 @@
 # PeVmProtector test runner (replacement for the retired ctest suite).
-# Usage:  powershell -ExecutionPolicy Bypass -File tests\Run-Tests.ps1 [-Configuration Release]
+# Usage:  powershell -ExecutionPolicy Bypass -File Tests\RunTests.ps1 [-Configuration Release]
 param(
     [string]$Configuration = "Release"
 )
@@ -36,6 +36,15 @@ function Get-FixtureText {
 }
 
 # ---------------------------------------------------------------------------
+Run-Step "pe_architecture_regression" {
+    $Regression = Join-Path $Bin "PeRegression.exe"
+    if (-not (Test-Path $Regression)) { Fail "PeRegression.exe missing - build the solution first"; return }
+    & $Regression
+    if ($LASTEXITCODE -ne 0) { Fail "PE architecture regression exited $LASTEXITCODE" }
+    else { Ok "PE parsing, snapshot lifting, memory containers and transactional output" }
+}
+
+# ---------------------------------------------------------------------------
 Run-Step "vm_self_test" {
     $Out = & $Pevm self-test 2>&1
     if ($LASTEXITCODE -ne 0) { Fail "self-test exited $LASTEXITCODE" } else { Ok "self-test" }
@@ -43,6 +52,24 @@ Run-Step "vm_self_test" {
     if ($LASTEXITCODE -ne 0) { Fail "vm2-self-test exited $LASTEXITCODE" }
     elseif (($VmOut -join "`n") -notmatch "VM2 self-test: OK") { Fail "vm2-self-test output invalid" }
     else { Ok "vm2-self-test" }
+}
+
+# ---------------------------------------------------------------------------
+Run-Step "vm_compiled_and_mutation_regression" {
+    $Regression = Join-Path $Bin "VmRegression.exe"
+    if (-not (Test-Path $Regression)) { Fail "VmRegression.exe missing - build the solution first"; return }
+    & $Regression
+    if ($LASTEXITCODE -ne 0) { Fail "VM regression exited $LASTEXITCODE" }
+    else { Ok "compiled VM and mutation regression" }
+}
+
+# ---------------------------------------------------------------------------
+Run-Step "license_regression" {
+    $Regression = Join-Path $Bin "LicenseRegression.exe"
+    if (-not (Test-Path $Regression)) { Fail "LicenseRegression.exe missing"; return }
+    & $Regression $Work
+    if ($LASTEXITCODE -ne 0) { Fail "License regression exited $LASTEXITCODE" }
+    else { Ok "signed license regression" }
 }
 
 # ---------------------------------------------------------------------------
@@ -349,12 +376,6 @@ Run-Step "mutation_and_watermark" {
 
 # ---------------------------------------------------------------------------
 Run-Step "licensing_and_compression" {
-    # Machine id must print as 8 hex digits.
-    $MachineOut = & $Pevm machine-id 2>&1
-    if ($LASTEXITCODE -ne 0 -or (($MachineOut -join "`n") -notmatch "machine id: [0-9a-fA-F]{8}")) {
-        Fail "machine-id failed"
-    } else { Ok "machine-id" }
-
     # Compressed container: unpacked bytes must equal the original exactly.
     $Container = Join-Path $Work "compressed.pvm"
     $Restored = Join-Path $Work "compressed.restored.exe"
@@ -370,42 +391,14 @@ Run-Step "licensing_and_compression" {
     elseif ((Get-FileHash $Fixture).Hash -ne (Get-FileHash $Restored).Hash) { Fail "compressed roundtrip SHA mismatch" }
     else { Ok "compressed container roundtrip" }
 
-    # Licensing: generated key accepted, absence rejected.
-    $Secret = -join ((1..64) | ForEach-Object { "{0:x}" -f (Get-Random -Max 16) })
-    $MakeOut = & $Pevm make-license $Secret 30 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "make-license failed: $($MakeOut -join ' ')" }
-    $LicenseKey = ($MakeOut | Where-Object { $_ -match "PEVML1\." }) -replace "^.*?(PEVML1\.\S+).*", '$1'
-    if (-not $LicenseKey -or $LicenseKey -notmatch "^PEVML1\.") { throw "make-license produced no key" }
-
-    $Rva = if ((Get-FixtureText) -match "PEVM-FIXTURE-RVA LiftTarget=0x([0-9A-Fa-f]+)") { "0x" + $Matches[1] } else { throw "no LiftTarget RVA" }
-    $Output = Join-Path $Work "LifterFixture.licensed.exe"
-    Remove-Item $Output, "$Output.loader-error.txt", "$Output.vmbridge-hit" -ErrorAction SilentlyContinue
-    & $Pevm protect-function $Fixture $Output build-key $Rva --license --license-secret=$Secret *> (Join-Path $Work "licensed-build.log")
-    if ($LASTEXITCODE -ne 0) { throw "licensed protect failed: $(Get-Content (Join-Path $Work "licensed-build.log") -Raw)" }
-
-    $env:PEVM_TEST_ERROR_LOG = "1"
-    $env:PEVM_TEST_NO_DIALOG = "1"
-    try {
-        $ExitCode = Invoke-Wrapped $Output "licensed-missing"
-        if ($ExitCode -eq 0) { Fail "licensed wrapper ran without a license" }
-        elseif (-not (Test-Path "$Output.loader-error.txt")) { Fail "loader error log missing" }
-        else {
-            $ErrLog = Get-Content "$Output.loader-error.txt" -Raw
-            if ($ErrLog -notmatch "license check failed") { Fail "unexpected error: $ErrLog" }
-            else { Ok "missing license rejected" }
-        }
-        $env:PEVM_LICENSE = $LicenseKey
-        $env:PEVM_TEST_VM_BRIDGE_LOG = "1"
-        $ExitCode = Invoke-Wrapped $Output "licensed-present"
-        if ($ExitCode -ne 0) { Fail "licensed wrapper failed with a valid license" }
-        elseif (-not (Test-Path "$Output.vmbridge-hit")) { Fail "licensed wrapper did not reach the VM bridge" }
-        else { Ok "valid license accepted, VM bridge executed" }
-    } finally {
-        Remove-Item env:PEVM_TEST_ERROR_LOG, env:PEVM_TEST_NO_DIALOG, env:PEVM_LICENSE, env:PEVM_TEST_VM_BRIDGE_LOG -ErrorAction SilentlyContinue
-    }
+    . (Join-Path $PSScriptRoot 'LicenseIntegration.ps1')
 }
 
 # ---------------------------------------------------------------------------
+Run-Step "detailed_build_output" {
+    . (Join-Path $PSScriptRoot 'BuildOutput.ps1')
+}
+
 Write-Host ""
 if ($Script:Failures.Count -gt 0) {
     Write-Host "$($Script:Failures.Count) test failure(s):" -ForegroundColor Red
