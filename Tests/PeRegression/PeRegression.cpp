@@ -1,6 +1,7 @@
 #include "PeImage.h"
 #include "PeLayout.h"
 #include "PeRelocations.h"
+#include "PeTls.h"
 #include "WindowsResources.h"
 #include "PeVmContainer.h"
 #include "X64Lifter.h"
@@ -76,6 +77,39 @@ Bytes WithFunctions() {
     Text(Data, 0x4a0, "Alpha"); Text(Data, 0x4a8, "Forward"); Text(Data, 0x4b0, "Data");
     Text(Data, 0x4c0, "KERNEL32.Sleep");
     return Data;
+}
+void TlsTests() {
+    constexpr std::uint64_t Base = 0x180000000ULL;
+    const auto MakeTls = [&](unsigned Raw, unsigned Zero) {
+        auto Data = MakePe();
+        Put(Data, Optional + 24, Base, 8);
+        Put(Data, Table + 40 + 36, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_CNT_INITIALIZED_DATA);
+        Directory(Data, 9, 0x2080, 40);
+        Put(Data, 0x480, Base + 0x2020, 8); Put(Data, 0x488, Base + 0x2020 + Raw, 8);
+        Put(Data, 0x490, Base + 0x2000, 8); Put(Data, 0x498, Base + 0x2040, 8);
+        Put(Data, 0x4a0, Zero); Put(Data, 0x4a4, IMAGE_SCN_ALIGN_16BYTES);
+        Put(Data, 0x440, Base + 0x1000, 8); Put(Data, 0x448, 0, 8);
+        return Data;
+    };
+    Check(!pevm::pe::ReadTlsLayout(ImageView(MakePe())), "absent TLS");
+    const auto Payload = MakeTls(16, 32);
+    const auto Tls = pevm::pe::ReadTlsLayout(ImageView(Payload));
+    Check(Tls && Tls->TemplateBytes == 16 && Tls->TotalBytes == 48 && Tls->IndexRva == 0x2000, "TLS template and zero fill");
+    auto Stub = MakeTls(8, 0);
+    const auto OriginalTemplate = ImageView(Stub).FileBytesAtRva(0x2020, 8);
+    const Bytes TemplateCopy(OriginalTemplate.begin(), OriginalTemplate.end());
+    pevm::pe::ConfigureWrapperTls(Stub, ImageView(Payload));
+    Check(pevm::pe::ReadTlsLayout(ImageView(Stub))->TotalBytes == 48, "wrapper carrier reserves payload TLS");
+    Check(std::equal(TemplateCopy.begin(), TemplateCopy.end(), ImageView(Stub).FileBytesAtRva(0x2020, 8).begin()), "TLS carrier does not expose payload template");
+    const auto Invalid = [&](const char* Name, auto Modify) {
+        auto Broken = Payload; Modify(Broken);
+        Reject(Name, [&] { pevm::pe::ReadTlsLayout(ImageView(Broken)); });
+    };
+    Invalid("truncated TLS directory", [&](auto& Data) { Directory(Data, 9, 0x2080, 39); });
+    Invalid("reversed TLS template", [&](auto& Data) { Put(Data, 0x488, Base + 0x2010, 8); });
+    Invalid("TLS index outside image", [&](auto& Data) { Put(Data, 0x490, Base + 0x3000, 8); });
+    Invalid("TLS callback in data", [&](auto& Data) { Put(Data, 0x440, Base + 0x2020, 8); });
+    Invalid("unbounded TLS zero fill", [&](auto& Data) { Put(Data, 0x4a0, UINT32_MAX); });
 }
 void ParserTests() {
     const auto Data = MakePe();
@@ -274,6 +308,16 @@ void LifterTests() {
     Check(Functions.Functions.size() == 2, "batch shares immutable image");
     const auto Attempt = x64lift::LiftPeFunctionsTolerant(Image, {0x1000, 0x2000});
     Check(Attempt.Lifted.Functions.size() == 1 && Attempt.Failures.size() == 1, "per-function failure retained");
+    auto Fragment = Data;
+    // Same chained unwind flag as AegisNT's shared add-rsp/pop/ret epilogue.
+    Fragment[0x500] = 1 | (UNW_FLAG_CHAININFO << 3);
+    Reject("chained epilogue cannot be a VM entry", [&] {
+        x64lift::LiftPeFunction(ImageView(Fragment), 0x1000);
+    });
+    const auto Skipped = x64lift::LiftPeFunctionsTolerant(ImageView(Fragment), {0x1000});
+    Check(Skipped.Lifted.Functions.empty() && Skipped.Failures.size() == 1 &&
+          Skipped.Failures[0].second.find("chained unwind") != std::string::npos,
+          "automatic lifting retains chained-fragment skip reason");
     auto Cross = MakePe();
     Cross[0x3ff] = 0x48; Cross[0x400] = 0x89; Cross[0x401] = 0xc8; Cross[0x402] = 0xc3;
     Reject("decoder cannot consume next section", [&] { x64lift::LiftPeFunction(ImageView(Cross), 0x11ff); });
@@ -367,7 +411,7 @@ void FileTests() {
 }
 int main() {
     try {
-        ParserTests(); LayoutTests(); RelocationTests(); ResourceTests(); LifterTests(); FunctionNameTests(); ContainerTests(); FileTests();
+        ParserTests(); TlsTests(); LayoutTests(); RelocationTests(); ResourceTests(); LifterTests(); FunctionNameTests(); ContainerTests(); FileTests();
         std::cout << "PE architecture regression: " << Checks << " checks passed\n";
         return 0;
     } catch (const std::exception& Error) {

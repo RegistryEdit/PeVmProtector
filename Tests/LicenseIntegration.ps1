@@ -124,17 +124,31 @@ try {
     $env:PEVM_LICENSE = $LicenseKey
     if ((Invoke-Wrapped $Output 'license-valid') -ne 0 -or -not (Test-Path "$Output.vmbridge-hit")) { Fail 'valid license failed to reach VM bridge' }
     else { Ok 'valid signed license reaches VM bridge' }
-    # A valid sidecar must not rescue any invalid environment value.
-    [IO.File]::WriteAllText("$Output.license", $LicenseKey + "`n", [Text.Encoding]::ASCII)
+    # No valid source means failure in noninteractive mode.
     foreach ($Name in $BadLicenses.Keys) {
         $env:PEVM_LICENSE = $BadLicenses[$Name]
         if ((Invoke-Wrapped $Output "license-$Name") -eq 0) { Fail "$Name license accepted" }
         elseif ((Get-Content "$Output.loader-error.txt" -Raw) -notmatch 'license check failed') { Fail "unexpected $Name failure" }
-        else { Ok "$Name license rejected with valid sidecar present" }
+        else { Ok "$Name license rejected without a valid fallback" }
+    }
+    # Each source is verified independently, in environment -> sidecar -> cache order.
+    [IO.File]::WriteAllText("$Output.license", $LicenseKey + "`n", [Text.Encoding]::ASCII)
+    foreach ($Name in $BadLicenses.Keys) {
+        $env:PEVM_LICENSE = $BadLicenses[$Name]
+        if ((Invoke-Wrapped $Output "license-fallback-$Name") -ne 0) { Fail "valid sidecar did not rescue $Name environment" }
+        else { Ok "valid sidecar accepted after $Name environment rejection" }
     }
     [Environment]::SetEnvironmentVariable('PEVM_LICENSE', $null, 'Process')
     if ((Invoke-Wrapped $Output 'license-sidecar') -ne 0) { Fail 'valid sidecar rejected' }
     else { Ok 'sidecar accepted when environment variable absent' }
+    $DialogWrapper = Join-Path $LicenseWork 'dialog-activation.exe'
+    & $Pevm protect-function $Fixture $DialogWrapper build-key $Rva @LicenseOptions *> (Join-Path $LicenseWork 'dialog-build.log')
+    if ($LASTEXITCODE -ne 0) { Fail 'dialog wrapper build failed' }
+    else {
+        & (Join-Path $Bin 'LicenseRuntime.exe') --wrapper $DialogWrapper $LicenseFile $Public $Product *> (Join-Path $LicenseWork 'dialog-integration.log')
+        if ($LASTEXITCODE -ne 0) { Fail 'native dialog activation integration failed; see dialog-integration.log' }
+        else { Ok 'real wrapper cancel, first activation, remembered second start and corrupt-cache reactivation' }
+    }
     $env:PEVM_LICENSE = $LicenseKey
     foreach ($Command in @('wrap', 'protect-all', 'protect-functions')) {
         $AnotherOutput = Join-Path $LicenseWork "$Command.exe"

@@ -1,6 +1,7 @@
 #include "VmImageCodec.h"
 #include "PeLayout.h"
 #include "PeRelocations.h"
+#include "PeTls.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -12,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -46,12 +48,24 @@ EmbeddedImage AddVmpSection(Bytes Stub, std::span<const std::uint8_t> Payload,
                             std::uint64_t BuildId, std::string_view Watermark,
                             const LicensePolicy& License) {
     pevm::pe::AppendLayout Layout;
+    std::optional<pevm::pe::TlsLayout> CarrierTls;
+    Bytes CarrierTemplate;
+    std::uint32_t TlsAlignment = 1;
     {
         const pevm::pe::ImageView StubImage(Stub);
         StubImage.RequireX64();
         if (StubImage.OptionalHeaderSize() < sizeof(IMAGE_OPTIONAL_HEADER64))
             throw std::runtime_error("stub requires a full PE32+ optional header");
-        const std::array<std::uint64_t, 3> Sizes = {Payload.size(), sizeof(VmpMetadata), VmData.size()};
+        CarrierTls = pevm::pe::ReadTlsLayout(StubImage);
+        std::uint64_t MetadataBytes = sizeof(VmpMetadata);
+        if (CarrierTls && CarrierTls->Directory.SizeOfZeroFill) {
+            const auto AlignmentCode = (CarrierTls->Directory.Characteristics & IMAGE_SCN_ALIGN_MASK) >> 20;
+            TlsAlignment = AlignmentCode ? 1U << (AlignmentCode - 1) : 1;
+            MetadataBytes += TlsAlignment - 1ULL + CarrierTls->TotalBytes;
+            const auto Template = StubImage.FileBytesAtRva(CarrierTls->TemplateRva, CarrierTls->TemplateBytes);
+            CarrierTemplate.assign(Template.begin(), Template.end());
+        }
+        const std::array<std::uint64_t, 3> Sizes = {Payload.size(), MetadataBytes, VmData.size()};
         Layout = pevm::pe::PlanAppendSections(StubImage, std::span(Sizes).first(VmData.empty() ? 2 : 3));
     }
     // The borrowed view is gone. All layout arithmetic has been checked.
@@ -90,6 +104,22 @@ EmbeddedImage AddVmpSection(Bytes Stub, std::span<const std::uint8_t> Payload,
     const auto VirtualSize = Layout.Sections[0].VirtualSize;
     const auto MetadataOffset = Layout.Sections[1].RawOffset;
     const auto VmDataOffset = VmData.empty() ? 0U : Layout.Sections[2].RawOffset;
+    if (CarrierTls && CarrierTls->Directory.SizeOfZeroFill) {
+        // The Windows loader uses the raw TLS VA interval, so reserve actual
+        // mapped template bytes instead of relying on SizeOfZeroFill alone.
+        const auto Begin = static_cast<std::uint64_t>(Layout.Sections[1].VirtualAddress) + sizeof(VmpMetadata);
+        const auto TlsRva = (Begin + TlsAlignment - 1) / TlsAlignment * TlsAlignment;
+        const auto TlsRaw = MetadataOffset + static_cast<std::size_t>(TlsRva - Layout.Sections[1].VirtualAddress);
+        std::copy(CarrierTemplate.begin(), CarrierTemplate.end(), Stub.begin() + TlsRaw);
+        const pevm::pe::ImageView Expanded(Stub);
+        const auto Directory = Expanded.FileBytesAtRva(Expanded.Directory(IMAGE_DIRECTORY_ENTRY_TLS).Address,
+                                                       sizeof(IMAGE_TLS_DIRECTORY64));
+        auto Tls = CarrierTls->Directory;
+        Tls.StartAddressOfRawData = Nt->OptionalHeader.ImageBase + TlsRva;
+        Tls.EndAddressOfRawData = Tls.StartAddressOfRawData + CarrierTls->TotalBytes;
+        Tls.SizeOfZeroFill = 0;
+        std::memcpy(Stub.data() + (Directory.data() - Stub.data()), &Tls, sizeof(Tls));
+    }
     std::copy(Payload.begin(), Payload.end(), Stub.begin() + RawOffset);
     if (!VmData.empty()) std::copy(VmData.begin(), VmData.end(), Stub.begin() + VmDataOffset);
 
@@ -188,6 +218,7 @@ Bytes ReadWrapperPayload(const fs::path& Input, pevm::build::Log& Log) {
         throw std::runtime_error("runnable wrappers require a GUI or console payload");
     // Use the runtime's relocation policy before producing a runnable artifact.
     (void)pevm::pe::RelocationTargets(Image);
+    (void)pevm::pe::ReadTlsLayout(Image);
     Log.Detail("input snapshot", "one immutable read reused by build stages");
     return Plain;
 }
@@ -221,18 +252,17 @@ void LogWrapperLayout(pevm::build::Log& Log, const VmpMetadata& Metadata) {
         pevm::build::Hex(Metadata.VmDataRawOffset) + " | " + pevm::build::Size(Metadata.VmDataRawSize));
 }
 
-void CmdWrap(const fs::path& Input, const fs::path& Output, std::string_view Password,
-             const fs::path& StubPath, std::string_view Watermark, bool Compress,
-             const LicensePolicy& License) {
-    pevm::build::Log Log("wrap", Input, Output);
-    const auto Plain = ReadWrapperPayload(Input, Log);
-    LogProtectionOptions(Log, false, false, false, Watermark, Compress, License);
+void AssemblePlainWrapper(std::span<const std::uint8_t> Plain, const fs::path& Output,
+                          std::string_view Password, const fs::path& StubPath,
+                          std::string_view Watermark, bool Compress,
+                          const LicensePolicy& License, pevm::build::Log& Log) {
     Log.Step("Check loader availability");
     if (!fs::exists(StubPath)) throw std::runtime_error("PeVmStub.exe not found beside pevm.exe");
     Log.Detail("loader", fs::absolute(StubPath).lexically_normal().string());
     const auto Payload = PackContainer(Plain, Password, Compress, &Log);
     Log.Step("Embed encrypted payload into loader");
     auto Stub = util::ReadFile(StubPath);
+    pevm::pe::ConfigureWrapperTls(Stub, pevm::pe::ImageView(Plain));
     Log.Detail("loader size", pevm::build::Size(Stub.size()));
     const auto OriginalSize = ParseContainer(Payload).OriginalSize;
     auto Embedded = AddVmpSection(std::move(Stub), Payload, {}, NewBuildId(Payload.size()),
@@ -245,6 +275,15 @@ void CmdWrap(const fs::path& Input, const fs::path& Output, std::string_view Pas
     Log.Finish(Wrapped, OriginalSize);
 }
 
+void CmdWrap(const fs::path& Input, const fs::path& Output, std::string_view Password,
+             const fs::path& StubPath, std::string_view Watermark, bool Compress,
+             const LicensePolicy& License) {
+    pevm::build::Log Log("wrap", Input, Output);
+    const auto Plain = ReadWrapperPayload(Input, Log);
+    LogProtectionOptions(Log, false, false, false, Watermark, Compress, License);
+    AssemblePlainWrapper(Plain, Output, Password, StubPath, Watermark, Compress, License, Log);
+}
+
 // Serializes a lifted multi-program set, packs the payload and seals the
 // wrapper. Shared by protect-functions and protect-all.
 void AssembleVirtualizedWrapper(std::span<const std::uint8_t> Plain, const fs::path& Output,
@@ -255,6 +294,9 @@ void AssembleVirtualizedWrapper(std::span<const std::uint8_t> Plain, const fs::p
     Log.Step("Prepare virtualized functions");
     const auto BuildId = NewBuildId(0);
     auto Prepared = Lifted;
+    for (const auto& Function : Prepared.Functions) {
+        if (Function.NativeBytes < 5) throw std::runtime_error("function too short for the 5-byte VM entry bridge");
+    }
     if (Mutate) {
         for (auto& Function : Prepared.Functions) {
             x64lift::MutateProgram(Function.Program, Seed ^ Function.Program.EntryAddress);
@@ -271,7 +313,8 @@ void AssembleVirtualizedWrapper(std::span<const std::uint8_t> Plain, const fs::p
         Blocks += Function.BasicBlockCount;
         Log.Detail("function RVA", pevm::build::Hex(Function.Program.EntryAddress) +
             " | blocks=" + pevm::build::Number(Function.BasicBlockCount) +
-            " | VM instructions=" + pevm::build::Number(Before) + " -> " + pevm::build::Number(After));
+            " | VM instructions=" + pevm::build::Number(Before) + " -> " + pevm::build::Number(After) +
+            (Function.Program.ResumeAddress ? " | mode=native-EH-fragment | resume="+pevm::build::Hex(Function.Program.ResumeAddress) : " | mode=full-function"));
     }
     Log.Detail("basic blocks", pevm::build::Number(Blocks));
     Log.Detail("total VM instructions", pevm::build::Number(TotalBefore) + " -> " + pevm::build::Number(TotalAfter));
@@ -297,6 +340,7 @@ void AssembleVirtualizedWrapper(std::span<const std::uint8_t> Plain, const fs::p
     const auto Payload = PackContainer(Plain, Password, Compress, &Log);
     Log.Step("Embed payload and VM program into loader");
     auto Stub = util::ReadFile(StubPath);
+    pevm::pe::ConfigureWrapperTls(Stub, pevm::pe::ImageView(Plain));
     Log.Detail("loader", fs::absolute(StubPath).lexically_normal().string());
     Log.Detail("loader size", pevm::build::Size(Stub.size()));
     const auto OriginalSize = ParseContainer(Payload).OriginalSize;
@@ -330,9 +374,8 @@ void CmdVirtualizeFunctions(const fs::path& Input, const fs::path& Output,
 
 // VMP-style "virtualize everything": discover every function (.pdata and
 // exports), lift each one, keep what succeeds and skip the rest with a
-// reason. Functions touching memory operands are skipped unless the caller
-// accepts VM-memory semantics (--allow-mem), because the lifted VM resolves
-// memory through flat VM-space offsets, not native pointers.
+// reason. Protected functions use native pointers and a per-call VM stack;
+// standalone lift-raw execution retains bounded flat-memory semantics.
 void CmdVirtualizeAll(const fs::path& Input, const fs::path& Output,
                       std::string_view Password, std::uint64_t Seed, const fs::path& StubPath,
                       bool AntiDisassembly, bool AllowMemory, std::size_t MinimumBytes,
@@ -343,12 +386,12 @@ void CmdVirtualizeAll(const fs::path& Input, const fs::path& Output,
     LogProtectionOptions(Log, true, AntiDisassembly, Mutate, Watermark, Compress, License);
     Log.Step("Discover function candidates");
     Log.Detail("minimum function bytes", pevm::build::Number(MinimumBytes));
-    Log.Detail("VM memory operands", AllowMemory ? "allowed" : "skip functions that access memory");
+    Log.Detail("VM memory operands", "native pointers and isolated VM stack");
+    (void)AllowMemory; // retained as a compatible CLI option
     if (!fs::exists(StubPath)) throw std::runtime_error("PeVmStub.exe not found beside pevm.exe");
     const pevm::pe::ImageView Image(Plain);
     const auto Candidates = x64lift::ScanFunctions(Image, MinimumBytes);
     Log.Detail("candidates", pevm::build::Number(Candidates.size()));
-    if (Candidates.empty()) throw std::runtime_error("no function candidates discovered (.pdata/exports)");
 
     std::vector<std::uint32_t> Rvas;
     for (const auto& Candidate : Candidates) Rvas.push_back(Candidate.Rva);
@@ -357,26 +400,29 @@ void CmdVirtualizeAll(const fs::path& Input, const fs::path& Output,
 
     x64lift::MultiLiftResult Lifted;
     for (auto& Function : Attempt.Lifted.Functions) {
-        const bool TouchesMemory = std::any_of(Function.Program.Instructions.begin(),
-                                               Function.Program.Instructions.end(),
-                                               [](const vmprotect::LiftedInstruction& Instruction) {
-                                                   return Instruction.Op == vmprotect::LiftedOp::LoadMem ||
-                                                          Instruction.Op == vmprotect::LiftedOp::StoreMem;
-                                               });
-        if (TouchesMemory && !AllowMemory) {
+        if (Function.NativeBytes < 5) {
             Attempt.Failures.push_back({Function.Program.EntryAddress,
-                                        "touches memory operands (VM memory semantics required, use --allow-mem)"});
+                                        "function too short for the 5-byte VM entry bridge"});
         } else {
             Lifted.Functions.push_back(std::move(Function));
         }
     }
     Log.Detail("selected", pevm::build::Number(Lifted.Functions.size()));
+    const auto Fragments=std::count_if(Lifted.Functions.begin(),Lifted.Functions.end(),[](const auto& F){return F.Program.ResumeAddress!=0;});
+    Log.Detail("full VM functions",pevm::build::Number(Lifted.Functions.size()-Fragments));
+    Log.Detail("native EH fragments",pevm::build::Number(Fragments));
     Log.Detail("selection rate", pevm::build::Ratio(Lifted.Functions.size(), Candidates.size()) + " of discovered candidates");
     Log.Detail("skipped", pevm::build::Number(Attempt.Failures.size()));
     for (const auto& [Rva, Reason] : Attempt.Failures) {
         Log.Detail("skipped RVA", pevm::build::Hex(Rva) + " - " + Reason);
     }
-    if (Lifted.Functions.empty()) throw std::runtime_error("no function could be virtualized");
+    if (Lifted.Functions.empty()) {
+        Log.Detail("function virtualization", "0 functions; no eligible VM entries; encrypted wrapper only");
+        Log.Detail("instruction mutation", "not applied (no VM functions)");
+        Log.Detail("anti-disassembly decoys", "not applied (no VM functions)");
+        AssemblePlainWrapper(Plain, Output, Password, StubPath, Watermark, Compress, License, Log);
+        return;
+    }
     AssembleVirtualizedWrapper(Plain, Output, Password, Lifted, Seed, StubPath, AntiDisassembly,
                                Mutate, Watermark, Compress, License, Log);
 }

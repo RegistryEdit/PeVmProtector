@@ -128,7 +128,8 @@ GUI 采用中英文 Qt6 / QFluent 界面，通过 QProcess 调用同目录的 `P
 - **Mutation 变异**：`--mutate` 在 VM IR 层做逐构建随机变异——`ADDI/SUBI` 按补码互换、2 的幂 `MULI` 降为移位；两者都要求紧接的指令不读取旧 flags 且完整覆写 flags。`ADC/SBB`、移位/循环移位、`CALL/RET` 不满足此条件。另在真实指令之间注入写 scratch 的垃圾指令（唯一合成地址、永不被分支引用）。种子化：同一 seed 复现同一变异布局。
 - **水印**：`--watermark=text` 把客户水印以 XOR 混淆写入 `.vmp2` 元数据（v5），`inspect` 解码显示；二进制里 grep 不到明文。
 - **payload 压缩**：`pack --compress`（wrap/protect-* 同名选项）在加密前做 LZSS 压缩（4 KiB 窗口、3..18 字节匹配）；解密后先解压再校验 SHA-256；不可压的输入自动保持存储形态，容器永不膨胀。
-- **许可系统**：`--license --license-public-key=<file> --license-product=<id>` 启用 ECDSA P-256/SHA-256 签名验证。wrapper 仅嵌入公钥和产品摘要，签发私钥由签发端 Windows 用户 DPAPI 保护；卡密绑定产品 ID、64 位十六进制机器码和可选有效期。仅接受 `PEVM-LICENSE`，旧卡需重新签发，旧 EXE 需重新构建并分发，没有兼容开关。环境变量 `PEVM_LICENSE` 优先，只有变量不存在才读取 `<完整EXE文件名>.license`；错误/空值/超长输入拒绝执行。离线校验在启动时进行，不提供在线吊销或完整防时钟回拨能力。详见[签发与迁移说明](Docs/Licensing.md)。
+- **许可系统**：`--license --license-public-key=<file> --license-product=<id>` 启用 ECDSA P-256/SHA-256 签名验证。wrapper 仅嵌入公钥和产品摘要，签发私钥由签发端 Windows 用户 DPAPI 保护；卡密绑定产品 ID、64 位十六进制机器码和可选有效期。仅接受 `PEVM-LICENSE`，旧卡需重新签发；已分发的 EXE 需重新构建并分发新版加载器。启动时依次验证 `PEVM_LICENSE`、同目录旁挂卡密、当前 Windows 用户的 DPAPI 缓存；均无效时显示 Windows 原生卡密弹窗。成功输入会记住在当前用户和 EXE 路径绑定的加密缓存中，每次启动都会重新验证。离线校验不提供在线吊销或完整防时钟回拨能力。详见[签发与迁移说明](Docs/Licensing.md)。
+- 受保护 EXE 的卡密弹窗使用 Windows 原生控件，无需 Qt/QFluent DLL。使用新版工具重新构建 EXE 后生效；本次弹窗更新不改变签名协议，现有有效卡密可继续使用。
 - **导入保护**：手工映射 + 运行期解析意味着磁盘 IAT 从不使用，导入保护天然成立。
 - **反调试/反 dump**：见下节。
 - 差距（诚实声明）：虚拟文件系统（VFS）、native 级 mutation（我们变异的是 VM IR）尚未实现；内存访问函数的全量虚拟化需要指针模拟层。
@@ -139,9 +140,10 @@ GUI 采用中英文 Qt6 / QFluent 界面，通过 QProcess 调用同目录的 `P
 
 1. `scan-functions` 自动发现全部函数入口——异常目录（`.pdata`）的 RUNTIME_FUNCTION 提供候选，导出表补充函数名；
 2. 每个候选独立尝试提升（fail closed per function）：能提升的打进**同一个多入口 .vmp3**，loader 为每个函数安装独立 trampoline；
-3. 不能提升的跳过并逐个报告原因（间接调用、RSP 基址、CPUID、RIP-relative 等都会 fail closed 而非错误翻译）。
+3. 常用 SSE/SSE2 指令可虚拟化；部分 EH/SEH 函数支持保留原生异常框架的寄存器计算片段。AVX、传统高位字节寄存器、LOCK/原子操作及链式展开等仍逐项报告原因并保持原生执行。
 
-安全边界：lifter 把内存操作数翻译为 **VM 平坦内存偏移**而非 native 指针，因此 `protect-all` 默认**跳过任何含内存访问的函数**（它们保持 native 原样执行），`--allow-mem` 可显式接受 VM 内存语义（用于明知指针实为 VM 偏移的载荷）；非叶子函数（CALL 外部目标）会因分支目标校验失败被跳过。这正是与 VMP 真实全量虚拟化的本质差距——VMP 用完整指针模拟层解决重定位，本原型对"叶子、无指针"函数做真虚拟化，其余保持原生，绝不错误翻译。
+保护后的函数默认使用原生指针、RIP 相对地址、独立 VM 栈和原生调用桥接；`--allow-mem` 保留为兼容参数。分析命令的 smoke 执行仍使用有边界的 VM 平坦内存，不能执行原生调用。
+
 
 `--min-bytes=N`（默认 16）过滤微小的 IAT thunk 级候选。
 
@@ -168,12 +170,15 @@ Wrapper 双击直接运行，不要求最终用户输入口令。构建口令经
 - 开发/CI 逃生阀：`PEVM_ALLOW_DEBUGGER=1` 同时禁用全部启动检查与看门狗线程；`PEVM_TEST_FAKE_DEBUGGER=1` 模拟检查命中（供 `loader_anti_debug` 测试验证 fail-closed 管线）。
 - 每个函数的桥接 trampoline 写入后读回比对；函数入口与 thunk 页统一收敛 `PAGE_EXECUTE_READ`；重复 wrap（入口已是 trampoline）会被明确拒绝。
 - 明文 payload 逐节拷贝到映射镜像后立即与源 buffer 比对（头部 + 每节），再应用节保护。
-- **反 dump**：重定位/import/TLS 处理完成后、移交入口前，擦除映射镜像的 PE 头（节保护改为可写→清零→只读）。
+- **运行兼容性**：映射镜像的 PE 头保持只读，供 CRT TLS guard、资源与异常处理继续使用。静态 TLS 使用扩大的 Windows 管理槽位，恢复原程序的初始化模板并转发进程/线程通知及析构回调。现有保护产物需使用新版 CLI 和 stub 重新生成，以预留正确的 TLS 大小。
+- **VM 桥接兼容性**：进入 C++ 前动态对齐栈，兼容优化后的内部 leaf 调用，并注册桥接代码的 x64 unwind 信息。MSVC 异常运行库可识别内存映射的原程序镜像。
+- 链式 unwind 片段（例如共享尾声）不能作为独立 VM 入口；`protect-all` 记录跳过原因，保留这些片段的原生执行。
+- 无可用候选时仍生成加密 wrapper，日志明确显示虚拟化数量为 0，此时不应用 VM 指令变异和诱饵。
 - **代码页 at-rest 加密（TextVault）**：payload 的全部可执行节逐页用 XTEA-CTR 加密（密钥由构建口令派生，域 `PEVM-TEXT-v1`），页保护收敛为 `PAGE_NOACCESS`，并注册前端 VEH：首次执行/访问某页时按需解密该页（RW 解密 → `PAGE_EXECUTE_READ`，进程内以原子状态机去重，多线程竞态安全），之后该页保持明文。运行中（或挂起后）对进程做内存 dump 得到的是密文 + NOACCESS 页，而不是完整明文代码镜像。限制：页面一旦执行过在本进程内保持明文；VEH 属用户态，先于帧 SEH 运行，payload 自注册的前端 VEH 会排在其后。
 - loader 中暴露保护内部结构的错误消息（`.vmp*` 完整性、VM 桥、反调试、import/relocation 等）以 `consteval` XOR 形式编译进二进制，运行期才还原；`PEVM_*` 环境变量名与窗口类名同样混淆。二进制中不再能 grep 到这些明文。
 - **敏感 IAT 彻底清除**：所有意图性 API（反调试、`VirtualAlloc/VirtualProtect`、VEH、Toolhelp、`NtQuery*`、`GetEnvironmentVariableW`，以及 payload 依赖解析用的 `LoadLibraryA`）全部经 **PEB LDR 遍历 + 导出表 FNV-1a 哈希匹配**在运行期解析——不经 `GetModuleHandleW`/`GetProcAddress`/`LoadLibraryA`，转发导出（kernel32 → KERNELBASE 等）会被跟随解析。导入表只剩 CRT 样板与完全通用的运行时入口，静态导入分析不再暴露任何加载意图；模块/函数/环境变量/窗口类名在二进制中均无明文。
 - **新增检测**：`NtQuerySystemInformation(SystemKernelDebuggerInformation)` 内核调试器检测（捕捉不进用户态 PEB/handle 视野的内核调试），以及经典调试器窗口类扫描（best-effort，user32 未映射时跳过）。
-- **VM 程序运行时防篡改**：loader 在载入每个 lifted program 时计算摘要，VM 桥每次调用前重新校验——VM 逐指令认证标签在装配时生成，防不住运行期对内存中 lifted program 的堆补丁，摘要校验封住了这个向量。
+- **VM 程序运行时校验**：loader 认证并校验 lifted image 后一次性编译，把加密字节码、映射、边界和标签冻结在只读页中，随后释放源 IR。每条指令仍检查标签，保留边界 CFI 和 fuel；每次调用不再重复全量扫描 IR 与字节码。只读页与运行时校验不构成对完全控制进程的攻击者的绝对保护。
 
 容器口令派生（scrypt）在解包时执行；运行所需密钥最终必须可由本机 loader 恢复，因此该封装用于提高静态提取成本，而不是宣称密钥在客户端绝对不可恢复。
 
@@ -219,7 +224,7 @@ VM 编译器按函数种子重排基本块，并连接条件分支的未跳转�
 
 ## x64 function lifting (VM2)
 
-loader 在加载 `.vmp3` 时为每个函数调用一次 `CompileLiftedProgram`，后续桥接通过 `InvokeCompiledProgram` 复用不可变的加密字节码。每次调用仍独立创建寄存器、flags、数据栈、调用栈和 VM 内存，并保留 IR 摘要、字节码完整性、逐指令标签、CFI 与 fuel 检查。`InvokeLiftedProgram` 保留为一次性编译并执行的兼容入口。缓存会增加每个已加载函数的常驻字节码内存，换取重复调用时省去组装和加密的开销。本次块重排与滚动解码沿用已升级的认证镜像格式；已有 wrapper 需要重新生成才会使用新 loader，命令名称保持不变。
+loader 在加载 `.vmp3` 时为每个函数调用一次 `CompileLiftedProgram`，后续通过 `InvokeCompiledProgram` 复用只读页中的加密字节码。寄存器、flags 和 VM 状态仍按调用隔离；完整布局与完整性校验在发布前完成，执行时保留逐指令认证、CFI 和 fuel。顺序指令使用边界游标，opcode 使用反查表。源 IR 编译后释放；不使用栈的原生叶子函数跳过 VM 栈分配和复制。`InvokeLiftedProgram` 保留为一次性入口。旧产物需配套使用新版 CLI 和 stub 重新生成。
 
 `VmRegression.exe` 覆盖编译结果复用、源 IR 修改后的快照独立性、4,000 次并发调用、跨调用状态隔离、越界/fuel 拒绝，以及 4,608 组变异 flags 差分。`--benchmark` 对 4 条 IR 指令比较每次编译与复用执行，不能据此推算完整应用的加速倍数。GUI 的命令日志将构建口令显示为 `<redacted>`；卡密设置使用公钥文件和产品 ID，签发私钥不传给保护命令。
 
@@ -233,25 +238,24 @@ through the native/VM register bridge:
 PeVm lift-x64 Input.exe 0x1000 Function.vm2.json 0x1234 --rcx=1 --rdx=2 --r8=4 --r9=8 --trace
 ```
 
-The bridge maps x64 register numbers `RAX..R15` to the 16-register VM2 file and
-returns the result through `RAX`. Supported instructions currently include:
+桥接保存 16 个通用寄存器、XMM0–XMM15、MXCSR 和标志位，入口使用 5 字节相对跳转，thunk 和原生调用桥均有 x64 展开信息。VM 镜像格式升级到版本 6，旧产物需重新保护。
 
-- `MOV r64, r64`, `MOV r64, imm64`（含 `mov r32, imm32` 的零扩展形式、`mov r/m64, imm32` 符号扩展（`C7 /0`）与 `xor r32,r32` 惯用法）
-- `ADD/SUB/AND/OR/XOR/CMP/TEST`（寄存器形式，以及基址寄存器+位移的内存形式，含读改写）；`ADC/SBB`（寄存器、内存与立即数形式，进位/借位取自 VM 实时 flags）
-- 立即数形式：Group1 `0x81/0x83` 全部可提升组（ADD/AND/OR/XOR/SUB/CMP/ADC/SBB，寄存器+内存）、累加器短形式（`04/05/0C/0D/15/1D/24/25/2C/2D/34/35/3C/3D`）、`TEST rax, imm32`（`F7 /0`、`A9`）
-- `IMUL r64, r64` 与三操作数 `IMUL r64, r/m64, imm`（展开为 MOV/MulI）
-- 移位与循环移位：`SHL/SHR/SAR` 与 `ROL/ROR`（立即数 0xC1/0xD1 与按 CL 0xD3，count & 63）；`BSWAP`（0F C8+r）
-- `MOVZX/MOVSX r64, r/m8|r/m16` 与 `MOVSXD`（符号扩展按 ShlI+SarI 展开；MOVZX 亦接受 32 位目标形式）
-- `NEG/NOT`（reg/mem，NEG 按完整 x86 flags、NOT 不改 flags）
-- `SETcc`（寄存器形式，mem 形式因字节写不支持而 fail-closed）、`XCHG r64,r64`（经 VM 数据栈展开）、`PUSH imm32/imm8`
-- `LEA`（含 `[base+index*scale+disp]` SIB 形式，按 VM 算术展开）
-- `PUSH/POP r64`、`INC/DEC r64`、`NOP` 家族（含多字节 NOP、endbr64）；`LOCK`（F0）前缀被跳过（单线程语义等价）
-- 全部 16 个条件跳转（rel8/rel32）与 `CMOVcc`（提升为反转条件分支 + 条件 Mov）
-- 直接 `CALL rel32` 与 `RET`
+- 支持 8/16/32/64 位 MOV 与整数 ALU、ADC/SBB、IMUL、NEG/NOT、INC/DEC、移位/循环移位、MOVZX/MOVSX/MOVSXD、32/64 位 BSWAP、SETcc 寄存器/内存形式、CMOVcc、LEA、PUSH/POP、条件分支、直接/间接原生 CALL 和尾调用 JMP。
+- 32 位写回清除高 32 位，8/16 位写回保留其余位；扩展和地址计算保留标志位；内存读写使用实际操作数宽度。
+- 支持原生指针、RSP/RBP、SIB、RIP 相对寻址。需要栈的函数从每线程 FLS 池租用 72 KiB 缓冲，递归/重入调用使用独立缓冲；提供 64 KiB 局部栈并按线程栈边界复制最多 4 KiB 入参，省去重复分配和全量清零。原生调用在真实 Windows 栈上放置 512 字节出参区，传递 XMM 参数、返回值和 MXCSR。
+- 原生被调用函数的 C++ 异常可以穿过桥接展开。部分 EH/SEH 函数在 prologue 后选择不会触发内存/浮点异常的直线寄存器片段进入 VM，原生调用、异常作用域、处理器和 epilogue 保持原位；日志分别统计 `full VM functions` 和 `native EH fragments`。链式展开、GS/TLS 操作数、AH/BH/CH/DH、LOCK/原子操作、setjmp/longjmp 和任意切栈仍不支持。
 
-Memory addressing maps VM-space offsets: base+disp loads/stores address the VM
-flat memory（`--rcx=N` 传给 bridge 的值即 VM 内存偏移）。SIB 地址在 scratch 寄存器中计算；read-modify-write（`add [mem], reg` 等）通过 scratch 值寄存器展开。任何 native 指针语义的访问都不可能在 VM 内实现，因此以下形式明确 fail closed：RSP/RBP 基址（栈相对访问需要影子栈）、RIP-relative 与绝对 disp32 内存访问、间接 CALL/JMP、SIMD、0x66 前缀的一般 32 位运算。不支持的 native 指令会在生成 wrapper 前明确失败。
+测试运行器（`Tests/RunTests.ps1`）会让 fixture 自报告各函数 RVA，逐个做 bridge 差分（含循环、分支、移位、VM 内存访问、MOVZX/MOVSX/MOVSXD、NEG/NOT、SETcc、Group1 内存+立即数、累加器短形式），并通过 `lift-raw` 对 34 组手工汇编字节做确定性解码差分（XCHG、PUSH imm、SETcc、ADC/SBB 进位链、旋转等），验证栈参数传递，并确认 CPUID 和 LOCK 操作得到明确拒绝。
 
-`protect-function` 将 lifted program 序列化到加密的 `.vmp3`；`protect-functions` 一次虚拟化多个函数到同一个 wrapper（同一 `.vmp3` 内每个函数一条入口记录，loader 为每条入口安装独立 trampoline 并通过第 5 参数函数下标分发到同一个 VM2 桥）。原始 PE 被手工映射后，loader 在指定函数 RVA 写入 12-byte `mov rax, imm64; jmp rax` trampoline，调用进入 thunk 再进入 VM2 runtime。当前落地 ABI 支持 Windows x64 前四个整数/指针参数：`RCX/RDX/R8/R9` 输入、`RAX` 返回。
+`VmRegression.exe` 将 164640 组整数操作数宽度用例与原生 CPU 对照，验证边界读取、六参数调用、XMM 返回和 C++ 异常展开。`loader_tls_and_qt` 显式虚拟化 `LoaderCallWithStack`、`LoaderSimd`、`LoaderExceptionFragment` 和 `LoaderSehFragment`，要求实际 VM 入口标记，并检查变异后的栈参数、线程/重入、SIMD、C++ catch 和 SEH 结果。桥接日志在绑定 payload TLS 前初始化，避免依赖被替换的 CRT 静态初始化 epoch。
 
-测试运行器（`Tests/RunTests.ps1`）会让 fixture 自报告各函数 RVA，逐个做 bridge 差分（含循环、分支、移位、VM 内存访问、MOVZX/MOVSX/MOVSXD、NEG/NOT、SETcc、Group1 内存+立即数、累加器短形式），并通过 `lift-raw` 对 35 组手工汇编字节做确定性解码差分（XCHG、PUSH imm、SETcc、ADC/SBB 进位链、LOCK 前缀等），验证含栈参数与 CPUID 的函数会以明确的 fail-closed 错误拒绝提升；`protected_function_vm_bridge` 端到端验证 protect-function 产物中的 trampoline 确实调用了 VM2；`protected_multi_vm_bridge` 端到端验证一条命令虚拟化两个函数后两个 trampoline 都进入 VM2 且结果正确；`protect_all_virtualization` 验证全量虚拟化管线；`mutation_and_watermark` 验证变异差分与水印往返；`licensing_and_compression` 验证 签名卡密签发、各保护命令、旁挂优先级、旧卡/错误卡拒绝、公钥元数据和压缩往返；`LicenseRegression.exe` 覆盖逐位篡改、时间边界、输入校验及 DPAPI 密钥生命周期。测试需要访问当前 Windows 用户的 DPAPI 状态。
+`protected_function_vm_bridge` 端到端验证 protect-function 产物中的 trampoline 确实调用了 VM2；`protected_multi_vm_bridge` 验证一条命令虚拟化两个函数后两个 trampoline 都进入 VM2 且结果正确；`protect_all_virtualization` 验证全量虚拟化管线；`mutation_and_watermark` 验证变异差分与水印往返；`licensing_and_compression` 验证签名卡密签发、各保护命令、旁挂优先级、旧卡/错误卡拒绝、公钥元数据和压缩往返；`LicenseRegression.exe` 覆盖逐位篡改、时间边界、输入校验及 DPAPI 密钥生命周期。测试需要访问当前 Windows 用户的 DPAPI 状态。
+
+
+## SIMD 覆盖与 Qt 性能复测
+
+已支持常用 SSE/SSE2：打包/标量移动，PS/PD/SS/SD 加减乘除、MIN/MAX/SQRT，逻辑运算、COMI/UCOMI、类型转换，以及打包整数加减、比较、低位乘法、unpack 和 shuffle。桥接保存 XMM0–XMM15 与 MXCSR；标量内存访问严格按 4/8 字节进行。目前仍是 SSE/SSE2 子集，AVX/AVX2/AVX-512 尚未覆盖。
+
+SIMD 原生 CPU 对照共 85632 项，覆盖四种舍入模式、DAZ/FTZ、NaN payload、标志位和边界访存；另测 SIMD 镜像往返、异常片段返回地址认证和不安全片段拒绝。`Tests/QtPerformance.ps1` 测 31 个 Qt timer 回调，每个回调调用同一个显式保护函数 2000 次，并核对校验和；可用 `-BaselineExe` 指定旧保护版本。共享机器的耗时只记录，不设固定速度通过线。
+
+`Tests/WindowResponsiveness.ps1` 测新启动程序窗口线程的 WM_NULL 响应，未覆盖登录后业务。完整应用仍需结合实际操作复测，高频界面/渲染函数进入 VM 后仍有执行开销。

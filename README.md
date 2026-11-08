@@ -226,8 +226,13 @@ the container itself.
   a 64-hex-digit device ID, with optional expiry. Only `PEVM-LICENSE` is accepted;
   reissue all old cards and rebuild/distribute wrappers. There is no legacy
   compatibility switch. See [license issuance and migration](Docs/Licensing.md).
-  `PEVM_LICENSE` takes precedence over `<wrapper.exe>.license`; only an absent
-  variable allows sidecar fallback. Invalid, empty or oversized values fail closed.
+  Startup checks `PEVM_LICENSE`, then `<wrapper.exe>.license`, then a DPAPI-encrypted
+  per-user cache. Invalid sources fall through only after their own signature,
+  product, device and time checks fail. If no source validates, a native Windows
+  dialog accepts and verifies a license; a successful entry is cached for that
+  user and wrapper path. Cache entries are revalidated on every startup.
+  The dialog uses Windows controls and needs no Qt/QFluent DLLs. Rebuild protected
+  EXEs with the updated stub to enable it; existing valid signed licenses still work.
   Verification runs at startup. This offline scheme has no trusted time source
   or online revocation and does not prevent arbitrary clock rollback or client patching.
 - **Import protection**: manual mapping plus runtime resolution means the
@@ -247,18 +252,16 @@ the container itself.
 2. each candidate is lifted independently (fail closed per function): the
    liftable ones land in **one multi-entry .vmp3**, and the loader installs a
    trampoline per entry;
-3. the rest are skipped with per-function reasons (indirect calls, RSP-base
-   addressing, CPUID, RIP-relative all fail closed instead of being
-   mistranslated).
+3. unsupported functions are skipped with a precise reason. Common SSE/SSE2
+   operations are supported. Eligible functions with EH/SEH handlers can use a
+   register-only VM fragment while their exception frame stays native. AVX,
+   legacy high-byte registers, atomic operations and chained unwind remain excluded.
 
-Safety boundary: the lifter translates memory operands to **flat VM-memory
-offsets**, not native pointers, so `protect-all` skips any function touching
-memory by default (they keep running natively); `--allow-mem` explicitly
-accepts VM-memory semantics; non-leaf functions (CALL to external targets)
-are skipped by branch-target verification. That is the essential gap to real
-VMProtect — it resolves pointers with a full emulation layer, this prototype
-truly virtualizes "leaf, pointer-free" functions and keeps everything else
-native, never mistranslating.
+Protected functions now use native pointers, image-relative address resolution,
+an isolated VM stack, and native call bridges. Memory operands are enabled by
+default; `--allow-mem` remains accepted for command-line compatibility.
+Standalone `lift-raw`/analysis smoke execution retains its bounded flat-memory
+model and cannot execute native calls.
 
 `--min-bytes=N` (default 16) filters tiny IAT-thunk-grade candidates.
 
@@ -309,8 +312,18 @@ wrapper's directory; working directory and command line stay compatible.
   already a trampoline) is rejected explicitly.
 - Each mapped section is compared against the source buffer right after
   copying (headers + every section), before protections apply.
-- **Anti-dump**: after relocations/imports/TLS and before handing control to
-  the entry, the mapped image's PE headers are wiped (RW → zero → RO).
+- **Runtime compatibility**: mapped PE headers remain read-only for CRT TLS
+  guards, resources and exception handling. Static TLS uses an enlarged,
+  Windows-managed wrapper slot; the loader restores the payload template and
+  forwards process/thread notifications, including TLS destructors. Rebuild
+  existing wrappers with the updated CLI and stub to reserve the correct size.
+- **VM bridge compatibility**: trampolines align the stack before entering C++
+  even for optimized internal leaf calls and register their x64 unwind data.
+  MSVC exception image lookups recognize the mapped payload as well as loaded modules.
+- Chained unwind fragments (such as shared epilogues) are rejected as VM entries;
+  `protect-all` records the reason and leaves those fragments running natively.
+  If no eligible functions remain, it emits an encrypted wrapper and explicitly
+  reports zero virtualized functions; VM mutation and decoys are not applied.
 - **At-rest code-page encryption (TextVault)**: every executable section is
   XTEA-CTR encrypted per page (key derived from the build password, domain
   `PEVM-TEXT-v1`), pages converge to `PAGE_NOACCESS`, and a front VEH
@@ -336,10 +349,11 @@ wrapper's directory; working directory and command line stay compatible.
   environment-variable and window-class names are absent from the binary.
 - Extra checks: `NtQuerySystemInformation(SystemKernelDebuggerInformation)`
   kernel-debugger detection and a classic debugger window-class scan.
-- **VM program runtime tamper check**: the loader digests every lifted
-  program at load time and the VM bridge re-verifies on every call — the
-  per-instruction VM tags are computed during assembly, so this closes the
-  "patch the lifted program in memory" vector.
+- **VM program runtime validation**: the loader authenticates and validates the
+  lifted image, compiles it once, then freezes encrypted bytecode, maps, offsets
+  and tags in read-only pages. Source IR is released after compilation.
+  Instruction tags, boundary CFI and fuel are checked during execution; calls
+  no longer rescan the entire IR or bytecode.
 
 Container password derivation (scrypt) happens at unpack time; the runtime
 key material must ultimately be recoverable by the local loader, so this
@@ -361,13 +375,12 @@ unclaimed bytes and truncated data. Functions are published to the bridge
 only after every function has compiled successfully. The decoder wipes its
 temporary decrypted table when it leaves scope, including exception paths.
 
-Runtime checks bind instruction offsets and 64-bit instruction tags to the
-whole-program checksum, validate opcode/register maps and handler variants,
-and enforce exact operand lengths before dispatch. Lifted entry addresses
-are honored even when the entry is not the first instruction. These runtime
-checksums detect corruption; they are not cryptographic MACs or a guarantee
-against an attacker controlling the running process. Lifted IR is still kept
-for the bridge's existing digest check.
+Compilation validates instruction offsets, the whole-program checksum,
+opcode/register maps, handler variants and operand lengths before freezing the
+program. Execution verifies per-instruction tags and exact branch boundaries.
+Lifted entry addresses are honored even when the entry is not the first
+instruction. Runtime checksums detect corruption; they are not cryptographic
+MACs or a guarantee against an attacker controlling the running process.
 
 The compiler now shuffles basic blocks by function seed and reconnects
 fallthrough and call-continuation edges. An explicit trap closes paths past
@@ -442,14 +455,14 @@ targets, virtual memory `STORE64/LOAD64` and instruction-boundary CFI.
 ## x64 function lifting (VM2)
 
 The loader calls `CompileLiftedProgram` once per function when loading
-`.vmp3`; subsequent bridge calls reuse immutable encrypted bytecode through
-`InvokeCompiledProgram`. Registers, flags, stacks and VM memory remain local
-to each invocation. IR digest, bytecode integrity, instruction tags, CFI and
-fuel checks remain active. `InvokeLiftedProgram` remains the one-shot API.
-Caching adds resident bytecode storage per loaded function in exchange for
-avoiding repeated assembly and encryption. The authenticated VM image format
-has changed; rebuild existing protected wrappers with the matching CLI and
-loader. Public command names remain unchanged.
+`.vmp3`; subsequent bridge calls reuse encrypted bytecode in read-only pages
+through `InvokeCompiledProgram`. Registers, flags and VM state remain local
+to each invocation. Full layout/integrity validation happens before publication;
+instruction authentication, CFI and fuel remain active during execution.
+Sequential instructions use a boundary cursor and opcode lookup table.
+Source IR is released, and register-only native leaf functions skip VM stack
+allocation and copying. `InvokeLiftedProgram` remains the one-shot API.
+Rebuild existing wrappers with matching CLI and loader binaries.
 
 `VmRegression.exe` checks reuse, snapshot independence from modified source
 IR, 4,000 concurrent calls, state isolation, OOB/fuel rejection, a non-first
@@ -471,66 +484,72 @@ through the native/VM register bridge:
 PeVm lift-x64 Input.exe 0x1000 Function.vm2.json 0x1234 --rcx=1 --rdx=2 --r8=4 --r9=8 --trace
 ```
 
-The bridge maps x64 register numbers `RAX..R15` onto the 16-register VM2 file
-and returns through `RAX`. Currently supported instructions:
+The bridge captures all 16 integer registers, XMM0–XMM15 and flags. The entry
+uses a five-byte relative jump to a nearby thunk, with registered x64 unwind
+metadata. The instruction stream carries explicit operand widths (VM image
+revision 6; rebuild older wrappers to use the new runtime).
 
-- `MOV r64, r64`, `MOV r64, imm64` (including the `mov r32, imm32`
-  zero-extension form, sign-extended `mov r/m64, imm32` (`C7 /0`) and the
-  `xor r32,r32` idiom)
-- `ADD/SUB/AND/OR/XOR/CMP/TEST` (register forms plus base+displacement memory
-  forms incl. read-modify-write); `ADC/SBB` (register, memory and immediate
-  forms, carry/borrow from live VM flags)
-- Immediate forms: Group1 `0x81/0x83` liftable groups (ADD/AND/OR/XOR/SUB/
-  CMP/ADC/SBB, register + memory), accumulator short forms
-  (`04/05/0C/0D/15/1D/24/25/2C/2D/34/35/3C/3D`), `TEST rax, imm32`
-  (`F7 /0`, `A9`)
-- `IMUL r64, r64` and three-operand `IMUL r64, r/m64, imm` (expanded to
-  MOV/MulI)
-- Shifts and rotates: `SHL/SHR/SAR` and `ROL/ROR` (immediates 0xC1/0xD1 and
-  CL-based 0xD3, count & 63); `BSWAP` (0F C8+r)
-- `MOVZX/MOVSX r64, r/m8|r/m16` and `MOVSXD` (sign extension via
-  ShlI+SarI; MOVZX also accepts the 32-bit destination form)
-- `NEG/NOT` (reg/mem; NEG with full x86 flags, NOT flag-preserving)
-- `SETcc` (register form — the memory form fails closed because byte stores
-  are unsupported), `XCHG r64,r64` (expanded via the VM data stack),
-  `PUSH imm32/imm8`
-- `LEA` (including `[base+index*scale+disp]` SIB forms, expanded to VM
-  arithmetic)
-- `PUSH/POP r64`, `INC/DEC r64`, the `NOP` family (multi-byte NOPs, endbr64);
-  the `LOCK` (F0) prefix is skipped (equivalent single-threaded semantics)
-- All 16 conditional jumps (rel8/rel32) and `CMOVcc` (lowered to an inverted
-  conditional branch + conditional Mov)
-- Direct `CALL rel32` and `RET`
+Supported integer operations include 8/16/32/64-bit MOV and ALU operations,
+ADC/SBB, IMUL, NEG/NOT, INC/DEC, shifts/rotates, MOVZX/MOVSX/MOVSXD,
+32/64-bit BSWAP, SETcc register/memory forms, CMOVcc, LEA, PUSH/POP,
+conditional branches, and direct/indirect native CALL and tail JMP. Instruction
+forms with legacy AH/BH/CH/DH operands remain rejected. Address arithmetic and
+extensions preserve flags; 32-bit writes clear the upper half, and 8/16-bit
+writes preserve it. Memory loads/stores use the actual operand width.
 
-Memory addressing maps VM-space offsets: base+disp loads/stores address the
-VM flat memory (`--rcx=N` passed to the bridge is a VM memory offset). SIB
-addresses are computed in scratch registers; read-modify-write (`add [mem],
-reg` etc.) goes through a scratch value register. Any native-pointer access
-cannot be represented inside the VM, so these forms fail closed explicitly:
-RSP/RBP bases (stack-relative access needs a shadow stack), RIP-relative and
-absolute disp32 memory access, indirect CALL/JMP, SIMD, and general 32-bit
-operations under the 0x66 prefix. Unsupported instructions fail with a clear
-error before the wrapper is built.
-
-`protect-function` serializes the lifted program into an encrypted `.vmp3`;
-`protect-functions` virtualizes several functions into one wrapper (one entry
-record per function inside the same `.vmp3`; the loader installs a
-trampoline per entry and dispatches through a fifth argument function index
-into a single VM2 bridge). After manual mapping, the loader patches a
-12-byte `mov rax, imm64; jmp rax` trampoline over the function RVA; calls
-enter the thunk and then the VM2 runtime. The current ABI covers the first
-four Windows x64 integer/pointer arguments (`RCX/RDX/R8/R9` in, `RAX` out).
+Native pointer, RSP/RBP, SIB and RIP-relative operands are supported in protected
+executables. Functions needing a stack lease a 72 KiB buffer from a per-thread
+FLS pool, with separate buffers for recursive/reentrant calls. This provides
+64 KiB of local stack and copies up to 4 KiB of incoming data within the thread
+stack bounds, without repeatedly allocating and clearing the entire buffer.
+Native calls copy a 512-byte outgoing argument area onto a real Windows stack
+and preserve XMM arguments/results and MXCSR. Native callee C++ exceptions can
+unwind through the bridge. Eligible EH/SEH functions virtualize a straight-line,
+nonfaulting register fragment after their prologue; native calls, exception
+scopes, handlers and epilogues stay in place. Logs report `full VM functions`
+and `native EH fragments` separately. Chained unwind, segment-based TLS operands,
+legacy high-byte registers, LOCK/atomic memory operations, setjmp/longjmp and
+arbitrary stack switching remain unsupported.
 
 The test runner (`Tests/RunTests.ps1`) has the fixture self-report function
 RVAs, runs bridge differentials per function (loops, branches, shifts, VM
 memory access, MOVZX/MOVSX/MOVSXD, NEG/NOT, SETcc, Group1 memory+immediate,
-accumulator short forms), plus 35 deterministic `lift-raw` decode differentials
-over hand-assembled bytes (XCHG, PUSH imm, SETcc, ADC/SBB carry chains, LOCK
-prefix etc.); it verifies stack-parameter and CPUID functions are rejected
-with clear fail-closed errors. `protected_function_vm_bridge` proves
+accumulator short forms), plus 34 deterministic `lift-raw` decode differentials
+over hand-assembled bytes (XCHG, PUSH imm, SETcc, ADC/SBB carry chains, rotations,
+etc.); it verifies stack-parameter execution and explicitly rejects CPUID and
+LOCK operations. `VmRegression.exe` also compares 164,640 operand-width cases
+against native CPU execution, checks a byte load beside a guard page, and
+exercises six-argument calls, XMM returns and C++ exception unwinding.
+`loader_tls_and_qt` explicitly virtualizes `LoaderCallWithStack`, `LoaderSimd`,
+`LoaderExceptionFragment` and `LoaderSehFragment`. It requires actual VM entry
+markers and checks stack arguments, thread/reentrant calls, SIMD results,
+C++ catch and SEH behavior with mutation enabled.
+Bridge tracing initializes its state before payload TLS is bound, so enabling
+the test log does not depend on the payload's CRT static-initialization epoch.
+`protected_function_vm_bridge` proves
 end-to-end that protect-function trampolines reach VM2;
 `protected_multi_vm_bridge` proves one command can virtualize two functions
 with both trampolines hitting VM2 correctly; `protect_all_virtualization`
 covers the full-virtualization pipeline; `mutation_and_watermark` covers
 mutation differentials and watermark round-trips; `licensing_and_compression`
-covers signed license issuance, all protection commands, sidecar precedence, invalid/legacy license rejection, public-only wrapper metadata, and compression round-trips. `LicenseRegression.exe` additionally covers cryptographic tampering, time boundaries, malformed inputs, and DPAPI key lifecycle; tests require access to the current Windows user DPAPI profile.
+covers signed license issuance, all protection commands, source fallback, invalid/legacy license rejection, public-only wrapper metadata, and compression round-trips. `LicenseRegression.exe` additionally covers cryptographic tampering, time boundaries, malformed inputs, and DPAPI key lifecycle. `LicenseRuntime.exe` exercises the real bilingual native dialog, retry/cancel, encrypted-cache isolation, first activation, remembered startup, corruption recovery and cache-write failure. Tests require the current Windows user DPAPI profile and an interactive desktop; dialog screenshots are saved under `bin/Release/TestArtifacts/license-runtime-*`.
+
+
+## SIMD coverage and Qt performance verification
+
+Supported SSE/SSE2 forms include packed/scalar moves; PS/PD/SS/SD arithmetic,
+MIN/MAX/SQRT; logical operations; COMI/UCOMI and conversions; packed integer
+add/subtract, comparisons, low-word multiply, unpack and shuffle. The bridge
+preserves XMM0–XMM15 and MXCSR. Scalar memory access uses its actual 4/8-byte
+width. This is a subset of SSE/SSE2, not complete AVX/AVX2/AVX-512 support.
+
+`VmRegression.exe` compares 85,632 SIMD cases against the CPU, including four
+rounding modes, DAZ/FTZ, NaN payloads, flags and memory boundaries. It also tests
+SIMD image round trips, authenticated EH resume metadata and unsafe-fragment
+rejection. `Tests/QtPerformance.ps1` measures 31 Qt timer callbacks with 2,000
+calls each to the same explicitly protected export, checking the final checksum.
+Pass `-BaselineExe` to compare an earlier protected fixture. Timings are recorded,
+not enforced as fixed thresholds on a shared machine. `Tests/WindowResponsiveness.ps1`
+samples WM_NULL response latency of freshly started applications; it does not
+exercise post-login business operations. Whole-application performance needs a
+representative workload: hot UI/rendering functions can still incur VM overhead.

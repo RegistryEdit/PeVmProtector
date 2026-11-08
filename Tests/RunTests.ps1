@@ -113,12 +113,24 @@ Run-Step "license_regression" {
 }
 
 # ---------------------------------------------------------------------------
+Run-Step "license_runtime" {
+    $Regression = Join-Path $Bin "LicenseRuntime.exe"
+    if (-not (Test-Path $Regression)) { Fail "LicenseRuntime.exe missing"; return }
+    & $Regression $Work *> (Join-Path $Work 'license-runtime.log')
+    if ($LASTEXITCODE -ne 0) { Fail "License runtime regression failed; see license-runtime.log" }
+    else { Ok "native bilingual dialog, retry/cancel, DPAPI cache, expiry and source fallback" }
+}
+
 Run-Step "dependency_fixture" {
     Push-Location $Bin
     try {
         & (Join-Path $Bin "DependencyApp.exe") | Out-Null
         if ($LASTEXITCODE -ne 0) { Fail "DependencyApp exited $LASTEXITCODE" } else { Ok "DependencyApp" }
     } finally { Pop-Location }
+}
+
+Run-Step "loader_tls_and_qt" {
+    . (Join-Path $PSScriptRoot 'LoaderRuntime.ps1')
 }
 
 # ---------------------------------------------------------------------------
@@ -136,7 +148,7 @@ Run-Step "x64_lift_matrix" {
     }
     if (-not $Targets.ContainsKey("LiftTarget")) { throw "fixture output did not include a LiftTarget RVA" }
 
-    $Negative = @("StackTarget", "CpuIdTarget")
+    $Negative = @("CpuIdTarget")
     foreach ($Name in $Targets.Keys) {
         $T = $Targets[$Name]
         $Json = Join-Path $Work "lift-matrix-$Name.json"
@@ -178,7 +190,6 @@ Run-Step "x64_lift_matrix" {
         "add_mem_reg|480111488B01C3|0x40|0x7B|0x7b",
         "or_mem_reg|480911488B01C3|0x40|0x55|0x55",
         "xor_mem_reg|483111488B01C3|0x40|0x55|0x55",
-        "lock_add_mem_reg|F0480111488B01C3|0x40|0x7B|0x7b",
         "acc_add_imm|480534120000C3|0x0|0x0|0x1234",
         "acc_and_imm|4889C84825FF000000C3|0x1FF|0x0|0xff",
         "acc_xor_imm|4889C8483555000000C3|0x0|0x0|0x55",
@@ -199,6 +210,10 @@ Run-Step "x64_lift_matrix" {
         elseif ($Raw -notmatch "raw bridge rax: $($Parts[4].ToLowerInvariant())\b") { Fail "$($Parts[0]) expected RAX $($Parts[4]), got: $Raw" }
         else { Ok $Parts[0] }
     }
+    $Locked = & $Pevm lift-raw F0480111488B01C3 0 --rcx=0x40 --rdx=0x7b 2>&1
+    if ($LASTEXITCODE -eq 0 -or ($Locked -join "`n") -notmatch 'LOCK atomic') {
+        Fail 'LOCK operation must retain atomicity or be rejected'
+    } else { Ok 'LOCK operation rejected without losing atomic semantics' }
 
     $MultiOut = & $Pevm lift-x64-multi $Fixture (Join-Path $Work "lift-multi.json") $Targets["LiftTarget"].Rva $Targets["LiftTarget"].Rva 2>&1
     if ($LASTEXITCODE -ne 0 -or (($MultiOut -join "`n") -notmatch "multi-function lift: 2 functions")) {
@@ -369,8 +384,9 @@ Run-Step "protect_all_virtualization" {
         Remove-Item env:PEVM_TEST_NO_DIALOG, env:PEVM_TEST_VM_BRIDGE_LOG -ErrorAction SilentlyContinue
     }
     $Marker = Get-Content "$Output.vmbridge-hit" -Raw
-    if ($Marker -notmatch "index=0" -or $Marker -notmatch "index=5") { Fail "expected bridge hits for the virtualized set" }
-    elseif ($Marker -match "index=[^0-5\r\n]") { Fail "bridge hit with an unexpected index" }
+    $Indices = @([regex]::Matches($Marker, 'index=(\d+)') | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Unique)
+    if ($Indices.Count -lt 6) { Fail "expected at least six distinct virtualized functions to execute" }
+    elseif (@($Indices | Where-Object { $_ -lt 0 -or $_ -ge $Virtualized }).Count) { Fail "bridge hit with an out-of-range index" }
     else { Ok "all virtualized functions bridged with correct indices" }
 }
 

@@ -10,9 +10,12 @@
   <Project Path="Src\Apps\Stub\PeVmStub.vcxproj" />
   <Project Path="Src\Apps\Gui\PeVmProtectorGui.vcxproj" />
   <Project Path="Tests\LifterFixture\LifterFixture.vcxproj" />
+  <Project Path="Tests\LoaderFixture\LoaderFixture.vcxproj" />
+  <Project Path="Tests\LoaderFixture\LoaderQtFixture.vcxproj" />
   <Project Path="Tests\VmRegression\VmRegression.vcxproj" />
   <Project Path="Tests\PeRegression\PeRegression.vcxproj" />
   <Project Path="Tests\LicenseRegression\LicenseRegression.vcxproj" />
+  <Project Path="Tests\LicenseRuntime\LicenseRuntime.vcxproj" />
   <Project Path="Tests\DependencyFixture\DepFixture.vcxproj" />
   <Project Path="Tests\DependencyFixture\DependencyApp.vcxproj" />
   <Project Path="Tests\FunctionSelection\FunctionSelection.vcxproj" />

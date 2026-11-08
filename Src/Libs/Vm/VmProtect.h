@@ -16,7 +16,8 @@ enum class LiftedOp : std::uint8_t {
     ShlI, ShrI, ShlR, ShrR, SarI, SarR, RolI, RorI, RolR, RorR,
     Cmp, Jmp, Jz, Jnz,
     Ja, Jae, Jb, Jbe, Js, Jns, Jl, Jge, Jle, Jg, Jo, Jno, Jp, Jnp,
-    Push, Pop, LoadMem, StoreMem, Call, Ret, Nop, Halt, Count
+    Push, Pop, LoadMem, StoreMem, Call, Ret, Nop, Halt,
+    ZeroExtend, SignExtend, Inc, Dec, ImageAddress, NativeCall, Simd, Count
 };
 
 struct LiftedInstruction {
@@ -26,24 +27,51 @@ struct LiftedInstruction {
     std::uint64_t Immediate{};
     std::uint32_t Address{};
     std::uint32_t Target{};
+    // Operand width in bits. Bit 7 preserves flags for address arithmetic.
+    std::uint8_t Width = 64;
 };
+
+inline constexpr std::uint8_t KPreserveFlags = 0x80;
+inline constexpr bool ValidOperandWidth(std::uint8_t Width) {
+    const auto Bits = Width & 0x7f;
+    return Bits == 8 || Bits == 16 || Bits == 32 || Bits == 64;
+}
 
 struct LiftedProgram {
     std::vector<LiftedInstruction> Instructions;
     std::uint32_t EntryAddress{};
+    // Nonzero for a straight-line fragment in an existing native EH frame.
+    std::uint32_t ResumeAddress{};
 };
 
 // Native/VM call bridge.  Arguments are marshalled by register number and the
 // virtualized function returns through RAX (Registers[0]).
-struct VmBridgeContext {
+struct alignas(16) VmBridgeContext {
     std::array<std::uint64_t, 16> Registers{};
+    std::array<std::array<std::uint8_t,16>,16> Xmm{};
+    std::uint64_t Rflags = 0x202;
+    std::uint64_t CallTarget{};
+    std::uint64_t NativeArguments{};
+    std::uint32_t Mxcsr = 0x1f80;
 };
+static_assert(offsetof(VmBridgeContext, Xmm) == 128);
+static_assert(offsetof(VmBridgeContext, Rflags) == 384);
+static_assert(offsetof(VmBridgeContext, NativeArguments) == 400);
+static_assert(offsetof(VmBridgeContext, Mxcsr) == 408);
+static_assert(sizeof(VmBridgeContext) == 416);
 
 // Runtime limits for a single VM execution. Defaults preserve the historical
 // 100k-instruction fuel and 4 KiB flat memory.
 struct RunConfig {
     std::size_t Fuel = 100000;
     std::size_t MemoryBytes = 4096;
+    // Explicit opt-in for the in-process native bridge; CLI simulation keeps
+    // using bounded, invocation-local flat memory.
+    bool NativeMemory = false;
+    std::uint64_t ImageBase = 0;
+    VmBridgeContext* NativeContext = nullptr;
+    std::uint64_t StackLower = 0;
+    std::uint64_t StackUpper = 0;
 };
 
 // Non-secret build metrics; no bytecode, keys or address maps are exposed.

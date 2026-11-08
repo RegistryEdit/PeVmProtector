@@ -116,11 +116,11 @@ crypto::Bytes EncodeVmImage(std::span<const vmprotect::LiftedProgram> Programs,
     for (std::size_t F = 0; F < Programs.size(); ++F) {
         const auto& Program = Programs[F];
         const Vmp3Entry Entry{Program.EntryAddress, static_cast<std::uint32_t>(Cursor),
-                             static_cast<std::uint32_t>(Program.Instructions.size()), 0};
+                             static_cast<std::uint32_t>(Program.Instructions.size()), Program.ResumeAddress};
         std::memcpy(Data.data() + sizeof(Header) + F * sizeof(Entry), &Entry, sizeof(Entry));
         for (const auto& Instruction : Program.Instructions) {
             const Vmp3Instruction Record{static_cast<std::uint8_t>(Instruction.Op), Instruction.Dst,
-                Instruction.Src, 0, Instruction.Immediate, Instruction.Address, Instruction.Target};
+                Instruction.Src, Instruction.Width, Instruction.Immediate, Instruction.Address, Instruction.Target};
             std::memcpy(Table.Data.data() + Cursor++ * sizeof(Record), &Record, sizeof(Record));
         }
     }
@@ -168,7 +168,9 @@ std::vector<DecodedVmFunction> DecodeVmImage(std::span<const std::uint8_t> Data,
     std::size_t Cursor = 0;
     for (std::size_t F = 0; F < Header.FunctionCount; ++F) {
         const auto Entry = Read<Vmp3Entry>(Body, sizeof(Header) + F * sizeof(Vmp3Entry));
-        if (Entry.Reserved != 0 || Entry.InstructionCount == 0 || Entry.InstructionOffset != Cursor ||
+        if ((Entry.ResumeRva && (Entry.ResumeRva<Entry.FunctionRva || Entry.ResumeRva-Entry.FunctionRva<5 ||
+                                Entry.ResumeRva-Entry.FunctionRva>128 || Entry.ResumeRva>=0x80000000U)) ||
+            Entry.InstructionCount == 0 || Entry.InstructionOffset != Cursor ||
             Entry.InstructionCount > TotalInstructions - Cursor || !Seen.insert(Entry.FunctionRva).second) {
             throw std::runtime_error("VM image entry table invalid");
         }
@@ -183,15 +185,16 @@ std::vector<DecodedVmFunction> DecodeVmImage(std::span<const std::uint8_t> Data,
         const auto Entry = Read<Vmp3Entry>(Body, sizeof(Header) + F * sizeof(Vmp3Entry));
         DecodedVmFunction Function{};
         Function.Program.EntryAddress = Entry.FunctionRva;
+        Function.Program.ResumeAddress = Entry.ResumeRva;
         Function.Seed = FunctionSeed(Keys, Entry.FunctionRva);
         Function.Program.Instructions.reserve(Entry.InstructionCount);
         for (std::size_t I = 0; I < Entry.InstructionCount; ++I) {
             const auto Record = Read<Vmp3Instruction>(Table.Data, (Entry.InstructionOffset + I) * sizeof(Vmp3Instruction));
-            if (Record.Reserved != 0 || Record.Op >= static_cast<std::uint8_t>(vmprotect::LiftedOp::Count)) {
+            if (!vmprotect::ValidOperandWidth(Record.Width) || Record.Op >= static_cast<std::uint8_t>(vmprotect::LiftedOp::Count)) {
                 throw std::runtime_error("VM image instruction invalid");
             }
             Function.Program.Instructions.push_back({static_cast<vmprotect::LiftedOp>(Record.Op),
-                Record.Dst, Record.Src, Record.Immediate, Record.Address, Record.Target});
+                Record.Dst, Record.Src, Record.Immediate, Record.Address, Record.Target, Record.Width});
         }
         Functions.push_back(std::move(Function));
     }

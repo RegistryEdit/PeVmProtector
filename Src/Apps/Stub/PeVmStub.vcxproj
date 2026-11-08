@@ -20,6 +20,8 @@
     <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  <ItemGroup><MASM Include="VmEntry.asm" /></ItemGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <PreprocessorDefinitions>PEVM_NO_CLI_MAIN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -34,6 +36,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Stub.cpp" />
+    <ClCompile Include="LicenseCache.cpp" />
+    <ClCompile Include="LicenseDialog.cpp" />
+    <ClCompile Include="LicenseRuntime.cpp" />
+    <ClInclude Include="LicenseRuntime.h" />
+    <ClInclude Include="LicenseDialog.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
 </Project>

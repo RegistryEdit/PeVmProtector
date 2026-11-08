@@ -593,13 +593,14 @@ private:
         ScanBtn->setText(T({"Scan functions", "\u626b\u63cf\u51fd\u6570"}));
         ProtectAllBtn->setText(T({"Protect ALL (VMP-style)", "\u5168\u91cf\u865a\u62df\u5316\uff08VMP \u98ce\u683c\uff09"}));
         FunctionDesc->setText(T({
-            "Memory operands map to flat VM-memory offsets (not native pointers).\n"
-            "Analyze and multi-function produce JSON manifests; virtualize builds a\n"
-            "protected EXE with a .vmp3 section and one trampoline per function.\n"
-            "Unsupported instructions fail closed with a clear error.",
-            "\u5185\u5b58\u64cd\u4f5c\u6570\u6309 VM \u5e73\u5766\u5185\u5b58\u504f\u79fb\u7ffb\u8bd1\uff08\u975e native \u6307\u9488\uff09\u3002\n"
-            "\u5206\u6790\u4e0e\u591a\u51fd\u6570\u751f\u6210 JSON \u6e05\u5355\uff1b\u865a\u62df\u5316\u751f\u6210\u5e26 .vmp3 \u8282\u7684\u53d7\u4fdd\u62a4 EXE\uff0c\n"
-            "\u6bcf\u4e2a\u51fd\u6570\u4e00\u4e2a trampoline\u3002\u4e0d\u652f\u6301\u7684\u6307\u4ee4\u4f1a\u660e\u786e\u62a5\u9519\u800c\u975e\u9519\u8bef\u7ffb\u8bd1\u3002"}));
+            "Supports native pointers, stack operands, native calls and common SSE/SSE2.\n"
+            "Eligible EH/SEH functions retain their native exception frame and virtualize\n"
+            "a register-only fragment. Logs distinguish fragments from full functions.\n"
+            "AVX and unsupported instructions are reported. Select hot UI functions carefully.",
+            "支持原生指针、栈操作数、原生调用和常用 SSE/SSE2 指令。\n"
+            "部分 EH/SEH 函数保留原生异常框架，对寄存器计算片段进行虚拟化；\n"
+            "日志分别统计完整函数和局部片段，AVX 等未支持指令会报告原因。\n"
+            "高频界面函数的虚拟化仍有开销，请按性能需求选择保护范围。"}));
 
         VmInputLabel->setText(T({"VM input", "VM \u8f93\u5165"}));
         DemoSeedLabel->setText(T({"Seed", "\u79cd\u5b50"}));
@@ -780,8 +781,10 @@ private:
         OptionsRow->addWidget(FunctionTrace);
         Layout->addLayout(OptionsRow);
         const auto AllOptions = new QFormLayout;
-        AllowMemoryCheck = Named(new CheckBox, "AllowMemory", {"Protect ALL: allow VM memory operands", "全量虚拟化：允许 VM 内存操作数"});
-        AllowMemoryCheck->setToolTip(T({"VM offsets, not native pointers; applies to Protect ALL only.", "操作数按 VM 偏移处理；仅适用于全量虚拟化。"}));
+        AllowMemoryCheck = Named(new CheckBox, "AllowMemory", {"Native memory (always enabled)", "原生内存（默认启用）"});
+        AllowMemoryCheck->setToolTip(T({"Native pointer semantics are enabled automatically for protected functions.", "保护后的函数自动使用原生指针语义。"}));
+        AllowMemoryCheck->setChecked(true);
+        AllowMemoryCheck->setEnabled(false);
         ProtectMinimum = new SpinBox;
         ProtectMinimum->setObjectName("ProtectMinimumBytes");
         ProtectMinimum->setRange(0, INT_MAX);

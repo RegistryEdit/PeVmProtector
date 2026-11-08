@@ -59,14 +59,14 @@ struct Vmp3Entry {
     std::uint32_t FunctionRva;
     std::uint32_t InstructionOffset;
     std::uint32_t InstructionCount;
-    std::uint32_t Reserved;
+    std::uint32_t ResumeRva;
 };
 
 struct Vmp3Instruction {
     std::uint8_t Op;
     std::uint8_t Dst;
     std::uint8_t Src;
-    std::uint8_t Reserved;
+    std::uint8_t Width;
     std::uint64_t Immediate;
     std::uint32_t Address;
     std::uint32_t Target;

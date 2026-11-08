@@ -20,6 +20,8 @@
     <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  <ItemGroup><MASM Include="..\Vm\VmNativeCall.asm" /></ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\Pe\PeImage.cpp" />
     <ClCompile Include="..\Pe\PeLayout.cpp" />
@@ -32,11 +34,13 @@
     <ClCompile Include="..\Lifter\X64Lifter.cpp" />
     <ClCompile Include="..\Lifter\FunctionScanner.cpp" />
     <ClCompile Include="..\Vm\VmProtect.cpp" />
+    <ClCompile Include="..\Vm\VmSimd.cpp"><FloatingPointModel>Strict</FloatingPointModel></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\Pe\PeImage.h" />
     <ClInclude Include="..\Pe\PeLayout.h" />
     <ClInclude Include="..\Pe\PeRelocations.h" />
+    <ClInclude Include="..\Pe\PeTls.h" />
     <ClInclude Include="..\Pe\WindowsResources.h" />
     <ClInclude Include="..\Pe\FileIo.h" />
     <ClInclude Include="..\Container\PeVmContainer.h" />
@@ -50,4 +54,5 @@
     <ClInclude Include="..\Vm\VmProtect.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
 </Project>

@@ -17,6 +17,7 @@ struct LiftResult {
     vmprotect::LiftedProgram Program;
     std::string Json;
     std::size_t BasicBlockCount{};
+    std::size_t NativeBytes{};
 };
 
 struct MultiLiftResult {

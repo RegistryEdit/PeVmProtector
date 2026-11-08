@@ -38,7 +38,7 @@
 3. 设置有效天数（默认 30，0 为永久）。卡密文件路径留空则仅显示文本供复制；填写新路径会同时保存文件。点击“签发卡密”后，下方显示卡密正文、ID、产品和 UTC 到期时间。
 4. 验证时选择已有卡密文件、公钥和对应产品 ID，点击“验证卡密文件”；机器码留空会验证本机。
 5. 点击“用于程序保护”，将公钥、产品 ID 和卡密开关带入“保护选项”，再回到“容器与封装”或“函数虚拟化”选择输入、输出和构建口令。
-6. 将卡密文件分发为 `<受保护EXE完整文件名>.license`，与 EXE 放在同一目录。GUI 的签发操作不会自动安装客户卡密。
+6. 将卡密文本交给客户；客户首次启动受保护 EXE 时在原生弹窗中粘贴，验证成功后自动记住。也可将卡密文件分发为 `<受保护EXE完整文件名>.license`，放在 EXE 同目录。GUI 的签发操作不会自动安装客户卡密。
 
 界面与 CLI 使用同一套签发和验签实现。已有密钥/卡密文件不会被覆盖。签发私钥不传给保护命令；卡密正文显示在专用结果框，可复制，不混入公共运行日志。
 
@@ -84,12 +84,17 @@ $Machine = '替换为客户的64位十六进制机器码'
 
 ```powershell
 & $Pevm wrap app.exe app.protected.exe 'build password' --license --license-public-key=.\license-keys\issuer.pub --license-product=my-product
+# 客户启动时可在弹窗中输入卡密；以下旁挂安装方式可选。
 Copy-Item .\customer.license .\app.protected.exe.license
 ```
 
 `protect-function`、`protect-functions` 和 `protect-all` 接受相同的三个卡密参数。启用卡密时，公钥和产品 ID 缺一即报错。GUI 的“保护选项”页提供共享卡密开关、公钥文件选择器和产品 ID 输入框，也可从“卡密签发与验证”页带入，对封装及函数虚拟化生效；打包/解包不使用卡密设置。
 
-运行时先读取 `PEVM_LICENSE` 环境变量。仅当变量**不存在**时，才读取 EXE 同目录的 `<完整EXE文件名>.license`。空值、无效值、超长值或非 ASCII 环境值不会回退到旁挂文件。卡密/密钥文本读取上限为 4096 字节，允许首尾空白，拒绝内部空白、额外前后缀和非规范 Base64。
+受保护 EXE 启动时按顺序验证 `PEVM_LICENSE`、同目录的 `<完整EXE文件名>.license`、当前 Windows 用户的 DPAPI 卡密缓存。每个来源都独立验签和检查产品、机器码、签发时间及到期时间；较高优先级来源无效时继续尝试下一个来源。全部不可用时显示 Windows 原生卡密弹窗，提供本机机器码、粘贴输入、显示/隐藏输入、验证重试和取消。取消会退出，不执行载荷。
+
+弹窗中成功验证的卡密会按公钥、产品和 EXE 完整路径区分，并用当前用户 DPAPI 加密后保存在 `%LOCALAPPDATA%\PeVmProtector\LicenseCache`。后续启动仍会重新验签并检查有效期；卡密过期或缓存损坏时会再次显示弹窗。卡密不会在缓存文件中以明文存储；复制到其他用户、产品、签发公钥或 EXE 路径的缓存均不可用。无法写缓存时本次启动仍会继续，并提示用户下次可能需要重新输入。
+
+如部署环境需要免弹窗，也可设置 `PEVM_LICENSE` 或旁挂文件。卡密文本读取上限为 4096 字节，允许首尾 ASCII 空白，拒绝内部空白、额外前后缀和非规范 Base64。`PEVM_TEST_NO_DIALOG=1` 只供自动化测试关闭 UI 提示，不会跳过任何许可证验证。
 
 在客户机器上，也可临时通过环境变量运行：
 
@@ -98,6 +103,10 @@ $env:PEVM_LICENSE = (Get-Content .\customer.license -Raw).Trim()
 .\app.protected.exe
 Remove-Item Env:PEVM_LICENSE
 ```
+
+弹窗不依赖 Qt/QFluent DLL。语言随 Windows 界面语言选择中文或英文，输入默认隐藏，可切换显示；机器码框支持选中复制。缓存只在弹窗验证成功后保存，环境变量和旁挂来源不会自动写入缓存。移动或重命名 EXE、切换 Windows 用户或更换产品/公钥后需要重新输入。要清除记住的卡密，可删除当前用户 `LicenseCache` 目录中的缓存文件（会清除该目录下各受保护程序的记忆），并移除相应环境变量/旁挂卡密；原始签发文件不受影响。
+
+**应用此更新必须重新构建受保护 EXE**：已有 EXE 内嵌旧加载器，仅替换保护工具不会更新它们。本次弹窗与缓存更新不改变签名协议，已经有效的 `PEVM-LICENSE` 卡密在产品、公钥、机器和有效期不变时可以继续使用，无需重新签发。
 
 ## 旧卡迁移顺序
 
@@ -133,7 +142,8 @@ Remove-Item Env:PEVM_LICENSE
 ```powershell
 & 'D:/Visual Studio/MSBuild/Current/Bin/MSBuild.exe' PeVmProtector.slnx /p:Configuration=Release /p:Platform=x64 /p:TrackFileAccess=false /m /v:minimal /nologo
 .\bin\Release\LicenseRegression.exe .\bin\Release\TestArtifacts
+.\bin\Release\LicenseRuntime.exe .\bin\Release\TestArtifacts
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Tests\RunTests.ps1 -Configuration Release
 ```
 
-测试需能访问当前 Windows 用户 DPAPI。回归覆盖签发与重新加载、逐位篡改、到期/时钟边界、错误产品/设备/公钥、旧格式拒绝、文件覆盖保护、输入长度与编码、环境变量优先级，以及真实 wrapper 启动与 VM bridge 执行。每次测试使用独立目录和新生成的测试密钥。
+测试需能访问当前 Windows 用户 DPAPI 和交互桌面。回归覆盖签发与重新加载、逐位篡改、到期/时钟边界、错误产品/设备/公钥、旧格式拒绝、文件覆盖保护、输入长度与编码、各来源回退，以及真实 wrapper 启动与 VM bridge 执行。`LicenseRuntime.exe` 直接操作原生窗口验证中英文、输入重试、取消及 DPAPI 缓存，保存 `dialog-en.bmp` 和 `dialog-zh.bmp` 到独立测试目录；真实 wrapper 回归还覆盖首次激活、再次免输入、损坏缓存恢复和缓存写入失败。自动输入只在测试程序中实现，生产加载器没有自动填卡接口。每次测试使用独立目录和新生成的测试密钥。

@@ -15,7 +15,7 @@ struct DecodedVmFunction {
 };
 
 // Internal wire revision only; the public feature name remains VM protection.
-inline constexpr std::uint32_t KVmImageVersion = 4;
+inline constexpr std::uint32_t KVmImageVersion = 6;
 inline constexpr std::size_t KVmImageTagSize = 32;
 
 crypto::Bytes EncodeVmImage(std::span<const vmprotect::LiftedProgram> Programs,

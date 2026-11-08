@@ -1,4 +1,5 @@
 #include "VmProtect.h"
+#include "VmSimd.h"
 
 #include <algorithm>
 #include <array>
@@ -15,8 +16,12 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <intrin.h>
+#include <windows.h>
+#include "WindowsResources.h"
 
 namespace vmprotect {
+extern "C" void PeVmCallNative(VmBridgeContext* Context);
 namespace {
 
 using Bytes = std::vector<std::uint8_t>;
@@ -27,7 +32,7 @@ enum class Op : std::uint8_t {
     Cmp, Jmp, Jz, Jnz,
     Ja, Jae, Jb, Jbe, Js, Jns, Jl, Jge, Jle, Jg, Jo, Jno, Jp, Jnp,
     Push, Pop, Call, Ret, Load64, Load64D, Store64, Store64D, Nop, Halt,
-    Trap, Count
+    Trap, Sized, Count
 };
 
 constexpr std::size_t KOpCount = static_cast<std::size_t>(Op::Count);
@@ -130,7 +135,7 @@ const char* Name(Op Operation) {
         "SHLI","SHRI","SHLR","SHRR","SARI","SARR","ROLI","RORI","ROLR","RORR",
         "CMP","JMP","JZ","JNZ",
         "JA","JAE","JB","JBE","JS","JNS","JL","JGE","JLE","JG","JO","JNO","JP","JNP",
-        "PUSH","POP","CALL","RET","LOAD64","LOAD64D","STORE64","STORE64D","NOP","HALT","TRAP"
+        "PUSH","POP","CALL","RET","LOAD64","LOAD64D","STORE64","STORE64D","NOP","HALT","TRAP","SIZED"
     };
     return Names[static_cast<std::size_t>(Operation)];
 }
@@ -166,6 +171,12 @@ public:
     }
     void R(Op Operation, std::uint8_t Value) { Opcode(Operation); Reg(Value); }
     void None(Op Operation) { Opcode(Operation); }
+    void Sized(const LiftedInstruction& I) {
+        Opcode(Op::Sized);
+        Code.push_back(static_cast<std::uint8_t>(I.Op));
+        Code.push_back(I.Width);
+        Reg(I.Dst); Reg(I.Src); AppendU64(Code, I.Immediate);
+    }
 
     void Junk() {
         const auto Count = static_cast<unsigned>((NextRandom(RandomState) % 3) + 1);
@@ -211,7 +222,7 @@ private:
     void Reg(std::uint8_t Value) {
         if (Value < Registers.size()) Code.push_back(Registers[Value]);
         else if (Value < KRegisterCount) Code.push_back(Value);
-        else throw std::runtime_error("assembler invalid register");
+        else throw std::runtime_error("VM assembler invalid register");
     }
 };
 
@@ -253,9 +264,23 @@ struct Program {
     std::uint64_t Tag{};
 };
 
+// The cached execution image contains encrypted operands, maps and boundaries
+// in one read-only allocation. Validate once before publication; instruction
+// authentication and branch CFI still run on every executed instruction.
+struct FrozenProgram {
+    OpMap Map{};
+    RegisterMap Registers{};
+    std::array<std::uint8_t, KVariantSlots> HandlerVariants{};
+    std::span<const std::uint8_t> EncryptedCode;
+    std::span<const std::uint32_t> InstructionOffsets;
+    std::span<const std::uint64_t> InstructionTags;
+    std::uint64_t Key{}, Tag{};
+    std::array<Op, 256> Decoder{};
+};
+
 // Runtime checksums are inexpensive corruption checks; the serialized image
 // uses HMAC-SHA256. Include the dispatch metadata as well as the code bytes.
-std::uint64_t IntegrityTag(const Program& Program) {
+template<class P> std::uint64_t IntegrityTag(const P& Program) {
     std::uint64_t Hash = 0xCBF29CE484222325ULL ^ Program.Key;
     auto Byte = [&](std::uint8_t Value) { Hash = (Hash ^ Value) * 0x100000001B3ULL; };
     auto Word = [&](std::uint64_t Value) {
@@ -273,7 +298,7 @@ std::uint64_t IntegrityTag(const Program& Program) {
     return Mix64(Hash);
 }
 
-void ValidateProgramLayout(const Program& Program) {
+template<class P> void ValidateProgramLayout(const P& Program) {
     if (Program.EncryptedCode.empty() || Program.EncryptedCode.size() > UINT32_MAX ||
         Program.InstructionOffsets.empty() || Program.InstructionOffsets.front() != 0 ||
         Program.InstructionOffsets.size() != Program.InstructionTags.size()) {
@@ -304,6 +329,7 @@ void ValidateProgramLayout(const Program& Program) {
 
 std::size_t EncodedInstructionSize(Op Operation) {
     switch (Operation) {
+    case Op::Sized: return 13;
     case Op::MovI: case Op::AddI: case Op::SubI: case Op::MulI: case Op::AndI:
     case Op::ShlI: case Op::ShrI: case Op::SarI: case Op::RolI: case Op::RorI:
         return 10;
@@ -579,24 +605,50 @@ public:
         return Logical[0];
     }
 
-    void RunRegisters(const Program& Program, std::array<std::uint64_t, 16>& Logical, bool Trace,
+    template<class P> void RunRegisters(const P& Program, std::array<std::uint64_t, 16>& Logical, bool Trace,
                       const RunConfig& Config = {}) {
         ValidateConfig(Config);
-        ValidateProgramLayout(Program);
-        if (Program.Tag != IntegrityTag(Program)) {
-            throw std::runtime_error("VM2 integrity violation");
+        if constexpr (!std::is_same_v<P, FrozenProgram>) {
+            ValidateProgramLayout(Program);
+            if (Program.Tag != IntegrityTag(Program)) {
+                throw std::runtime_error("VM2 integrity violation");
+            }
         }
         const auto& Code = Program.EncryptedCode;
         Regs.fill(0);
-        Memory.assign(Config.MemoryBytes, 0);
+        Mapping = Program.Registers;
+        Memory.assign(Config.NativeMemory ? 0 : Config.MemoryBytes, 0);
         Stack.clear();
         Calls.clear();
         for (std::size_t I = 0; I < Logical.size(); ++I) Regs[Program.Registers[I]] = Logical[I];
         Flags = {};
+        if (Config.NativeContext) ReadNativeFlags(Config.NativeContext->Rflags);
+        auto Finish = [&] {
+            for (std::size_t I = 0; I < Logical.size(); ++I) Logical[I] = Regs[Program.Registers[I]];
+            if (Config.NativeContext) Config.NativeContext->Rflags = NativeFlags(Config.NativeContext->Rflags);
+        };
+        auto Push = [&](std::uint64_t Value) {
+            if (!Config.NativeMemory) { Stack.push_back(Value); return; }
+            auto& Sp = Regs[Program.Registers[4]];
+            if (Sp < Config.StackLower + 8 || Sp > Config.StackUpper) throw std::runtime_error("VM native stack overflow");
+            Sp -= 8; std::memcpy(reinterpret_cast<void*>(Sp), &Value, 8);
+        };
+        auto Pop = [&]() -> std::uint64_t {
+            if (!Config.NativeMemory) {
+                if (Stack.empty()) throw std::runtime_error("VM2 stack underflow");
+                const auto Value = Stack.back(); Stack.pop_back(); return Value;
+            }
+            auto& Sp = Regs[Program.Registers[4]];
+            if (Sp < Config.StackLower || Sp > Config.StackUpper - 8) throw std::runtime_error("VM native stack underflow");
+            std::uint64_t Value; std::memcpy(&Value, reinterpret_cast<void*>(Sp), 8); Sp += 8; return Value;
+        };
         std::size_t Pc = 0;
         std::size_t Fuel = Config.Fuel;
 
+        std::size_t SequentialIndex = 0;
         auto FindInstruction = [&](std::uint32_t Address) {
+            if (SequentialIndex < Program.InstructionOffsets.size() &&
+                Program.InstructionOffsets[SequentialIndex] == Address) return SequentialIndex;
             const auto It = std::lower_bound(Program.InstructionOffsets.begin(),
                                              Program.InstructionOffsets.end(), Address);
             if (It == Program.InstructionOffsets.end() || *It != Address) {
@@ -690,8 +742,11 @@ public:
         };
 
         while (Fuel-- != 0) {
+            if (Config.StackLower && (Regs[Program.Registers[4]] < Config.StackLower ||
+                Regs[Program.Registers[4]] > Config.StackUpper)) throw std::runtime_error("VM native stack range exceeded");
             const auto At = Pc;
             const auto InstructionIndex = FindInstruction(static_cast<std::uint32_t>(At));
+            SequentialIndex = InstructionIndex + 1;
             const auto InstructionEnd = InstructionIndex + 1 < Program.InstructionOffsets.size()
                 ? Program.InstructionOffsets[InstructionIndex + 1]
                 : static_cast<std::uint32_t>(Code.size());
@@ -704,7 +759,10 @@ public:
             DecodeState = InstructionDecodeState(Program.Key, static_cast<std::uint32_t>(At), InstructionEnd);
             const auto InstructionVariant = static_cast<std::uint8_t>((DecodeState >> 32) & 3U);
             const auto Encoded = Byte();
-            const auto Op = Decode(Encoded, Program.Map);
+            const auto Op = [&] {
+                if constexpr (std::is_same_v<P, FrozenProgram>) return Program.Decoder[Encoded];
+                else return Decode(Encoded, Program.Map);
+            }();
             if (InstructionEnd - At != EncodedInstructionSize(Op)) {
                 throw std::runtime_error("VM instruction size mismatch");
             }
@@ -718,6 +776,14 @@ public:
                           << " sf=" << Flags.Sf << " of=" << Flags.Of << std::dec << "\n";
             }
             switch (Op) {
+            case Op::Sized: {
+                const auto Kind = static_cast<LiftedOp>(Byte());
+                const auto Width = Byte();
+                const auto D = Reg(), S = Reg();
+                const auto Imm = U64();
+                ExecuteSized(Kind, Width, D, S, Imm, Config);
+                break;
+            }
             case Op::MovI: { const auto D=Reg(); Regs[D]=U64(); break; }
             case Op::Mov: { const auto D=Reg(),S=Reg(); Regs[D]=Regs[S]; break; }
             case Op::Add: {
@@ -879,16 +945,17 @@ public:
                 const auto Operand=Pc;
                 const auto T=U32() ^ BranchMask(Program.Key, Operand);
                 if (TakeBranch(Op)) Target(T); break; }
-            case Op::Push: Stack.push_back(Regs[Reg()]); break;
-            case Op::Pop: { const auto D=Reg(); if(Stack.empty()) throw std::runtime_error("VM2 stack underflow"); Regs[D]=Stack.back(); Stack.pop_back(); break; }
-            case Op::Call: { const auto Operand=Pc; const auto T=U32() ^ BranchMask(Program.Key, Operand); Calls.push_back(Pc); Target(T); break; }
+            case Op::Push: Push(Regs[Reg()]); break;
+            case Op::Pop: { const auto D=Reg(); Regs[D]=Pop(); break; }
+            case Op::Call: { const auto Operand=Pc; const auto T=U32() ^ BranchMask(Program.Key, Operand); Calls.push_back(Pc); if (Config.NativeMemory) Push(Pc); Target(T); break; }
             case Op::Ret: {
                 // An empty VM2 call stack means the lifted function is
                 // returning to its native caller: behave exactly like Halt.
                 if (Calls.empty()) {
-                    for (std::size_t I = 0; I < Logical.size(); ++I) Logical[I] = Regs[Program.Registers[I]];
+                    Finish();
                     return;
                 }
+                if (Config.NativeMemory) (void)Pop();
                 Target(static_cast<std::uint32_t>(Calls.back())); Calls.pop_back(); break; }
             case Op::Load64: {
                 const auto D=Reg(); const auto Off=Reg();
@@ -911,7 +978,7 @@ public:
             case Op::Nop: break;
             case Op::Trap: throw std::runtime_error("VM control flow falls past the lifted program");
             case Op::Halt:
-                for (std::size_t I = 0; I < Logical.size(); ++I) Logical[I] = Regs[Program.Registers[I]];
+                Finish();
                 return;
             case Op::Count: throw std::runtime_error("VM2 invalid sentinel opcode");
             }
@@ -920,6 +987,152 @@ public:
     }
 
 private:
+    void ReadNativeFlags(std::uint64_t F) {
+        Flags.Cf = F & 1; Flags.Pf = F & 4; Flags.Zf = F & 64; Flags.Sf = F & 128; Flags.Of = F & 2048;
+    }
+    std::uint64_t NativeFlags(std::uint64_t F) const {
+        return (F & ~0x8c5ULL) | Flags.Cf | (std::uint64_t{Flags.Pf} << 2) |
+               (std::uint64_t{Flags.Zf} << 6) | (std::uint64_t{Flags.Sf} << 7) | (std::uint64_t{Flags.Of} << 11);
+    }
+    void ExecuteSized(LiftedOp Op, std::uint8_t Width, std::uint8_t D,
+                      std::uint8_t S, std::uint64_t Imm, const RunConfig& Config) {
+        using O = LiftedOp;
+        if (!ValidOperandWidth(Width)) throw std::runtime_error("VM invalid operand width");
+        const unsigned Bits = Width & 0x7f;
+        const auto Mask = Bits == 64 ? UINT64_MAX : (1ULL << Bits) - 1;
+        const auto Sign = 1ULL << (Bits - 1);
+        const auto Before = Flags;
+        const auto A = Regs[D] & Mask, B = Regs[S] & Mask;
+        auto R = A;
+        bool Write = true;
+        auto Zsp = [&] {
+            R &= Mask;
+            Flags.Zf = R == 0; Flags.Sf = (R & Sign) != 0; Flags.Pf = EvenParity(R);
+        };
+        auto Add = [&](std::uint64_t X, std::uint64_t Y, bool Carry) {
+            const auto Sum = (X + Y) & Mask;
+            R = (Sum + static_cast<unsigned>(Carry)) & Mask;
+            Flags.Cf = Sum < X || (Carry && R == 0);
+            Flags.Of = (~(X ^ Y) & (X ^ R) & Sign) != 0;
+            Zsp();
+        };
+        auto Sub = [&](std::uint64_t X, std::uint64_t Y, bool Borrow) {
+            R = (X - Y - static_cast<unsigned>(Borrow)) & Mask;
+            Flags.Cf = X < Y || (Borrow && X == Y);
+            Flags.Of = ((X ^ Y) & (X ^ R) & Sign) != 0;
+            Zsp();
+        };
+        auto Signed = [](std::uint64_t Value, unsigned Size) {
+            if (Size == 64) return static_cast<std::int64_t>(Value);
+            const auto Top = 1ULL << (Size - 1);
+            return static_cast<std::int64_t>(((Value & ((1ULL << Size) - 1)) ^ Top) - Top);
+        };
+        switch (Op) {
+        case O::Simd: {
+            if (!Config.NativeContext) throw std::runtime_error("VM SIMD context missing");
+            auto& C=*Config.NativeContext;
+            C.Rflags=NativeFlags(C.Rflags);
+            ExecuteSimd(Imm,Bits,Regs[D],Regs[S],C,Memory,Config.NativeMemory);
+            ReadNativeFlags(C.Rflags);
+            return;
+        }
+        case O::NativeCall: {
+            if (!Config.NativeMemory || !Config.NativeContext) throw std::runtime_error("VM native call requires an in-process bridge");
+            auto& Context = *Config.NativeContext;
+            for (std::size_t I = 0; I < 16; ++I) Context.Registers[I] = Regs[Mapping[I]];
+            Context.Rflags = NativeFlags(Context.Rflags);
+            Context.Mxcsr = _mm_getcsr();
+            Context.CallTarget = Regs[D];
+            Context.NativeArguments = Context.Registers[4] + (Imm ? 8 : 0);
+            if (Context.NativeArguments < Config.StackLower || Context.NativeArguments > Config.StackUpper - 512)
+                throw std::runtime_error("VM native call stack arguments exceed bridge range");
+            PeVmCallNative(&Context);
+            _mm_setcsr(Context.Mxcsr);
+            for (std::size_t I = 0; I < 16; ++I) Regs[Mapping[I]] = Context.Registers[I];
+            ReadNativeFlags(Context.Rflags);
+            return;
+        }
+        case O::MovI: R = Imm; break;
+        case O::Mov: R = B; break;
+        case O::ImageAddress: R = Config.ImageBase + Imm; break;
+        case O::ZeroExtend: case O::SignExtend:
+            if (Imm != 8 && Imm != 16 && Imm != 32) throw std::runtime_error("VM invalid extension width");
+            R = Op == O::SignExtend ? static_cast<std::uint64_t>(Signed(Regs[S], static_cast<unsigned>(Imm)))
+                                  : Regs[S] & ((1ULL << Imm) - 1);
+            break;
+        case O::Add: Add(A, B, false); break;
+        case O::AddI: Add(A, Imm & Mask, false); break;
+        case O::Adc: Add(A, B, Before.Cf); break;
+        case O::Sub: Sub(A, B, false); break;
+        case O::SubI: Sub(A, Imm & Mask, false); break;
+        case O::Sbb: Sub(A, B, Before.Cf); break;
+        case O::Cmp: Sub(A, B, false); Write = false; break;
+        case O::Inc: Add(A, 1, false); Flags.Cf = Before.Cf; break;
+        case O::Dec: Sub(A, 1, false); Flags.Cf = Before.Cf; break;
+        case O::Neg: Sub(0, A, false); break;
+        case O::Not: R = ~A; break;
+        case O::And: case O::AndI: case O::Or: case O::Xor: case O::Test:
+            R = Op == O::Or ? A | B : Op == O::Xor ? A ^ B : A & (Op == O::AndI ? Imm : B);
+            Flags.Cf = false; Flags.Of = false; Zsp();
+            Write = Op != O::Test; break;
+        case O::Mul: case O::MulI: {
+            const auto X = Signed(A, Bits), Y = Signed(Op == O::MulI ? Imm : B, Bits);
+            std::int64_t High;
+            const auto Low = static_cast<std::uint64_t>(_mul128(X, Y, &High));
+            R = Low & Mask;
+            const auto Extended = Signed(R, Bits);
+            Flags.Cf = Flags.Of = Low != static_cast<std::uint64_t>(Extended) || High != (Extended < 0 ? -1 : 0);
+            break;
+        }
+        case O::Bswap:
+            if (Bits != 32 && Bits != 64) throw std::runtime_error("VM invalid BSWAP width");
+            R = 0;
+            for (unsigned I = 0; I < Bits / 8; ++I) R = (R << 8) | ((A >> (I * 8)) & 255);
+            break;
+        case O::ShlI: case O::ShlR: case O::ShrI: case O::ShrR:
+        case O::SarI: case O::SarR: case O::RolI: case O::RolR: case O::RorI: case O::RorR: {
+            const bool RegisterCount = Op == O::ShlR || Op == O::ShrR || Op == O::SarR || Op == O::RolR || Op == O::RorR;
+            const auto Count = static_cast<unsigned>((RegisterCount ? Regs[S] : Imm) & (Bits == 64 ? 63 : 31));
+            if (Count == 0) break;
+            const bool Left = Op == O::ShlI || Op == O::ShlR || Op == O::RolI || Op == O::RolR;
+            const bool Rotate = Op == O::RolI || Op == O::RolR || Op == O::RorI || Op == O::RorR;
+            const bool Arithmetic = Op == O::SarI || Op == O::SarR;
+            if (Rotate) {
+                const auto N = Count % Bits;
+                R = N == 0 ? A : Left ? ((A << N) | (A >> (Bits - N))) & Mask
+                                                    : ((A >> N) | (A << (Bits - N))) & Mask;
+                Flags.Cf = Left ? (R & 1) != 0 : (R & Sign) != 0;
+                if (Count == 1) Flags.Of = Left ? ((R & Sign) != 0) != Flags.Cf
+                                              : ((R >> (Bits - 1)) ^ (R >> (Bits - 2))) & 1;
+            } else {
+                R = Arithmetic ? static_cast<std::uint64_t>(Signed(A, Bits) >> Count) & Mask
+                  : Count >= Bits ? 0 : Left ? (A << Count) & Mask : A >> Count;
+                if (Count <= Bits) Flags.Cf = ((A >> (Left ? Bits - Count : Count - 1)) & 1) != 0;
+                else Flags.Cf = Arithmetic && (A & Sign) != 0;
+                if (Count == 1) Flags.Of = Arithmetic ? false : Left ? ((R & Sign) != 0) != Flags.Cf : (A & Sign) != 0;
+                Zsp();
+            }
+            break;
+        }
+        case O::LoadMem: case O::StoreMem: {
+            const auto Address = (Op == O::LoadMem ? Regs[S] : Regs[D]) + Imm;
+            const auto Bytes = Bits / 8;
+            std::uint8_t* Pointer;
+            if (Config.NativeMemory) Pointer = reinterpret_cast<std::uint8_t*>(Address);
+            else {
+                if (Memory.size() < Bytes || Address > Memory.size() - Bytes) throw std::runtime_error("VM2 memory OOB");
+                Pointer = Memory.data() + Address;
+            }
+            if (Op == O::LoadMem) { R = 0; std::memcpy(&R, Pointer, Bytes); }
+            else { std::memcpy(Pointer, &Regs[S], Bytes); Write = false; }
+            break;
+        }
+        default: throw std::runtime_error("VM invalid sized opcode");
+        }
+        if (Write) Regs[D] = Bits >= 32 ? R & Mask : (Regs[D] & ~Mask) | (R & Mask);
+        if (Width & KPreserveFlags) Flags = Before;
+    }
+
     static void ValidateConfig(const RunConfig& Config) {
         if (Config.MemoryBytes < 8) throw std::runtime_error("VM2 memory too small");
         if (Config.MemoryBytes > (std::size_t{1} << 26)) throw std::runtime_error("VM2 memory configuration too large");
@@ -927,6 +1140,7 @@ private:
     }
 
     std::array<std::uint64_t, KRegisterCount> Regs{};
+    RegisterMap Mapping{};
     std::vector<std::uint8_t> Memory;
     std::vector<std::uint64_t> Stack;
     std::vector<std::size_t> Calls;
@@ -1059,13 +1273,47 @@ Program CompileSpinDemo(std::uint64_t Seed) {
 } // namespace
 
 struct CompiledProgram::Storage {
-    Program Bytecode;
     CompilationStats Stats;
+    pevm::platform::VirtualAllocation Memory;
+    const FrozenProgram* Bytecode{};
+
+    Storage(const Program& Source, CompilationStats Metrics) : Stats(Metrics) {
+        ValidateProgramLayout(Source);
+        if (Source.Tag != IntegrityTag(Source)) throw std::runtime_error("VM2 integrity violation");
+        const auto Align = [](std::size_t N) { return (N + 7) & ~std::size_t{7}; };
+        const auto CodeOffset = Align(sizeof(FrozenProgram));
+        const auto OffsetsOffset = Align(CodeOffset + Source.EncryptedCode.size());
+        const auto TagsOffset = Align(OffsetsOffset + Source.InstructionOffsets.size() * 4);
+        const auto Bytes = TagsOffset + Source.InstructionTags.size() * 8;
+        auto* Base = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, Bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!Base) throw std::runtime_error("VM immutable image allocation failed");
+        Memory.reset(Base);
+        auto* View = new (Base) FrozenProgram;
+        View->Map=Source.Map; View->Registers=Source.Registers; View->HandlerVariants=Source.HandlerVariants;
+        View->Key=Source.Key; View->Tag=Source.Tag;
+        std::memcpy(Base+CodeOffset,Source.EncryptedCode.data(),Source.EncryptedCode.size());
+        std::memcpy(Base+OffsetsOffset,Source.InstructionOffsets.data(),Source.InstructionOffsets.size()*4);
+        std::memcpy(Base+TagsOffset,Source.InstructionTags.data(),Source.InstructionTags.size()*8);
+        View->EncryptedCode={Base+CodeOffset,Source.EncryptedCode.size()};
+        View->InstructionOffsets={reinterpret_cast<const std::uint32_t*>(Base+OffsetsOffset),Source.InstructionOffsets.size()};
+        View->InstructionTags={reinterpret_cast<const std::uint64_t*>(Base+TagsOffset),Source.InstructionTags.size()};
+        View->Decoder.fill(Op::Count);
+        for (std::size_t I=0; I<Source.Map.size(); ++I) View->Decoder[Source.Map[I]]=static_cast<Op>(I);
+        DWORD Old;
+        if (!VirtualProtect(Base,Bytes,PAGE_READONLY,&Old)) throw std::runtime_error("VM immutable image protection failed");
+        Bytecode=View;
+    }
 };
 
 namespace {
 Program CompileLiftedBytecode(const LiftedProgram& Lifted, std::uint64_t Seed, CompilationStats& Stats) {
     if (Lifted.Instructions.empty()) throw std::runtime_error("VM bridge received an empty program");
+    if(Lifted.ResumeAddress) {
+        if(Lifted.ResumeAddress<Lifted.EntryAddress || Lifted.ResumeAddress-Lifted.EntryAddress<5 ||
+           Lifted.ResumeAddress-Lifted.EntryAddress>128 || Lifted.Instructions.back().Op!=LiftedOp::Ret ||
+           !std::all_of(Lifted.Instructions.begin(),Lifted.Instructions.end(),NativeFragmentInstruction))
+            throw std::runtime_error("VM invalid native EH fragment");
+    }
 
     Program Result;
     Result.Map = MakeMap(Seed ^ 0xB7E151628AED2A6BULL);
@@ -1162,6 +1410,16 @@ Program CompileLiftedBytecode(const LiftedProgram& Lifted, std::uint64_t Seed, C
         for (std::size_t I = Start; I < End; ++I) {
             const auto& Instruction = Lifted.Instructions[I];
             A.Label(Labels.at(Instruction.Address));
+            // Native address anchors bind to the following instruction; they
+            // need no runtime dispatch of their own.
+            if (Instruction.Op == LiftedOp::Nop) continue;
+            if (!ValidOperandWidth(Instruction.Width)) throw std::runtime_error("VM invalid operand width");
+            if (Instruction.Op <= LiftedOp::Cmp || Instruction.Op == LiftedOp::LoadMem ||
+                Instruction.Op == LiftedOp::StoreMem || Instruction.Op >= LiftedOp::ZeroExtend) {
+                A.Sized(Instruction);
+                continue;
+            }
+            if (Instruction.Width != 64) throw std::runtime_error("VM invalid control operand width");
             switch (Instruction.Op) {
             case LiftedOp::MovI: A.Ri(Op::MovI, Register(Instruction.Dst), Instruction.Immediate); break;
             case LiftedOp::Mov: A.Rr(Op::Mov, Register(Instruction.Dst), Register(Instruction.Src)); break;
@@ -1225,7 +1483,7 @@ CompiledProgram CompileLiftedProgram(const LiftedProgram& Lifted, std::uint64_t 
     CompilationStats Stats{};
     auto Result = CompileLiftedBytecode(Lifted, Seed, Stats);
     CompiledProgram Compiled;
-    Compiled.Data = std::make_shared<CompiledProgram::Storage>(std::move(Result), Stats);
+    Compiled.Data = std::make_shared<CompiledProgram::Storage>(Result, Stats);
     return Compiled;
 }
 
@@ -1238,7 +1496,15 @@ void InvokeCompiledProgram(const CompiledProgram& Compiled, VmBridgeContext& Con
                             bool Trace, const RunConfig& Config) {
     if (!Compiled.Data) throw std::runtime_error("VM bridge received an empty compiled program");
     Machine Vm;
-    Vm.RunRegisters(Compiled.Data->Bytecode, Context.Registers, Trace, Config);
+    auto Execution=Config;
+    if (!Execution.NativeContext) Execution.NativeContext=&Context;
+    struct MxcsrScope {
+        VmBridgeContext& Context;
+        unsigned Saved=_mm_getcsr();
+        explicit MxcsrScope(VmBridgeContext& C):Context(C) { _mm_setcsr(C.Mxcsr); }
+        ~MxcsrScope() { Context.Mxcsr=_mm_getcsr(); _mm_setcsr(Saved); }
+    } FloatingState(Context);
+    Vm.RunRegisters(*Compiled.Data->Bytecode, Context.Registers, Trace, Execution);
 }
 
 void InvokeLiftedProgram(const LiftedProgram& Lifted, VmBridgeContext& Context,

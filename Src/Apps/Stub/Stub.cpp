@@ -1,5 +1,6 @@
 #include "VmImageCodec.h"
 #include "PeRelocations.h"
+#include "PeTls.h"
 #include "WindowsResources.h"
 #include <windows.h>
 
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -18,11 +20,14 @@
 #include <tlhelp32.h>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <vector>
 
 #include "PeVmContainer.h"
 #include "PeVmCrypto.h"
 #include "PeVmLicense.h"
+#include "LicenseRuntime.h"
 #include "VmProtect.h"
 #include "WrapperFormat.h"
 
@@ -674,10 +679,10 @@ VmpMetadata ValidateProtectionMetadata(std::span<const std::uint8_t> Image, cons
 }
 
 struct VmProgram {
-    vmprotect::LiftedProgram Program;
     vmprotect::CompiledProgram Compiled;
-    std::uint64_t Seed{};
-    std::uint64_t Digest{};
+    std::uint32_t EntryAddress{};
+    std::uint32_t ResumeAddress{};
+    bool NeedsStack{};
 };
 
 // Digest over a lifted program so the bridge can detect runtime patching of
@@ -691,35 +696,93 @@ std::uint64_t ProgramDigest(const vmprotect::LiftedProgram& Program) {
             (static_cast<std::uint64_t>(Instruction.Dst) << 48) ^
             (static_cast<std::uint64_t>(Instruction.Src) << 40) ^ Instruction.Immediate);
         Add((static_cast<std::uint64_t>(Instruction.Address) << 32) ^ Instruction.Target);
+        Add(Instruction.Width);
     }
-    return Hash;
+    return WrapperMix64(Hash ^ Program.ResumeAddress);
 }
 
 std::vector<VmProgram> GVirtualizedPrograms;
-
-extern "C" std::uint64_t VirtualizedFunctionBridge(std::uint64_t Rcx, std::uint64_t Rdx,
-                                                    std::uint64_t R8, std::uint64_t R9,
-                                                    std::uint32_t Index) noexcept(false) {
-    if (HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_VM_BRIDGE_LOG").c_str()) != 0) {
-        static std::ofstream Log(SelfPath().wstring() + L".vmbridge-hit",
-                                 std::ios::binary | std::ios::trunc);
-        Log << "VM2 bridge invoked index=" << Index << "\n";
-        Log.flush();
+std::uint64_t GVmImageBase{};
+// Construct before BindTls replaces this image's TLS template. Function-local
+// static guards use the CRT thread epoch, which belongs to the payload after
+// that switch and can incorrectly skip a first-time initialization.
+struct VmBridgeTrace {
+    std::mutex Mutex;
+    std::vector<std::uint8_t> Seen;
+    std::ofstream Log;
+    bool Enabled{};
+} GVmBridgeTrace;
+struct VmStackPool {
+    std::vector<std::unique_ptr<std::uint8_t[]>> Frames;
+    std::size_t Depth{};
+};
+DWORD GVmStackSlot = FLS_OUT_OF_INDEXES;
+void NTAPI ReleaseVmStacks(void* Pointer) { delete static_cast<VmStackPool*>(Pointer); }
+struct VmStackLease {
+    static constexpr std::size_t Size = 64 * 1024 + 8192;
+    VmStackPool* Pool{};
+    std::uint8_t* Data{};
+    VmStackLease() {
+        Pool = static_cast<VmStackPool*>(FlsGetValue(GVmStackSlot));
+        if (!Pool) {
+            auto NewPool = std::make_unique<VmStackPool>();
+            if (!FlsSetValue(GVmStackSlot, NewPool.get())) throw std::runtime_error("VM stack slot unavailable");
+            Pool = NewPool.release();
+        }
+        if (Pool->Depth == Pool->Frames.size()) Pool->Frames.emplace_back(new std::uint8_t[Size]);
+        Data = Pool->Frames[Pool->Depth++].get();
     }
+    ~VmStackLease() { --Pool->Depth; }
+};
+extern "C" void PeVmNativeEntry();
+
+extern "C" void VirtualizedFunctionBridge(vmprotect::VmBridgeContext* State,
+                                           std::uint32_t Index) noexcept(false) {
     if (Index >= GVirtualizedPrograms.size()) {
         throw std::runtime_error(PEVM_TEXT("VM bridge function index invalid"));
     }
-    const auto& Virtualized = GVirtualizedPrograms[static_cast<std::size_t>(Index)];
-    if (ProgramDigest(Virtualized.Program) != Virtualized.Digest) {
-        IntegrityFailure();
+    if (GVmBridgeTrace.Enabled) {
+        const std::lock_guard Lock(GVmBridgeTrace.Mutex);
+        if (!GVmBridgeTrace.Seen[Index]) {
+            GVmBridgeTrace.Seen[Index] = 1;
+            GVmBridgeTrace.Log << "VM2 bridge invoked index=" << Index << "\n";
+            GVmBridgeTrace.Log.flush();
+        }
     }
-    vmprotect::VmBridgeContext Context{};
-    Context.Registers[1] = Rcx;
-    Context.Registers[2] = Rdx;
-    Context.Registers[8] = R8;
-    Context.Registers[9] = R9;
-    vmprotect::InvokeCompiledProgram(Virtualized.Compiled, Context, false);
-    return Context.Registers[0];
+    const auto& Virtualized = GVirtualizedPrograms[static_cast<std::size_t>(Index)];
+    auto& Context = *State;
+    const auto NativeSp = Context.Registers[4];
+    const auto* Tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const auto StackTop = reinterpret_cast<std::uint64_t>(Tib->StackBase);
+    const auto StackBottom = reinterpret_cast<std::uint64_t>(Tib->StackLimit);
+    if (NativeSp < StackBottom || NativeSp >= StackTop)
+        throw std::runtime_error("VM entry stack is outside thread stack");
+    if(Virtualized.ResumeAddress || !Virtualized.NeedsStack) {
+        // The thunk pushed a synthetic return address. The fragment sees the
+        // original native RSP and cannot modify it or touch stack memory.
+        Context.Registers[4]=NativeSp+(Virtualized.ResumeAddress?8:0);
+        vmprotect::RunConfig Config;
+        Config.NativeMemory=true; Config.NativeContext=&Context; Config.ImageBase=GVmImageBase;
+        vmprotect::InvokeCompiledProgram(Virtualized.Compiled,Context,false,Config);
+        Context.Registers[4]=NativeSp;
+        return;
+    }
+    // Locals and saved registers live on a separate VM stack, so interpreted
+    // prologues cannot overwrite the active C++ interpreter's own frames.
+    VmStackLease Stack;
+    const auto Lower = reinterpret_cast<std::uint64_t>(Stack.Data);
+    const auto VmSp = ((Lower + 64 * 1024) & ~15ULL) | (NativeSp & 15);
+    const auto Incoming = (std::min)(std::uint64_t{4096}, StackTop - NativeSp);
+    std::memcpy(reinterpret_cast<void*>(VmSp), reinterpret_cast<const void*>(NativeSp), static_cast<std::size_t>(Incoming));
+    Context.Registers[4] = VmSp;
+    vmprotect::RunConfig Config;
+    Config.NativeMemory = true;
+    Config.ImageBase = GVmImageBase;
+    Config.NativeContext = &Context;
+    Config.StackLower = Lower;
+    Config.StackUpper = Lower + VmStackLease::Size;
+    vmprotect::InvokeCompiledProgram(Virtualized.Compiled, Context, false, Config);
+    Context.Registers[4] = NativeSp;
 }
 
 void LoadVmp3(std::span<const std::uint8_t> Data, std::string_view BuildSecret,
@@ -729,20 +792,23 @@ void LoadVmp3(std::span<const std::uint8_t> Data, std::string_view BuildSecret,
     Programs.reserve(Decoded.size());
     for (auto& Function : Decoded) {
         VmProgram Virtualized{};
-        Virtualized.Program = std::move(Function.Program);
-        Virtualized.Seed = Function.Seed;
-        Virtualized.Digest = ProgramDigest(Virtualized.Program);
-        Virtualized.Compiled = vmprotect::CompileLiftedProgram(Virtualized.Program, Virtualized.Seed);
+        const auto Digest = ProgramDigest(Function.Program);
+        // Exercise the same ingestion-integrity gate before freezing the image.
+        if (HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_CORRUPT_VM").c_str()) != 0 && Programs.empty())
+            Function.Program.Instructions.front().Immediate ^= 1ULL;
+        if (ProgramDigest(Function.Program) != Digest) IntegrityFailure();
+        Virtualized.EntryAddress = Function.Program.EntryAddress;
+        Virtualized.ResumeAddress = Function.Program.ResumeAddress;
+        Virtualized.NeedsStack=std::any_of(Function.Program.Instructions.begin(),Function.Program.Instructions.end(),[](const auto& I) {
+            using O=vmprotect::LiftedOp;
+            return I.Op==O::Push || I.Op==O::Pop || I.Op==O::Call || I.Op==O::NativeCall || I.Dst==4 || I.Src==4;
+        });
+        Virtualized.Compiled = vmprotect::CompileLiftedProgram(Function.Program, Function.Seed);
         Programs.push_back(std::move(Virtualized));
     }
     // Publish only after every function has passed decoding and compilation.
+    GVmBridgeTrace.Seen.assign(Programs.size(), 0);
     GVirtualizedPrograms = std::move(Programs);
-    // Test-only hook: corrupts the first loaded program AFTER its digest is
-    // computed, so the bridge's per-call verification must reject the run.
-    if (HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_CORRUPT_VM").c_str()) != 0 && !GVirtualizedPrograms.empty()) {
-        auto& First = GVirtualizedPrograms.front().Program;
-        if (!First.Instructions.empty()) First.Instructions.front().Immediate ^= 1ULL;
-    }
 }
 
 // At-rest encryption for the payload's executable sections. Every page
@@ -893,11 +959,52 @@ DWORD SectionProtection(DWORD Characteristics) {
     return Read ? PAGE_READONLY : PAGE_NOACCESS;
 }
 
+struct PayloadTlsContext {
+    std::uint8_t* Base{};
+    IMAGE_TLS_DIRECTORY64 Directory{};
+    DWORD Index{};
+
+    void Notify(DWORD Reason, PVOID Reserved) const {
+        if (Reason == DLL_PROCESS_ATTACH || Reason == DLL_THREAD_ATTACH) {
+            auto** Slots = reinterpret_cast<std::uint8_t**>(__readgsqword(0x58));
+            auto* Block = Slots[Index];
+            const auto Size = static_cast<std::size_t>(Directory.EndAddressOfRawData - Directory.StartAddressOfRawData);
+            if (Size) std::memcpy(Block, reinterpret_cast<const void*>(Directory.StartAddressOfRawData), Size);
+            if (Directory.SizeOfZeroFill) std::memset(Block + Size, 0, Directory.SizeOfZeroFill);
+        }
+        if (!Directory.AddressOfCallBacks) return;
+        auto* Callbacks = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(Directory.AddressOfCallBacks);
+        for (; *Callbacks; ++Callbacks) (*Callbacks)(Base, Reason, Reserved);
+    }
+};
+
+std::atomic<const PayloadTlsContext*> GPayloadTls{};
+void NTAPI DispatchPayloadTls(PVOID, DWORD Reason, PVOID Reserved) {
+    if (const auto* Context = GPayloadTls.load(std::memory_order_acquire)) Context->Notify(Reason, Reserved);
+}
+
+struct PayloadImageRange { std::uint8_t* Base{}; std::size_t Size{}; };
+std::atomic<const PayloadImageRange*> GPayloadImageRange{};
+PVOID NTAPI PayloadPcToFileHeader(PVOID Pc, PVOID* ImageBase) {
+    if (const auto* Range = GPayloadImageRange.load(std::memory_order_acquire)) {
+        const auto Address = reinterpret_cast<std::uintptr_t>(Pc);
+        const auto Base = reinterpret_cast<std::uintptr_t>(Range->Base);
+        if (Address >= Base && Address - Base < Range->Size) {
+            *ImageBase = Range->Base;
+            return Range->Base;
+        }
+    }
+    using LookupFn = PVOID(NTAPI*)(PVOID, PVOID*);
+    const auto Lookup = PEVM_API(LookupFn, KNtdllModule, "RtlPcToFileHeader");
+    return Lookup ? Lookup(Pc, ImageBase) : nullptr;
+}
+
 class MappedImage {
 public:
     explicit MappedImage(std::span<const std::uint8_t> File) {
         const pevm::pe::ImageView Parsed(File);
         Parsed.RequireX64();
+        TlsLayout = pevm::pe::ReadTlsLayout(Parsed);
         if (Parsed.OptionalHeaderSize() < sizeof(IMAGE_OPTIONAL_HEADER64))
             throw std::runtime_error("payload requires a full PE32+ optional header");
         const auto Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(File.data() + Parsed.NtOffset());
@@ -945,9 +1052,32 @@ public:
         if (std::memcmp(Base, File.data(), NtHeaders->OptionalHeader.SizeOfHeaders) != 0) {
             throw std::runtime_error(PEVM_TEXT("mapped header verification failed"));
         }
+        ImageRange = {Base, NtHeaders->OptionalHeader.SizeOfImage};
     }
 
     ~MappedImage() {
+        if (ThunkExceptionsRegistered) RtlDeleteFunctionTable(ThunkFunctions.data());
+        for (const auto& Hook : ImageLookupHooks) {
+            DWORD Old = 0;
+            if (HideProtect(Hook.Slot, sizeof(*Hook.Slot), PAGE_READWRITE, &Old)) {
+                *Hook.Slot = Hook.Original;
+                DWORD Ignored = 0;
+                HideProtect(Hook.Slot, sizeof(*Hook.Slot), Old, &Ignored);
+            }
+        }
+        if (GPayloadImageRange.load(std::memory_order_acquire) == &ImageRange)
+            GPayloadImageRange.store(nullptr, std::memory_order_release);
+        if (GPayloadTls.load(std::memory_order_acquire) == &TlsContext) {
+            GPayloadTls.store(nullptr, std::memory_order_release);
+            DWORD Old = 0;
+            if (HideProtect(WrapperCallbacks, SavedCallbacks.size() * sizeof(PIMAGE_TLS_CALLBACK), PAGE_READWRITE, &Old)) {
+                std::copy(SavedCallbacks.begin(), SavedCallbacks.end(), WrapperCallbacks);
+                DWORD Ignored = 0;
+                HideProtect(WrapperCallbacks, SavedCallbacks.size() * sizeof(PIMAGE_TLS_CALLBACK), Old, &Ignored);
+            }
+            auto** Slots = reinterpret_cast<std::uint8_t**>(__readgsqword(0x58));
+            std::copy(SavedWrapperTls.begin(), SavedWrapperTls.end(), Slots[TlsContext.Index]);
+        }
         if (FunctionTable) RtlDeleteFunctionTable(FunctionTable);
         // Member owners release the thunk and image after unwind deregistration.
     }
@@ -956,65 +1086,86 @@ public:
         ApplyRelocations();
         ResolveImports();
         RegisterExceptions();
+        BindTls();
         ProtectSections();
-        RunTlsCallbacks();
         FlushInstructionCache(GetCurrentProcess(), Base, NtHeaders->OptionalHeader.SizeOfImage);
+        if (TlsLayout) TlsContext.Notify(DLL_PROCESS_ATTACH, nullptr);
     }
 
-    // Installs one bridge trampoline per virtualized function. The original
-    // entry is patched with the same 12-byte `mov rax, imm64; jmp rax` hop
-    // into a freshly generated thunk; the thunk pushes the function index as
-    // the fifth argument (mov dword [rsp+0x20]) and calls the shared bridge,
-    // so one C++ bridge dispatches every virtualized function by index.
-    void InstallVmBridge(std::uint32_t FunctionRva, std::uint64_t Index) {
+    // A relative entry jump preserves every input register. Each nearby
+    // thunk supplies an index and calls the common ABI-aware assembly entry.
+    void InstallVmBridge(std::uint32_t FunctionRva, std::uint64_t Index, std::uint32_t ResumeRva=0) {
         if (FunctionRva >= NtHeaders->OptionalHeader.SizeOfImage ||
-            NtHeaders->OptionalHeader.SizeOfImage - FunctionRva < 12) throw std::runtime_error(PEVM_TEXT("VM bridge RVA invalid"));
-        if (Index > 0xFFFFFFFFULL) throw std::runtime_error(PEVM_TEXT("VM bridge function index overflow"));
+            NtHeaders->OptionalHeader.SizeOfImage - FunctionRva < 5 || Index > UINT32_MAX)
+            throw std::runtime_error(PEVM_TEXT("VM bridge RVA/index invalid"));
         auto* Target = Base + FunctionRva;
-        if (Target[0] == 0x48 && Target[1] == 0xB8) throw std::runtime_error(PEVM_TEXT("VM bridge already installed"));
         if (!ThunkBase) {
-            ThunkBase = static_cast<std::uint8_t*>(HideAlloc(nullptr, ThunkPageBytes,
-                                                             MEM_RESERVE | MEM_COMMIT,
-                                                             PAGE_EXECUTE_READWRITE));
-            if (!ThunkBase) throw std::runtime_error(PEVM_TEXT("cannot allocate VM bridge thunk page"));
+            const auto Center = reinterpret_cast<std::uintptr_t>(Base) & ~0xffffULL;
+            // Windows allocations use 64 KiB granularity. Keep the complete
+            // thunk arena within rel32 reach of every payload code address.
+            for (std::uintptr_t Delta = 0x10000; Delta < 0x60000000 && !ThunkBase; Delta += 0x10000) {
+                for (const bool Above : {true, false}) {
+                    if (!Above && Delta >= Center) continue;
+                    const auto Address = Above ? Center + Delta : Center - Delta;
+                    ThunkBase = static_cast<std::uint8_t*>(HideAlloc(reinterpret_cast<void*>(Address), ThunkPageBytes,
+                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                    if (ThunkBase) break;
+                }
+            }
+            if (!ThunkBase) throw std::runtime_error(PEVM_TEXT("cannot allocate nearby VM bridge arena"));
             ThunkMemory.reset(ThunkBase);
         }
-        if (ThunkUsed + 29 > ThunkPageBytes) throw std::runtime_error(PEVM_TEXT("VM bridge thunk page exhausted"));
-        const auto Thunk = ThunkBase + ThunkUsed;
-        const auto Bridge = reinterpret_cast<std::uint64_t>(&VirtualizedFunctionBridge);
-        // The thunk passes the function index as the fifth integer argument
-        // (mov dword [rsp+0x20] inside the 0x28-byte frame) and reaches the
-        // bridge through an absolute rax call: the thunk page can be
-        // allocated anywhere in the address space, so rel32 is not usable.
-        // The bridge reads the index as a 32-bit value because only the low
-        // half of the argument slot is written here.
-        std::array<std::uint8_t, 29> Code{};
-        Code[0] = 0x48; Code[1] = 0x83; Code[2] = 0xEC; Code[3] = 0x28;      // sub rsp, 0x28
-        Code[4] = 0xC7; Code[5] = 0x44; Code[6] = 0x24; Code[7] = 0x20;      // mov dword [rsp+0x20], imm32
-        for (unsigned I = 0; I < 4; ++I) Code[8 + I] = static_cast<std::uint8_t>(Index >> (I * 8));
-        Code[12] = 0x48; Code[13] = 0xB8;                                    // movabs rax, imm64 (bridge)
-        for (unsigned I = 0; I < 8; ++I) Code[14 + I] = static_cast<std::uint8_t>(Bridge >> (I * 8));
-        Code[22] = 0xFF; Code[23] = 0xD0;                                    // call rax
-        Code[24] = 0x48; Code[25] = 0x83; Code[26] = 0xC4; Code[27] = 0x28;  // add rsp, 0x28
-        Code[28] = 0xC3;                                                     // ret
-        DWORD OldProtection = 0;
-        if (!HideProtect(Target, 12, PAGE_EXECUTE_READWRITE, &OldProtection)) throw std::runtime_error(PEVM_TEXT("VM bridge cannot unlock target"));
-        const std::array<std::uint8_t, 2> MovRax = {0x48, 0xB8}; std::memcpy(Target, MovRax.data(), MovRax.size());
-        const auto Hop = reinterpret_cast<std::uint64_t>(Thunk);
-        std::memcpy(Target + 2, &Hop, sizeof(Hop)); Target[10] = 0xFF; Target[11] = 0xE0;
-        std::memcpy(Thunk, Code.data(), Code.size());
-        std::array<std::uint8_t, 12> Patched{};
-        std::memcpy(Patched.data(), Target, Patched.size());
-        std::array<std::uint8_t, 12> Expected{};
-        std::memcpy(Expected.data(), MovRax.data(), MovRax.size());
-        std::memcpy(Expected.data() + 2, &Hop, sizeof(Hop));
-        Expected[10] = 0xFF; Expected[11] = 0xE0;
-        if (Patched != Expected) throw std::runtime_error(PEVM_TEXT("VM bridge patch verification failed"));
-        DWORD Ignored = 0;
-        HideProtect(Target, 12, PAGE_EXECUTE_READ, &Ignored);
-        ThunkUsed += Code.size();
-        FlushInstructionCache(GetCurrentProcess(), Target, 12);
-        FlushInstructionCache(GetCurrentProcess(), Thunk, Code.size());
+        constexpr std::size_t Slot = 64;
+        if (ThunkUsed + Slot > ThunkPageBytes) throw std::runtime_error(PEVM_TEXT("VM bridge arena exhausted"));
+        auto* Thunk = ThunkBase + ThunkUsed;
+        const auto Displacement = reinterpret_cast<std::intptr_t>(Thunk) - reinterpret_cast<std::intptr_t>(Target + 5);
+        if (Displacement < INT32_MIN || Displacement > INT32_MAX)
+            throw std::runtime_error(PEVM_TEXT("VM bridge is outside relative jump range"));
+        std::array<std::uint8_t, 25> Code = {
+            0x68,0,0,0,0,                 // push index
+            0xff,0x15,6,0,0,0,            // call qword [rip+6]
+            0x48,0x8d,0x64,0x24,8,0xc3,  // lea rsp,[rsp+8]; ret
+            0,0,0,0,0,0,0,0
+        };
+        const auto Entry = reinterpret_cast<std::uint64_t>(&PeVmNativeEntry);
+        const auto EntryIndex = static_cast<std::uint32_t>(Index);
+        std::memcpy(Code.data() + 1, &EntryIndex, 4);
+        std::memcpy(Code.data() + 17, &Entry, 8);
+        const auto Prefix=ResumeRva?6U:0U;
+        if(ResumeRva) {
+            if(ResumeRva>=NtHeaders->OptionalHeader.SizeOfImage || ResumeRva<FunctionRva+5)
+                throw std::runtime_error("VM fragment resume RVA invalid");
+            // push [rip+34] installs the native continuation without changing
+            // any GPR or flags. The common thunk returns directly to it.
+            constexpr std::uint8_t PushResume[]{0xff,0x35,34,0,0,0};
+            std::memcpy(Thunk,PushResume,6);
+            const auto Resume=reinterpret_cast<std::uint64_t>(Base+ResumeRva);
+            std::memcpy(Thunk+40,&Resume,8);
+            // Drop the synthetic frame and JMP to the continuation. RET
+            // would consume an unmatched return on CET shadow-stack systems.
+            const std::uint8_t FragmentCode[]{0x68,0,0,0,0,0xff,0x15,15,0,0,0,
+                0x48,0x8d,0x64,0x24,16,0xff,0x25,12,0,0,0};
+            std::memcpy(Thunk+6,FragmentCode,sizeof(FragmentCode));
+            std::memcpy(Thunk+7,&EntryIndex,4);
+            std::memcpy(Thunk+32,&Entry,8);
+        } else {
+            std::memcpy(Thunk,Code.data(),Code.size());
+        }
+        constexpr std::array<std::uint8_t,8> Unwind{1,5,1,0,5,2,0,0}; // allocate 8 bytes for index
+        std::memcpy(Thunk + 48, Unwind.data(), Unwind.size());
+        ThunkFunctions.push_back({static_cast<DWORD>(ThunkUsed+Prefix),static_cast<DWORD>(ThunkUsed+(ResumeRva?28:17)),
+                                  static_cast<DWORD>(ThunkUsed+48)});
+        DWORD Old;
+        if (!HideProtect(Target,5,PAGE_EXECUTE_READWRITE,&Old)) throw std::runtime_error(PEVM_TEXT("cannot patch VM entry"));
+        std::array<std::uint8_t,5> Patch{0xe9};
+        const auto Relative = static_cast<std::int32_t>(Displacement);
+        std::memcpy(Patch.data()+1,&Relative,4);
+        std::memcpy(Target,Patch.data(),Patch.size());
+        if (std::memcmp(Target,Patch.data(),Patch.size())) throw std::runtime_error(PEVM_TEXT("VM bridge patch verification failed"));
+        DWORD Ignored;
+        HideProtect(Target,5,Old,&Ignored);
+        FlushInstructionCache(GetCurrentProcess(),Target,5);
+        ThunkUsed += Slot;
     }
 
     // Drops the thunk page to execute/read after every bridge is installed.
@@ -1022,28 +1173,18 @@ public:
     // freeze the whole page and break later thunk writes in the same page.
     void SealBridges() {
         if (!ThunkBase || ThunkUsed == 0) return;
+        if (!RtlAddFunctionTable(ThunkFunctions.data(), static_cast<DWORD>(ThunkFunctions.size()),
+                                 reinterpret_cast<DWORD64>(ThunkBase)))
+            throw std::runtime_error(PEVM_TEXT("cannot register VM bridge unwind table"));
+        ThunkExceptionsRegistered = true;
         DWORD Ignored = 0;
         HideProtect(ThunkBase, ThunkUsed, PAGE_EXECUTE_READ, &Ignored);
         FlushInstructionCache(GetCurrentProcess(), ThunkBase, ThunkUsed);
     }
 
     [[noreturn]] void RunEntryPoint() {
-        const auto Entry = reinterpret_cast<void(*)()>(Base + EntryPointRva);
-        Entry();
-        ExitProcess(0);
-    }
-
-    // Anti-dump: after relocation/import/TLS processing nothing needs the PE
-    // headers of the mapped payload anymore, so they are wiped to break
-    // memory dumps that rebuild the image from its headers.
-    void WipeHeaders() {
-        const auto Size = NtHeaders->OptionalHeader.SizeOfHeaders;
-        DWORD OldProtection = 0;
-        if (HideProtect(Base, Size, PAGE_READWRITE, &OldProtection)) {
-            SecureZeroMemory(Base, Size);
-            HideProtect(Base, Size, PAGE_READONLY, &OldProtection);
-            FlushInstructionCache(GetCurrentProcess(), Base, Size);
-        }
+        const auto Entry = reinterpret_cast<DWORD(*)()>(Base + EntryPointRva);
+        ExitProcess(Entry());
     }
 
     // Access for the code-page vault (sealing runs outside the class).
@@ -1063,7 +1204,17 @@ private:
     PRUNTIME_FUNCTION FunctionTable{};
     std::uint8_t* ThunkBase{};
     std::size_t ThunkUsed{};
-    static constexpr std::size_t ThunkPageBytes = 64 * 1024;
+    std::vector<RUNTIME_FUNCTION> ThunkFunctions;
+    bool ThunkExceptionsRegistered{};
+    static constexpr std::size_t ThunkPageBytes = 1024 * 1024;
+    std::optional<pevm::pe::TlsLayout> TlsLayout;
+    PayloadTlsContext TlsContext;
+    PIMAGE_TLS_CALLBACK* WrapperCallbacks{};
+    std::vector<PIMAGE_TLS_CALLBACK> SavedCallbacks;
+    Bytes SavedWrapperTls;
+    PayloadImageRange ImageRange;
+    struct ImageLookupHook { ULONGLONG* Slot; ULONGLONG Original; };
+    std::vector<ImageLookupHook> ImageLookupHooks;
 
     IMAGE_DATA_DIRECTORY Directory(std::size_t Index) const {
         if (Index >= IMAGE_NUMBEROF_DIRECTORY_ENTRIES || Index >= NtHeaders->OptionalHeader.NumberOfRvaAndSizes) return {};
@@ -1084,6 +1235,7 @@ private:
     }
 
     void ResolveImports() {
+        GPayloadImageRange.store(&ImageRange, std::memory_order_release);
         const auto& Data = Directory(IMAGE_DIRECTORY_ENTRY_IMPORT);
         if (Data.VirtualAddress == 0) return;
         // Even payload dependency resolution avoids GetProcAddress as the
@@ -1103,6 +1255,14 @@ private:
             if (ModuleBase == nullptr) {
                 throw std::runtime_error(std::string(PEVM_TEXT("cannot load imported DLL: ")) + DllName);
             }
+            // MSVC's throw runtime obtains the ThrowInfo image base through
+            // RtlPcToFileHeader. Private mappings are absent from the OS module
+            // list, even with a registered unwind table; teach only the CRT's
+            // imported lookup about this range and delegate all other PCs.
+            std::string ModuleName(DllName);
+            std::transform(ModuleName.begin(), ModuleName.end(), ModuleName.begin(),
+                           [](unsigned char C) { return static_cast<char>(std::tolower(C)); });
+            if (ModuleName.starts_with("vcruntime")) BindCrtImageLookup(ModuleBase);
             auto Lookup = reinterpret_cast<IMAGE_THUNK_DATA64*>(Base +
                 (Descriptor->OriginalFirstThunk ? Descriptor->OriginalFirstThunk : Descriptor->FirstThunk));
             auto Address = reinterpret_cast<IMAGE_THUNK_DATA64*>(Base + Descriptor->FirstThunk);
@@ -1118,6 +1278,7 @@ private:
                     const auto Import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(Base + Lookup->u1.AddressOfData);
                     FuncName = Import->Name;
                     Function = ExportByName(ModuleBase, FuncName);
+                    if (std::strcmp(FuncName, "RtlPcToFileHeader") == 0) Function = PayloadPcToFileHeader;
                 }
                 // Last-resort fallback: the real GetProcAddress handles every
                 // edge case the walker may miss.
@@ -1132,6 +1293,32 @@ private:
                                              DllName + "!" + (ByOrdinal ? "#" + std::to_string(FuncOrdinal) : FuncName));
                 }
                 Address->u1.Function = reinterpret_cast<ULONGLONG>(Function);
+            }
+        }
+    }
+
+    void BindCrtImageLookup(const std::uint8_t* Module) {
+        const auto* Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(Module +
+            reinterpret_cast<const IMAGE_DOS_HEADER*>(Module)->e_lfanew);
+        const auto Data = Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!Data.VirtualAddress) return;
+        const auto* Descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(Module + Data.VirtualAddress);
+        for (; Descriptor->Name; ++Descriptor) {
+            if (!Descriptor->OriginalFirstThunk) continue;
+            const auto* Lookup = reinterpret_cast<const IMAGE_THUNK_DATA64*>(Module + Descriptor->OriginalFirstThunk);
+            auto* Address = reinterpret_cast<IMAGE_THUNK_DATA64*>(const_cast<std::uint8_t*>(Module) + Descriptor->FirstThunk);
+            for (; Lookup->u1.AddressOfData; ++Lookup, ++Address) {
+                if (IMAGE_SNAP_BY_ORDINAL64(Lookup->u1.Ordinal)) continue;
+                const auto* Import = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(Module + Lookup->u1.AddressOfData);
+                if (std::strcmp(Import->Name, "RtlPcToFileHeader") != 0) continue;
+                if (Address->u1.Function == reinterpret_cast<ULONGLONG>(PayloadPcToFileHeader)) continue;
+                ImageLookupHooks.push_back({&Address->u1.Function, Address->u1.Function});
+                DWORD Old = 0;
+                if (!HideProtect(&Address->u1.Function, sizeof(Address->u1.Function), PAGE_READWRITE, &Old))
+                    throw std::runtime_error(PEVM_TEXT("cannot bind CRT image lookup"));
+                Address->u1.Function = reinterpret_cast<ULONGLONG>(PayloadPcToFileHeader);
+                DWORD Ignored = 0;
+                HideProtect(&Address->u1.Function, sizeof(Address->u1.Function), Old, &Ignored);
             }
         }
     }
@@ -1163,29 +1350,40 @@ private:
         }
     }
 
-    void RunTlsCallbacks() {
-        const auto& Data = Directory(IMAGE_DIRECTORY_ENTRY_TLS);
-        if (Data.VirtualAddress == 0 || Data.Size < sizeof(IMAGE_TLS_DIRECTORY64)) return;
-        const auto Tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(Base + Data.VirtualAddress);
-        if (Tls->AddressOfCallBacks == 0) return;
-        auto Callbacks = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(Tls->AddressOfCallBacks);
-        for (; *Callbacks; ++Callbacks) (*Callbacks)(Base, DLL_PROCESS_ATTACH, nullptr);
+    void BindTls() {
+        if (!TlsLayout) return;
+        const auto Wrapper = reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr));
+        const auto WrapperNt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(Wrapper +
+            reinterpret_cast<const IMAGE_DOS_HEADER*>(Wrapper)->e_lfanew);
+        const auto Data = WrapperNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        if (!Data.VirtualAddress || Data.Size < sizeof(IMAGE_TLS_DIRECTORY64))
+            throw std::runtime_error(PEVM_TEXT("wrapper static TLS carrier missing; rebuild protected program"));
+        const auto* Tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(Wrapper + Data.VirtualAddress);
+        const auto RawSize = static_cast<std::size_t>(Tls->EndAddressOfRawData - Tls->StartAddressOfRawData);
+        if (RawSize + Tls->SizeOfZeroFill < TlsLayout->TotalBytes || !Tls->AddressOfCallBacks)
+            throw std::runtime_error(PEVM_TEXT("wrapper static TLS carrier too small; rebuild protected program"));
+        TlsContext.Base = Base;
+        TlsContext.Directory = *reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(Base + Directory(IMAGE_DIRECTORY_ENTRY_TLS).VirtualAddress);
+        TlsContext.Index = *reinterpret_cast<const DWORD*>(Tls->AddressOfIndex);
+        *reinterpret_cast<DWORD*>(Base + TlsLayout->IndexRva) = TlsContext.Index;
+        auto** Slots = reinterpret_cast<std::uint8_t**>(__readgsqword(0x58));
+        SavedWrapperTls.assign(Slots[TlsContext.Index], Slots[TlsContext.Index] + RawSize);
+        WrapperCallbacks = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(Tls->AddressOfCallBacks);
+        for (auto* Callback = WrapperCallbacks; *Callback; ++Callback) SavedCallbacks.push_back(*Callback);
+        SavedCallbacks.push_back(nullptr);
+        // The wrapper's CRT TLS guard shares this slot. Its callbacks must not
+        // run before the payload's constructors or after its destructors.
+        DWORD Old = 0;
+        if (!HideProtect(WrapperCallbacks, 2 * sizeof(PIMAGE_TLS_CALLBACK), PAGE_READWRITE, &Old))
+            throw std::runtime_error(PEVM_TEXT("cannot install TLS notifications"));
+        WrapperCallbacks[0] = DispatchPayloadTls;
+        WrapperCallbacks[1] = nullptr;
+        DWORD Ignored = 0;
+        HideProtect(WrapperCallbacks, 2 * sizeof(PIMAGE_TLS_CALLBACK), Old, &Ignored);
+        GPayloadTls.store(&TlsContext, std::memory_order_release);
     }
 };
 
-// VMP-style license gate: the key arrives via the PEVM_LICENSE environment
-// variable or a .license file next to the wrapper. Anything missing, forged,
-// locked to another machine or expired fails closed with one message.
-void VerifyLicense(const LicensePolicy& Policy) {
-    try {
-        const auto Payload = pevm::license::ParseLicense(pevm::license::ReadRuntimeLicense(SelfPath()));
-        const auto Reason = pevm::license::VerifyPayload(Payload, Policy,
-            pevm::license::MachineId(), pevm::license::CurrentFileTime());
-        if (!Reason.empty()) throw std::runtime_error(Reason);
-    } catch (const std::exception&) {
-        throw std::runtime_error(PEVM_TEXT("license check failed"));
-    }
-}
 [[noreturn]] void RunWrapped() {
     RunAntiDebugChecks();
     const auto WrapperPath = SelfPath();
@@ -1201,7 +1399,8 @@ void VerifyLicense(const LicensePolicy& Policy) {
     if (Footer.PayloadOffset > Image.size() || Footer.PayloadSize > Image.size() - PayloadOffset ||
         Footer.StubSize != SecretOffset) throw std::runtime_error(PEVM_TEXT("invalid wrapper payload location"));
     const auto Metadata = ValidateProtectionMetadata(Image, Footer);
-    if (Metadata.License.Required != 0) VerifyLicense(Metadata.License);
+    if (Metadata.License.Required != 0) pevm::activation::EnsureLicense(Metadata.License, WrapperPath,
+        HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_NO_DIALOG").c_str()) == 0);
     auto Password = RecoverBuildSecret(Image, Footer, PayloadOffset, SecretOffset);
 
     const auto WrapperDirectory = WrapperPath.parent_path();
@@ -1223,20 +1422,27 @@ void VerifyLicense(const LicensePolicy& Policy) {
     SecureZeroMemory(Plain.data(), Plain.size());
     Plain.clear();
     Plain.shrink_to_fit();
+    GVmStackSlot = FlsAlloc(ReleaseVmStacks);
+    if (GVmStackSlot == FLS_OUT_OF_INDEXES) throw std::runtime_error("VM stack slot allocation failed");
+    GVmBridgeTrace.Enabled = Metadata.VmDataRawSize != 0 &&
+        HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_VM_BRIDGE_LOG").c_str()) != 0;
+    if (GVmBridgeTrace.Enabled) {
+        GVmBridgeTrace.Log.open(WrapperPath.wstring() + L".vmbridge-hit",
+                               std::ios::binary | std::ios::trunc);
+    }
     Payload.Prepare();
+    GVmImageBase = reinterpret_cast<std::uint64_t>(Payload.ImageBase());
     if (Metadata.VmDataRawSize != 0) {
         LoadVmp3(std::span(Image).subspan(Metadata.VmDataRawOffset, Metadata.VmDataRawSize),
                  Password, Metadata.HandlerProfile);
         for (std::size_t I = 0; I < GVirtualizedPrograms.size(); ++I) {
-            Payload.InstallVmBridge(GVirtualizedPrograms[I].Program.EntryAddress, I);
+            Payload.InstallVmBridge(GVirtualizedPrograms[I].EntryAddress, I, GVirtualizedPrograms[I].ResumeAddress);
         }
         Payload.SealBridges();
     }
-    // Code pages must be sealed while the build secret is still alive and
-    // before the headers are wiped (section discovery needs the section
-    // table); the wipe order below is load-bearing.
+    // CRT TLS guards, resources and exception handlers continue to inspect
+    // the mapped PE headers after startup, so keep them read-only.
     TextVault::Instance.Seal(Payload.ImageBase(), Payload.NtHeadersView(), Password);
-    Payload.WipeHeaders();
     // Everything below this point runs without the wrapper image or the
     // metadata (they hold the region tags and handler profile).
     SecureZeroMemory(const_cast<std::uint8_t*>(Image.data()), Image.size());
@@ -1253,6 +1459,7 @@ void VerifyLicense(const LicensePolicy& Policy) {
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     try { RunWrapped(); }
+    catch (const pevm::activation::Cancelled&) { return ERROR_CANCELLED; }
     catch (const std::exception& Error) {
         if (HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_ERROR_LOG").c_str()) != 0) {
             const auto Path = SelfPath().wstring() + L".loader-error.txt";

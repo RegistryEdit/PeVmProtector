@@ -35,8 +35,7 @@ extern "C" __declspec(dllexport, noinline) std::uint64_t MemTarget(std::uint64_t
     return Values[0] + Values[1] + Values[2] + Values[3];
 }
 
-// Fifth argument arrives on the native stack: the lifter must reject
-// stack-relative (RSP-base) memory access instead of miscompiling it.
+// Fifth argument arrives on the native stack and must survive virtualization.
 extern "C" __declspec(dllexport, noinline) std::uint64_t StackTarget(
     std::uint64_t A, std::uint64_t B, std::uint64_t C, std::uint64_t D, std::uint64_t E) {
     return A + B + C + D + E;
