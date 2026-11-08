@@ -24,20 +24,32 @@ struct MultiLiftResult {
     std::string Json;
 };
 
-// One virtualization candidate discovered from .pdata / the export table.
+// One virtualization candidate; names are evidence from exports/COFF/PDB.
 struct FunctionCandidate {
     std::uint32_t Rva{};
     std::uint32_t Size{};
-    std::string Name;   // export name when the function is exported
+    std::string Name;
+    std::string DecoratedName;
+    std::string NameSource;
+    std::vector<std::string> Aliases;
 };
 
-// Enumerates every function entry in a PE32+ image: RUNTIME_FUNCTION records
-// from the exception directory provide the candidates, export names annotate
-// them. MinimumBytes filters tiny thunks.
+// Enumerates known function entries, not every possible code entry. The file
+// overload also uses a matching local PDB; the image overload is self-contained.
 std::vector<FunctionCandidate> ScanFunctions(const std::filesystem::path& Input,
                                              std::size_t MinimumBytes = 16);
 std::vector<FunctionCandidate> ScanFunctions(const pevm::pe::ImageView& Image,
                                              std::size_t MinimumBytes = 16);
+
+struct FunctionScanResult {
+    std::vector<FunctionCandidate> Functions;
+    std::string SymbolFile;
+    std::vector<std::string> Diagnostics;
+};
+FunctionScanResult ScanFunctionDetails(const std::filesystem::path& Input,
+                                      std::size_t MinimumBytes = 0,
+                                      const std::filesystem::path& PdbPath = {});
+std::string FunctionScanJson(const FunctionScanResult& Result);
 
 // Per-function failures when lifting a candidate list; the successes still
 // lift and serialize normally.

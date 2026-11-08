@@ -50,9 +50,22 @@ bin\Release\VmRegression.exe --benchmark
 
 - 输出位于 `bin\Release\`（`PeVm.exe`、`PeVmStub.exe`、`PeVmProtectorGui.exe` 与测试夹具）。
 - Qt6 GUI 需要 Qt 6.x MSVC kit 且内置 **QFluentWidgets**（默认路径 `D:\Qt\6.7.3\msvc2022_64`，可用 `msbuild ... /p:QtDir=<kit路径>` 覆盖）；构建后自动拷贝 Qt6Core/Gui/Widgets/Svg/Xml、QFluent/QWKCore/QWKWidgets DLL 与 platforms/imageformats 插件。
-- GUI 主题用 `Theme::setThemeMode(Fluent::ThemeMode::DARK)`，控件为 QFluent 的 `PushButton`/`PrimaryPushButton`/`LineEdit`/`PasswordLineEdit`/`CheckBox`/`IndeterminateProgressRing`，提示用 `InfoBar`；导航列因 QFluent `NavigationBar` 无公开展开 API 而采用原生可勾选按钮（选中高亮）。
+- GUI 统一使用 QFluent：导航为 `ToggleButton`，按钮和输入框为 `PushButton`/`PrimaryPushButton`/`LineEdit`，函数表为 `TableWidget`，文字为 `BodyLabel`/`CaptionLabel`，日志为 `PlainTextEdit`，滚动区域为 `ScrollArea`/`ScrollBar`，通知为 `InfoBar`。
 - GUI 不使用 moc：全部信号连接走 lambda，工程为普通 vcxproj。界面支持中英文一键切换（QSettings 持久化）。
 - 代码规范：全库标识符（类型、函数、变量、参数）统一大驼峰（PascalCase），文件与目录名同样大驼峰（`Src/`、`Tests/`、`PeVmMain.cpp` 等）；Windows/Qt/标准库 API 名、入口函数与字符串字面量保持原样。
+
+### 按函数勾选与名称解析
+
+进入“函数虚拟化”页，点击“扫描函数”，按函数名或 RVA 搜索，勾选目标后点击“虚拟化勾选函数”。只有复选框勾选的函数参与该次构建；筛选不会取消隐藏行的勾选，计数包含隐藏项。每次扫描默认不勾选，切换输入文件或 PDB 会清空旧选择。手动 RVA 输入仍单独保留。
+
+函数名来自 PE 导出表、COFF 函数符号和匹配的本地 PDB。自动查找输入文件同目录的 PDB（包括调试信息记录的文件名）及原构建路径，也可点“选择 PDB”指定文件。PDB 的 GUID/age 必须与 PE 匹配；C++ 名字自动反修饰，原始修饰名及别名保留在提示和扫描 JSON 中。缺失或不匹配的 PDB 会显示诊断。没有符号的函数显示 `sub_RVA`；已内联、被优化移除或符号被剥离的函数可能无法恢复名称。
+
+GUI 和 `scan-functions` 默认包含小函数，可用 `--min-bytes=N` 筛选已知长度。`protect-all` 保留原有发现策略。函数名可见不代表 lifter 支持该函数；所选函数包含不支持的指令时仍会明确报错。
+
+```powershell
+bin\Release\PeVm.exe scan-functions app.exe functions.json --pdb=C:\symbols\app.pdb
+bin\Release\PeVm.exe protect-functions app.exe selected.exe "build key" 0x1000 0x1234 --seed=12345
+```
 
 ## 使用
 
@@ -78,7 +91,22 @@ bin\Release\PeVm.exe license-keygen issuer.private issuer.pub
 bin\Release\PeVm.exe license-issue issuer.private 30 --machine=<64hex> --product=my-product --output=customer.license
 ```
 
-GUI 为 Qt6 界面（QProcess 驱动同目录的 `PeVm.exe`）：顶部是输入/输出/口令共享区（支持把文件直接拖到输入框，自动建议输出路径，口令可切换明文显示），左侧为 Fluent 导航列，右侧按「Container & Wrapper / Function Virtualization / VM Demo」三个页面组织操作，底部是等宽字体的运行日志、忙碌指示环与状态栏（显示每步用时）。函数虚拟化页的 RVA 输入框可填多个（逗号分隔时自动走多函数 `protect-functions`），并提供 Scan functions（自动发现函数）与 Protect ALL（全量虚拟化）按钮。
+GUI 采用中英文 Qt6 / QFluent 界面，通过 QProcess 调用同目录的 `PeVm.exe`，现有 22 个 CLI 命令均有界面入口：
+
+| 页面 | 功能 |
+| --- | --- |
+| 容器与封装 | `wrap`、`pack`、`unpack`、`inspect`、`vm-dump` |
+| 函数虚拟化 | `scan-functions`、`protect-function`、`protect-functions`、`protect-all`、`lift-x64`、`lift-x64-multi` |
+| 卡密签发与验证 | 生成密钥对、从私钥导出公钥、获取/复制本机机器码、签发/复制卡密、验证卡密文件 |
+| 原始机器码分析 | `lift-raw`，可设入口 RVA、种子、RCX/RDX/R8/R9 和 Trace |
+| VM 演示 | 阶乘 VM、Call/Memory VM、密钥 VM、VM2 自测、完整自检 |
+| 保护选项 | 共用的压缩、水印、卡密开关、公钥文件和产品 ID |
+
+输入/输出/口令共享区仅在容器与函数页显示，保留拖放文件、建议输出路径和显示口令。函数页可勾选目标函数，也可手动填写逗号分隔的 RVA；另可设置扫描与全量虚拟化各自的最小字节数、全量虚拟化 `--allow-mem`、桥接 Trace、清单 JSON 路径，并导出当前扫描 JSON。清单路径留空时仍按原有后缀生成。演示页使用自己的种子和 Trace。
+
+签发卡密时，先选择尚不存在的私钥/公钥路径并生成密钥对，或打开已有密钥；填写产品 ID、客户机器码、有效天数（0 为永久），然后签发。卡密路径留空时直接显示并可复制，填写新路径时同时写入文件。验证时选择已有卡密文件；机器码留空表示验证本机。点击“用于程序保护”会把公钥和产品 ID 带入“保护选项”，并启用卡密。私钥受当前 Windows 用户 DPAPI 保护，密钥和卡密文件均拒绝覆盖；安装与恢复见 [卡密说明](Docs/Licensing.md)。
+
+底部日志支持保存、清空，显示忙碌状态和每步用时。构建与密钥 VM 口令在命令日志中显示为 `<redacted>`，签发卡密正文仅显示在专用结果框。`GuiFeatures.exe` 通过真实界面执行全部命令，验证卡密生命周期及带卡密 EXE 的运行，并将中英文离屏截图写入 `bin/Release/TestArtifacts/GuiFeatures`。该回归已纳入 `Tests/RunTests.ps1`，Qt 安装在其他路径时可传 `-QtDir`。
 
 `pack`、`wrap` 和 `protect-*` 默认输出详细构建日志，各阶段即时刷新到终端或 GUI 日志区：
 

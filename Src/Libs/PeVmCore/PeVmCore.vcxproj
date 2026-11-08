@@ -30,6 +30,7 @@
     <ClCompile Include="..\Crypto\PeVmCrypto.cpp" />
     <ClCompile Include="..\License\PeVmLicense.cpp" />
     <ClCompile Include="..\Lifter\X64Lifter.cpp" />
+    <ClCompile Include="..\Lifter\FunctionScanner.cpp" />
     <ClCompile Include="..\Vm\VmProtect.cpp" />
   </ItemGroup>
   <ItemGroup>

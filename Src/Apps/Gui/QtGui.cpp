@@ -1,6 +1,6 @@
 // PeVmProtector Qt6 front-end built on QFluentWidgets. The GUI drives
 // PeVm.exe (same directory) in the background and streams its output into
-// the log pane; navigation uses a Fluent-style rail with a stacked view.
+// the Fluent log pane; navigation uses Fluent toggles with a stacked view.
 //
 // No moc is required on our side: every signal connection uses a lambda
 // receiver and the window subclass only overrides virtual event handlers.
@@ -8,6 +8,11 @@
 // Qt Linguist toolchain is needed either.
 
 #include <QApplication>
+#include "FunctionPicker.h"
+#include "LicensePage.h"
+#include "RawCodePage.h"
+#include <QDateTime>
+#include <QTemporaryDir>
 #include "PeVmLicenseFormat.h"
 #include <QButtonGroup>
 #include <QDragEnterEvent>
@@ -25,6 +30,7 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QSettings>
+#include <QSaveFile>
 #include <QScrollArea>
 #include <QStackedWidget>
 #include <QStatusBar>
@@ -42,6 +48,9 @@
 #include "Progress/IndeterminateProgressRing.h"
 #include "PushButton.h"
 #include "ScrollBar.h"
+#include "ScrollArea.h"
+#include "Label.h"
+#include "TextEdit.h"
 #include "Theme.h"
 
 #include <chrono>
@@ -63,8 +72,17 @@ class MainWindow final : public QMainWindow {
 public:
     MainWindow() {
         setAcceptDrops(true);
-        resize(960, 680);
+        resize(1120, 880);
         Theme::setThemeMode(Fluent::ThemeMode::DARK);
+        // QFluent styles controls; Qt's scroll viewports and stacked surfaces
+        // still use the application palette for their background.
+        auto Palette = QApplication::palette();
+        Palette.setColor(QPalette::Window, QColor(30, 32, 38));
+        Palette.setColor(QPalette::Base, QColor(24, 26, 31));
+        Palette.setColor(QPalette::WindowText, QColor(215, 218, 224));
+        Palette.setColor(QPalette::Text, QColor(215, 218, 224));
+        Palette.setColor(QPalette::ButtonText, QColor(215, 218, 224));
+        QApplication::setPalette(Palette);
         QSettings Settings;
         const auto SystemLang = QLocale::system().language() == QLocale::Chinese
                                     ? UiLang::Chinese
@@ -106,6 +124,11 @@ private:
     CheckBox* MutateCheck{};
     CheckBox* CompressCheck{};
     CheckBox* LicenseCheck{};
+    CheckBox* AllowMemoryCheck{};
+    CheckBox* FunctionTrace{};
+    SpinBox *ScanMinimum{}, *ProtectMinimum{};
+    LineEdit *ManifestEdit{}, *ScanExportEdit{};
+    QByteArray ScanResult;
     LineEdit* WatermarkEdit{};
     LineEdit* LicensePublicKeyEdit{};
     LineEdit* LicenseProductEdit{};
@@ -155,6 +178,12 @@ private:
     QPushButton* ViewJsonBtn{};
     QPushButton* ScanBtn{};
     QPushButton* ProtectAllBtn{};
+    QPushButton* VirtualizeSelectedBtn{};
+    FunctionPicker* Picker{};
+    QTemporaryDir ScanDirectory;
+    QString PendingScanJson;
+    quint64 ScanGeneration{}, PendingScanGeneration{};
+    QFileInfo ScannedFile;
     QPushButton* FactorialBtn{};
     QPushButton* CallMemoryBtn{};
     QPushButton* SelfTestBtn{};
@@ -162,14 +191,59 @@ private:
     QPushButton* NavContainerBtn{};
     QPushButton* NavFunctionsBtn{};
     QPushButton* NavDemoBtn{};
+    QPushButton *NavLicenseBtn{}, *NavRawBtn{}, *NavSettingsBtn{};
+    QWidget* SharedFields{};
+    QStackedWidget* Pages{};
+    LicensePage* Licensing{};
+    RawCodePage* RawCode{};
+    PasswordLineEdit* DemoPassword{};
+    std::vector<std::function<void()>> Translations;
 
     QFormLayout* FunctionForm{};
     QFormLayout* DemoForm{};
-    QPlainTextEdit* Log{};
+    PlainTextEdit* Log{};
+    CaptionLabel* StatusLabel{};
     IndeterminateProgressRing* Ring{};
     QProcess* Runner{};
     std::chrono::steady_clock::time_point Started{};
     bool Running{};
+    LicensePage::Completion PendingCompletion;
+    QByteArray CommandOutput;
+    bool PrivateOutput{};
+
+    template<class W> W* Named(W* Widget, const char* Name, const Bi& Text) {
+        Widget->setObjectName(Name);
+        Translations.push_back([this, Widget, Text] { Widget->setText(T(Text)); });
+        return Widget;
+    }
+
+    BodyLabel* Label(const Bi& Text) {
+        return Named(new BodyLabel, "", Text);
+    }
+
+    QWidget* FileField(LineEdit*& Edit, const char* Name, const char* Filter) {
+        auto* Row = new QWidget;
+        auto* Layout = new QHBoxLayout(Row);
+        Layout->setContentsMargins(0, 0, 0, 0);
+        Edit = new LineEdit;
+        Edit->setObjectName(Name);
+        Layout->addWidget(Edit, 1);
+        auto* Browse = Named(new PushButton, "", {"Browse…", "浏览…"});
+        Layout->addWidget(Browse);
+        connect(Browse, &QPushButton::clicked, this, [this, Edit, Filter] {
+            const auto Path = QFileDialog::getSaveFileName(this, T({"Output file", "输出文件"}), Edit->text(), Filter);
+            if (!Path.isEmpty()) Edit->setText(Path);
+        });
+        return Row;
+    }
+
+    void SelectPage(int Index) {
+        Pages->setCurrentIndex(Index);
+        SharedFields->setVisible(Index <= 1);
+        for (int I = 0; I < Pages->count(); ++I)
+            Pages->widget(I)->setSizePolicy(QSizePolicy::Preferred, I == Index ? QSizePolicy::Preferred : QSizePolicy::Ignored);
+        Pages->updateGeometry();
+    }
 
     QString T(const Bi& Text) const {
         return Lang == UiLang::Chinese ? QString::fromUtf8(Text.Zh)
@@ -203,17 +277,25 @@ private:
 
     void BuildUi() {
         InputEdit = new LineEdit;
+        InputEdit->setObjectName("InputPath");
         OutputEdit = new LineEdit;
+        OutputEdit->setObjectName("OutputPath");
         PasswordEdit = new PasswordLineEdit;
+        PasswordEdit->setObjectName("BuildPassword");
         ShowPassword = new CheckBox;
         TraceCheck = new CheckBox;
         AntiDisasmCheck = new CheckBox;
         MutateCheck = new CheckBox;
         CompressCheck = new CheckBox;
         LicenseCheck = new CheckBox;
+        LicenseCheck->setObjectName("RequireLicense");
         WatermarkEdit = new LineEdit;
+        WatermarkEdit->setObjectName("Watermark");
+        CompressCheck->setObjectName("CompressPayload");
         LicensePublicKeyEdit = new LineEdit;
+        LicensePublicKeyEdit->setObjectName("ProtectionPublicKey");
         LicenseProductEdit = new LineEdit;
+        LicenseProductEdit->setObjectName("ProtectionProduct");
         BrowseLicenseKeyBtn = new PushButton(QString(), Fluent::IconType::FOLDER);
         connect(BrowseLicenseKeyBtn, &QPushButton::clicked, this, [this] {
             const auto Path = QFileDialog::getOpenFileName(this,
@@ -248,81 +330,95 @@ private:
             PasswordEdit->setEchoMode(Checked ? QLineEdit::Normal : QLineEdit::Password);
         });
 
-        const auto Shared = new QGridLayout;
+        SharedFields = new QWidget;
+        SharedFields->setObjectName("BuildFields");
+        const auto Shared = new QGridLayout(SharedFields);
         int Row = 0;
-        InputLabel = new QLabel;
+        InputLabel = new BodyLabel;
         Shared->addWidget(InputLabel, Row, 0);
         Shared->addWidget(InputEdit, Row, 1);
         Shared->addWidget(BrowseInputBtn, Row, 2);
-        OutputLabel = new QLabel;
+        OutputLabel = new BodyLabel;
         Shared->addWidget(OutputLabel, ++Row, 0);
         Shared->addWidget(OutputEdit, Row, 1);
         Shared->addWidget(BrowseOutputBtn, Row, 2);
-        PasswordLabel = new QLabel;
+        PasswordLabel = new BodyLabel;
         Shared->addWidget(PasswordLabel, ++Row, 0);
         Shared->addWidget(PasswordEdit, Row, 1);
         Shared->addWidget(ShowPassword, Row, 2);
-        Shared->addWidget(LicenseCheck, ++Row, 0, 1, 3);
-        LicensePublicKeyLabel = new QLabel;
-        Shared->addWidget(LicensePublicKeyLabel, ++Row, 0);
-        Shared->addWidget(LicensePublicKeyEdit, Row, 1);
-        Shared->addWidget(BrowseLicenseKeyBtn, Row, 2);
-        LicenseProductLabel = new QLabel;
-        Shared->addWidget(LicenseProductLabel, ++Row, 0);
-        Shared->addWidget(LicenseProductEdit, Row, 1, 1, 2);
-        LanguageLabel = new QLabel;
-        Shared->addWidget(LanguageLabel, ++Row, 0);
+        LicensePublicKeyLabel = new BodyLabel;
+        LicenseProductLabel = new BodyLabel;
+        LanguageLabel = new BodyLabel;
         LangToggleBtn = new PushButton;
+        LangToggleBtn->setObjectName("LanguageToggle");
         connect(LangToggleBtn, &QPushButton::clicked, this, [this] {
             Lang = Lang == UiLang::English ? UiLang::Chinese : UiLang::English;
             QSettings().setValue("Language", static_cast<int>(Lang));
             RetranslateUi();
         });
-        Shared->addWidget(LangToggleBtn, Row, 1, 1, 2);
         Shared->setColumnStretch(1, 1);
 
-        const auto Pages = new QStackedWidget;
+        Pages = new QStackedWidget;
         Pages->addWidget(BuildContainerPage());
         Pages->addWidget(BuildFunctionPage());
         Pages->addWidget(BuildDemoPage());
+        Licensing = new LicensePage;
+        Licensing->Run = [this](const QStringList& Args, LicensePage::Completion Callback) {
+            return Start(Args, Args.front(), std::move(Callback));
+        };
+        Licensing->ApplyProtection = [this](const QString& PublicKey, const QString& Product) {
+            LicensePublicKeyEdit->setText(PublicKey);
+            LicenseProductEdit->setText(Product);
+            LicenseCheck->setChecked(true);
+            NavSettingsBtn->click();
+        };
+        Pages->addWidget(Licensing);
+        RawCode = new RawCodePage;
+        RawCode->Run = [this](const QStringList& Args) { Start(Args, Args.front()); };
+        Pages->addWidget(RawCode);
+        Pages->addWidget(BuildSettingsPage());
 
-        // QFluent's NavigationBar renders in a compact icon strip without a
-        // public expand API, so the nav rail is plain checkable buttons with
-        // a selected highlight - visually consistent and fully controllable.
+        // Fluent toggle controls retain the full-width navigation labels.
         const auto Nav = new QWidget;
         Nav->setFixedWidth(200);
-        Nav->setStyleSheet(
-            "QPushButton { text-align: left; padding: 9px 14px; border: none; border-radius: 6px;"
-            "  color: #d7dae0; background-color: transparent; }"
-            "QPushButton:hover { background-color: #2a2d35; }"
-            "QPushButton:checked { background-color: #406eb4; color: white; }");
         const auto NavLayout = new QVBoxLayout(Nav);
         NavLayout->setContentsMargins(8, 8, 8, 8);
         NavLayout->setSpacing(4);
         const auto NavGroup = new QButtonGroup(this);
         NavGroup->setExclusive(true);
         const auto AddNavButton = [&](int Page) {
-            const auto Button = new QPushButton;
+            const auto Button = new ToggleButton;
             Button->setCheckable(true);
             NavGroup->addButton(Button);
             NavLayout->addWidget(Button);
-            connect(Button, &QPushButton::clicked, this, [this, Pages, Page] {
-                Pages->setCurrentIndex(Page);
+            connect(Button, &QPushButton::clicked, this, [this, Page] {
+                SelectPage(Page);
             });
             return Button;
         };
         NavContainerBtn = AddNavButton(0);
+        NavContainerBtn->setObjectName("ContainerPage");
         NavFunctionsBtn = AddNavButton(1);
+        NavFunctionsBtn->setObjectName("FunctionPage");
         NavDemoBtn = AddNavButton(2);
+        NavDemoBtn->setObjectName("DemoPage");
+        NavLicenseBtn = Named(AddNavButton(3), "LicensePage", {"License issuance", "卡密签发与验证"});
+        NavRawBtn = Named(AddNavButton(4), "RawPage", {"Raw machine code", "原始机器码分析"});
+        NavSettingsBtn = Named(AddNavButton(5), "ProtectionSettingsPage", {"Protection options", "保护选项"});
         NavContainerBtn->setChecked(true);
         NavLayout->addStretch(1);
+        NavLayout->addWidget(LanguageLabel);
+        NavLayout->addWidget(LangToggleBtn);
+        SelectPage(0);
 
-        Log = new QPlainTextEdit;
+        Log = new PlainTextEdit;
+        Log->setObjectName("CommandLog");
         Log->setReadOnly(true);
+        Log->setMaximumHeight(180);
         Log->setMaximumBlockCount(5000);
-        Log->setStyleSheet(
-            "QPlainTextEdit { font-family: Consolas, monospace; background-color: #181a1f;"
-            " color: #d7dae0; border: 1px solid #3a3f4b; border-radius: 4px; }");
+        QFont LogFont("Consolas");
+        LogFont.setStyleHint(QFont::Monospace);
+        Log->setFont(LogFont);
         // Fluent scrollbars (Qt ships default ones otherwise).
         Log->setVerticalScrollBar(new ScrollBar(Log));
         Log->setHorizontalScrollBar(new ScrollBar(Log));
@@ -332,26 +428,39 @@ private:
 
         const auto Body = new QWidget;
         const auto BodyLayout = new QVBoxLayout(Body);
-        BodyLayout->addLayout(Shared);
-        const auto PageScroll = new QScrollArea;
+        BodyLayout->addWidget(SharedFields);
+        const auto PageScroll = new ScrollArea;
         PageScroll->setWidgetResizable(true);
+        PageScroll->enableTransparentBackground();
         PageScroll->setFrameShape(QFrame::NoFrame);
         PageScroll->setMinimumHeight(180);
         PageScroll->setVerticalScrollBar(new ScrollBar(PageScroll));
         PageScroll->setHorizontalScrollBar(new ScrollBar(PageScroll));
         PageScroll->setWidget(Pages);
+        Pages->setAutoFillBackground(false);
         BodyLayout->addWidget(PageScroll, 1);
 
-        LogLabel = new QLabel;
+        LogLabel = new BodyLabel;
         const auto LogRow = new QHBoxLayout;
         LogRow->addWidget(LogLabel);
         LogRow->addStretch(1);
+        auto* SaveLog = Named(new PushButton, "SaveLog", {"Save log…", "保存日志…"});
+        auto* ClearLog = Named(new PushButton, "ClearLog", {"Clear", "清空"});
+        LogRow->addWidget(SaveLog);
+        LogRow->addWidget(ClearLog);
+        connect(ClearLog, &QPushButton::clicked, Log, &QPlainTextEdit::clear);
+        connect(SaveLog, &QPushButton::clicked, this, [this] {
+            const auto Path = QFileDialog::getSaveFileName(this, T({"Save log", "保存日志"}), QString(), "Text (*.txt);;All files (*)");
+            if (!Path.isEmpty()) SaveText(Path, Log->toPlainText().toUtf8());
+        });
         LogRow->addWidget(Ring);
         const auto Right = new QWidget;
         const auto RightLayout = new QVBoxLayout(Right);
         RightLayout->addWidget(Body, 1);
         RightLayout->addLayout(LogRow);
         RightLayout->addWidget(Log, 1);
+        StatusLabel = new CaptionLabel;
+        RightLayout->addWidget(StatusLabel);
 
         const auto Central = new QWidget;
         Central->setAutoFillBackground(true);
@@ -370,26 +479,54 @@ private:
 
         Runner = new QProcess(this);
         connect(Runner, &QProcess::readyReadStandardOutput, this, [this] {
-            AppendLog(QString::fromLocal8Bit(Runner->readAllStandardOutput()));
+            ReadOutput();
         });
         connect(Runner, &QProcess::readyReadStandardError, this, [this] {
-            AppendLog(QString::fromLocal8Bit(Runner->readAllStandardError()));
+            ReadOutput();
         });
-        connect(Runner, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
-            if (Runner->state() != QProcess::NotRunning) return;
+        connect(Runner, &QProcess::errorOccurred, this, [this](QProcess::ProcessError Error) {
+            if (Error != QProcess::FailedToStart || !Running) return;
+            PendingScanJson.clear();
+            CommandOutput += Runner->errorString().toUtf8();
             FinishRun(T({"failed to launch PeVm.exe", "\u65e0\u6cd5\u542f\u52a8 PeVm.exe"}));
         });
         connect(Runner, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                this, [this](int ExitCode, QProcess::ExitStatus) {
+                this, [this](int ExitCode, QProcess::ExitStatus ExitStatus) {
+            ReadOutput();
+            if (ExitStatus != QProcess::NormalExit) ExitCode = 1;
+            if (!PendingScanJson.isEmpty()) {
+                QFile Json(PendingScanJson);
+                const QFileInfo CurrentFile(InputEdit->text());
+                if (ExitCode == 0 && ExitStatus == QProcess::NormalExit && PendingScanGeneration == ScanGeneration &&
+                    CurrentFile.size() == ScannedFile.size() && CurrentFile.lastModified() == ScannedFile.lastModified()) {
+                    const bool Opened = Json.open(QIODevice::ReadOnly);
+                    const auto Data = Opened ? Json.readAll() : QByteArray{};
+                    if (!Opened || !Picker->Load(Data)) {
+                        AppendLog(T({"Invalid function scan result.\n", "函数扫描结果无效。\n"}));
+                        ExitCode = 1;
+                    } else ScanResult = Data;
+                }
+                PendingScanJson.clear();
+            }
             FinishRun(ExitCode == 0
                           ? T({"done", "\u5b8c\u6210"})
-                          : T({"exit code", "\u9000\u51fa\u7801"}) + QString(" %1").arg(ExitCode));
+                          : T({"exit code", "\u9000\u51fa\u7801"}) + QString(" %1").arg(ExitCode), ExitCode == 0);
+        });
+        connect(InputEdit, &QLineEdit::textChanged, this, [this] {
+            ++ScanGeneration;
+            ScanResult.clear();
+            Picker->Clear();
+            FunctionRvaEdit->clear();
+            MultiRvaEdit->clear();
         });
     }
 
     // Applies every visible text for the active language. Called once after
     // the widgets are built and on every language toggle.
     void RetranslateUi() {
+        for (const auto& Update : Translations) Update();
+        Licensing->SetChinese(Lang == UiLang::Chinese);
+        RawCode->SetChinese(Lang == UiLang::Chinese);
         InputLabel->setText(T({"Input", "\u8f93\u5165\u6587\u4ef6"}));
         OutputLabel->setText(T({"Output", "\u8f93\u51fa\u6587\u4ef6"}));
         PasswordLabel->setText(T({"Password", "\u53e3\u4ee4"}));
@@ -401,7 +538,7 @@ private:
         BrowseInputBtn->setText(T({"Browse...", "\u6d4f\u89c8..."}));
         BrowseOutputBtn->setText(T({"Browse...", "\u6d4f\u89c8..."}));
 
-        NavContainerBtn->setText(T({"Container & Wrapper", "\u5bb9\u5668\u4e0e\u5c01\u88c5"}));
+        NavContainerBtn->setText(T({"Container && Wrapper", "\u5bb9\u5668\u4e0e\u5c01\u88c5"}));
         NavFunctionsBtn->setText(T({"Function Virtualization", "\u51fd\u6570\u865a\u62df\u5316"}));
         NavDemoBtn->setText(T({"VM Demo", "VM \u6f14\u793a"}));
 
@@ -440,8 +577,8 @@ private:
             "仅接受 签名卡密，旧卡需重新签发。此设置不影响打包 / 解包。"}));
         LicensePublicKeyLabel->setText(T({"License public key", "卡密公钥"}));
         LicensePublicKeyEdit->setPlaceholderText(T({"Select a .pub file", "选择 .pub 公钥文件"}));
-        LicensePublicKeyEdit->setToolTip(T({"Generate keys with PeVm license-keygen; select the public file.",
-                                           "使用 PeVm license-keygen 生成密钥，然后选择公钥文件。"}));
+        LicensePublicKeyEdit->setToolTip(T({"Generate keys on the License issuance page; select the public file.",
+                                           "在卡密签发页生成密钥，然后选择公钥文件。"}));
         BrowseLicenseKeyBtn->setText(T({"Browse...", "浏览..."}));
         LicenseProductLabel->setText(T({"Product ID", "产品 ID"}));
         LicenseProductEdit->setPlaceholderText("my-product");
@@ -449,6 +586,8 @@ private:
                                          "区分大小写，必须与签发卡密时的产品 ID 一致。"}));
         AnalyzeBtn->setText(T({"Analyze / bridge test", "\u5206\u6790 / \u6865\u63a5\u6d4b\u8bd5"}));
         VirtualizeBtn->setText(T({"Virtualize function(s)", "\u865a\u62df\u5316\u51fd\u6570"}));
+        VirtualizeSelectedBtn->setText(T({"Virtualize checked", "虚拟化勾选函数"}));
+        Picker->SetChinese(Lang == UiLang::Chinese);
         MultiJsonBtn->setText(T({"Multi-function JSON", "\u591a\u51fd\u6570 JSON"}));
         ViewJsonBtn->setText(T({"View manifest JSON", "\u67e5\u770b\u6e05\u5355 JSON"}));
         ScanBtn->setText(T({"Scan functions", "\u626b\u63cf\u51fd\u6570"}));
@@ -476,7 +615,7 @@ private:
             "\u9010\u6307\u4ee4\u8ba4\u8bc1\u3002Trace \u9010\u6761\u6253\u5370\u865a\u62df\u6307\u4ee4\uff1b\u81ea\u6d4b\u4e0e native \u7ed3\u679c\u505a\u5dee\u5206\u3002"}));
 
         LogLabel->setText(T({"Log", "\u8fd0\u884c\u65e5\u5fd7"}));
-        statusBar()->showMessage(T({"Ready", "\u5c31\u7eea"}));
+        if (!Running) StatusLabel->setText(T({"Ready", "\u5c31\u7eea"}));
     }
 
     // Shared tail options appended to every protection command.
@@ -496,20 +635,27 @@ private:
     QWidget* BuildContainerPage() {
         const auto Page = new QWidget;
         const auto Layout = new QVBoxLayout(Page);
-        const auto Buttons = new QHBoxLayout;
+        const auto Buttons = new QGridLayout;
         WrapBtn = new PrimaryPushButton(QString(), Fluent::IconType::SAVE);
         PackBtn = new PrimaryPushButton(QString(), Fluent::IconType::SAVE);
         UnpackBtn = new PushButton(QString(), Fluent::IconType::SYNC);
         InspectBtn = new PushButton(QString(), Fluent::IconType::INFO);
         DumpBtn = new PushButton(QString(), Fluent::IconType::CODE);
-        Buttons->addWidget(WrapBtn);
-        Buttons->addWidget(PackBtn);
-        Buttons->addWidget(UnpackBtn);
-        Buttons->addWidget(InspectBtn);
-        Buttons->addWidget(DumpBtn);
-        Buttons->addStretch(1);
+        WrapBtn->setObjectName("Wrap");
+        PackBtn->setObjectName("Pack");
+        UnpackBtn->setObjectName("Unpack");
+        InspectBtn->setObjectName("Inspect");
+        DumpBtn->setObjectName("VmDump");
+        Buttons->addWidget(WrapBtn, 0, 0);
+        Buttons->addWidget(PackBtn, 0, 1);
+        Buttons->addWidget(UnpackBtn, 0, 2);
+        Buttons->addWidget(InspectBtn, 1, 0);
+        Buttons->addWidget(DumpBtn, 1, 1);
+        auto* Options = Named(new PushButton, "ContainerOptions", {"Protection options…", "保护选项…"});
+        Buttons->addWidget(Options, 1, 2);
+        connect(Options, &QPushButton::clicked, this, [this] { NavSettingsBtn->click(); });
         Layout->addLayout(Buttons);
-        ContainerDesc = new QLabel;
+        ContainerDesc = new BodyLabel;
         Layout->addWidget(ContainerDesc);
         Layout->addStretch(1);
         connect(WrapBtn, &QPushButton::clicked, this, [this] { RunProtection("wrap"); });
@@ -526,13 +672,76 @@ private:
         return Page;
     }
 
+    QWidget* BuildSettingsPage() {
+        const auto Page = new QWidget;
+        const auto Layout = new QVBoxLayout(Page);
+        Layout->addWidget(Label({"Shared wrapper / function protection options", "封装与函数虚拟化的共用选项"}));
+        auto* Help = Label({"Compression also applies to Pack. Watermark and licensing apply to Wrap and function protection. Choose the input and output on those pages, then run the desired operation.",
+                            "压缩也适用于容器打包。水印和卡密用于封装、函数虚拟化；设置后回到相应页面选择文件并运行。"});
+        Help->setWordWrap(true);
+        Layout->addWidget(Help);
+        Layout->addWidget(CompressCheck);
+        const auto Form = new QFormLayout;
+        WatermarkLabel = new BodyLabel;
+        Form->addRow(WatermarkLabel, WatermarkEdit);
+        Form->addRow(LicenseCheck);
+        auto* PublicRow = new QWidget;
+        auto* PublicLayout = new QHBoxLayout(PublicRow);
+        PublicLayout->setContentsMargins(0, 0, 0, 0);
+        PublicLayout->addWidget(LicensePublicKeyEdit, 1);
+        PublicLayout->addWidget(BrowseLicenseKeyBtn);
+        Form->addRow(LicensePublicKeyLabel, PublicRow);
+        Form->addRow(LicenseProductLabel, LicenseProductEdit);
+        Layout->addLayout(Form);
+        auto* Keys = Named(new PushButton, "OpenLicenseIssuance", {"Generate keys / issue licenses…", "生成密钥 / 签发卡密…"});
+        Layout->addWidget(Keys);
+        connect(Keys, &QPushButton::clicked, this, [this] { NavLicenseBtn->click(); });
+        Layout->addStretch(1);
+        return Page;
+    }
+
     QWidget* BuildFunctionPage() {
         const auto Page = new QWidget;
         const auto Layout = new QVBoxLayout(Page);
+        const auto ScanRow = new QHBoxLayout;
+        ScanBtn = new PushButton(QString(), Fluent::IconType::INFO);
+        ScanBtn->setObjectName("ScanFunctions");
+        VirtualizeSelectedBtn = new PrimaryPushButton(QString(), Fluent::IconType::PLAY);
+        VirtualizeSelectedBtn->setObjectName("VirtualizeSelected");
+        ProtectAllBtn = new PushButton(QString(), Fluent::IconType::PLAY);
+        ProtectAllBtn->setObjectName("ProtectAll");
+        ScanRow->addWidget(ScanBtn);
+        ScanRow->addWidget(VirtualizeSelectedBtn);
+        ScanRow->addWidget(ProtectAllBtn);
+        Layout->addLayout(ScanRow);
+        Picker = new FunctionPicker;
+        Picker->SelectionChanged = [this] { VirtualizeSelectedBtn->setEnabled(!Running && !Picker->Rvas().isEmpty()); };
+        Picker->SymbolsChanged = [this] { ++ScanGeneration; ScanResult.clear(); };
+        VirtualizeSelectedBtn->setEnabled(false);
+        Layout->addWidget(Picker);
+        const auto ScanOptions = new QFormLayout;
+        ScanMinimum = new SpinBox;
+        ScanMinimum->setObjectName("ScanMinimumBytes");
+        ScanMinimum->setRange(0, INT_MAX);
+        ScanOptions->addRow(Label({"Scan minimum bytes", "扫描最小字节数"}), ScanMinimum);
+        connect(ScanMinimum, &QSpinBox::valueChanged, this, [this] { ++ScanGeneration; Picker->Clear(); ScanResult.clear(); });
+        ScanOptions->addRow(Label({"Scan JSON export", "扫描 JSON 导出路径"}), FileField(ScanExportEdit, "ScanExportPath", "JSON (*.json);;All files (*)"));
+        auto* Export = Named(new PushButton, "ExportScan", {"Export current scan", "导出当前扫描"});
+        ScanOptions->addRow(Export);
+        connect(Export, &QPushButton::clicked, this, [this] {
+            if (ScanResult.isEmpty()) { NotifyError({"No scan", "没有扫描结果"}, {"Scan functions first.", "请先扫描函数。"}); return; }
+            auto Path = ScanExportEdit->text().trimmed();
+            if (Path.isEmpty()) Path = QFileDialog::getSaveFileName(this, T({"Export scan", "导出扫描"}), QString(), "JSON (*.json)");
+            if (!Path.isEmpty() && SaveText(Path, ScanResult)) ScanExportEdit->setText(Path);
+        });
+        ScanOptions->addRow(Label({"Manifest JSON (optional)", "清单 JSON 路径（可选）"}), FileField(ManifestEdit, "ManifestPath", "JSON (*.json);;All files (*)"));
+        Layout->addLayout(ScanOptions);
         FunctionForm = new QFormLayout;
         FunctionRvaEdit = new LineEdit;
-        FunctionRvaEdit->setText("0x1000");
+        FunctionRvaEdit->setObjectName("FunctionRvas");
+        FunctionRvaEdit->setPlaceholderText("0x1000, 0x1234");
         LiftSeedEdit = new LineEdit;
+        LiftSeedEdit->setObjectName("FunctionSeed");
         LiftSeedEdit->setText("12345");
         BridgeRcx = new LineEdit;
         BridgeRcx->setText("0");
@@ -543,74 +752,87 @@ private:
         BridgeR9 = new LineEdit;
         BridgeR9->setText("0");
         MultiRvaEdit = new LineEdit;
-        MultiRvaEdit->setText("0x1000, 0x1010");
-        RvaLabel = new QLabel;
+        MultiRvaEdit->setObjectName("MultiRvas");
+        BridgeRcx->setObjectName("BridgeRcx");
+        BridgeRdx->setObjectName("BridgeRdx");
+        BridgeR8->setObjectName("BridgeR8");
+        BridgeR9->setObjectName("BridgeR9");
+        MultiRvaEdit->setPlaceholderText("0x1000, 0x1010");
+        RvaLabel = new BodyLabel;
         FunctionForm->addRow(RvaLabel, FunctionRvaEdit);
-        SeedLabel = new QLabel;
+        SeedLabel = new BodyLabel;
         FunctionForm->addRow(SeedLabel, LiftSeedEdit);
-        RcxLabel = new QLabel;
+        RcxLabel = new BodyLabel;
         FunctionForm->addRow(RcxLabel, BridgeRcx);
-        RdxLabel = new QLabel;
+        RdxLabel = new BodyLabel;
         FunctionForm->addRow(RdxLabel, BridgeRdx);
-        R8Label = new QLabel;
+        R8Label = new BodyLabel;
         FunctionForm->addRow(R8Label, BridgeR8);
-        R9Label = new QLabel;
+        R9Label = new BodyLabel;
         FunctionForm->addRow(R9Label, BridgeR9);
-        MultiRvaLabel = new QLabel;
+        MultiRvaLabel = new BodyLabel;
         FunctionForm->addRow(MultiRvaLabel, MultiRvaEdit);
         Layout->addLayout(FunctionForm);
         const auto OptionsRow = new QHBoxLayout;
         OptionsRow->addWidget(AntiDisasmCheck);
         OptionsRow->addWidget(MutateCheck);
-        OptionsRow->addWidget(CompressCheck);
-        WatermarkLabel = new QLabel;
-        OptionsRow->addWidget(WatermarkLabel);
-        OptionsRow->addWidget(WatermarkEdit, 1);
+        FunctionTrace = Named(new CheckBox, "FunctionTrace", {"Bridge trace", "桥接执行跟踪"});
+        OptionsRow->addWidget(FunctionTrace);
         Layout->addLayout(OptionsRow);
+        const auto AllOptions = new QFormLayout;
+        AllowMemoryCheck = Named(new CheckBox, "AllowMemory", {"Protect ALL: allow VM memory operands", "全量虚拟化：允许 VM 内存操作数"});
+        AllowMemoryCheck->setToolTip(T({"VM offsets, not native pointers; applies to Protect ALL only.", "操作数按 VM 偏移处理；仅适用于全量虚拟化。"}));
+        ProtectMinimum = new SpinBox;
+        ProtectMinimum->setObjectName("ProtectMinimumBytes");
+        ProtectMinimum->setRange(0, INT_MAX);
+        ProtectMinimum->setValue(16);
+        AllOptions->addRow(AllowMemoryCheck);
+        AllOptions->addRow(Label({"Protect ALL minimum bytes", "全量虚拟化最小字节数"}), ProtectMinimum);
+        auto* Options = Named(new PushButton, "FunctionOptions", {"Compression / watermark / licensing…", "压缩 / 水印 / 卡密选项…"});
+        AllOptions->addRow(Options);
+        connect(Options, &QPushButton::clicked, this, [this] { NavSettingsBtn->click(); });
+        Layout->addLayout(AllOptions);
 
         const auto Buttons = new QGridLayout;
         AnalyzeBtn = new PushButton(QString(), Fluent::IconType::CODE);
         VirtualizeBtn = new PrimaryPushButton(QString(), Fluent::IconType::PLAY);
         MultiJsonBtn = new PushButton(QString(), Fluent::IconType::INFO);
         ViewJsonBtn = new PushButton(QString(), Fluent::IconType::INFO);
-        ScanBtn = new PushButton(QString(), Fluent::IconType::INFO);
-        ProtectAllBtn = new PrimaryPushButton(QString(), Fluent::IconType::PLAY);
+        AnalyzeBtn->setObjectName("AnalyzeFunction");
+        VirtualizeBtn->setObjectName("VirtualizeManual");
+        MultiJsonBtn->setObjectName("MultiJson");
+        ViewJsonBtn->setObjectName("ViewJson");
         Buttons->addWidget(AnalyzeBtn, 0, 0);
         Buttons->addWidget(VirtualizeBtn, 0, 1);
         Buttons->addWidget(MultiJsonBtn, 1, 0);
         Buttons->addWidget(ViewJsonBtn, 1, 1);
-        Buttons->addWidget(ScanBtn, 2, 0);
-        Buttons->addWidget(ProtectAllBtn, 2, 1);
         Layout->addLayout(Buttons);
-        FunctionDesc = new QLabel;
+        FunctionDesc = new BodyLabel;
         Layout->addWidget(FunctionDesc);
         Layout->addStretch(1);
 
         connect(AnalyzeBtn, &QPushButton::clicked, this, [this] {
             if (!RequireInput() || !RequireRva(FunctionRvaEdit->text())) return;
             const auto Manifest = ManifestPath(".vm2.json");
-            Start({ "lift-x64", Quote(InputEdit->text()), Quote(FunctionRvaEdit->text()), Quote(Manifest),
+            if (!RequireSeparateOutput(Manifest)) return;
+            QStringList Args{ "lift-x64", Quote(InputEdit->text()), Quote(FunctionRvaEdit->text()), Quote(Manifest),
                     Quote(SeedOr("12345")),
                     "--rcx=" + BridgeRcx->text(), "--rdx=" + BridgeRdx->text(),
-                    "--r8=" + BridgeR8->text(), "--r9=" + BridgeR9->text() },
-                  "lift-x64");
+                    "--r8=" + BridgeR8->text(), "--r9=" + BridgeR9->text() };
+            if (FunctionTrace->isChecked()) Args << "--trace";
+            Start(Args, "lift-x64");
         });
         connect(VirtualizeBtn, &QPushButton::clicked, this, [this] {
-            if (!RequireProtection()) return;
-            const auto Rvas = SplitRvas(FunctionRvaEdit->text());
-            if (Rvas.empty()) {
-                NotifyError({"Missing input", "\u7f3a\u5c11\u8f93\u5165"},
-                            {"Enter at least one function RVA.", "\u8bf7\u586b\u5199\u81f3\u5c11\u4e00\u4e2a\u51fd\u6570 RVA\u3002"});
+            VirtualizeRvas(SplitRvas(FunctionRvaEdit->text()));
+        });
+        connect(VirtualizeSelectedBtn, &QPushButton::clicked, this, [this] {
+            const QFileInfo CurrentFile(InputEdit->text());
+            if (CurrentFile.size() != ScannedFile.size() || CurrentFile.lastModified() != ScannedFile.lastModified()) {
+                Picker->Clear();
+                NotifyError({"Input changed", "输入文件已变化"}, {"Scan the input again before selecting functions.", "请重新扫描后再选择函数。"});
                 return;
             }
-            QStringList Arguments{ Rvas.size() == 1 ? "protect-function" : "protect-functions",
-                                   Quote(InputEdit->text()), Quote(OutputOr(".protected.exe")),
-                                   Quote(PasswordEdit->text()) };
-            for (const auto& Rva : Rvas) Arguments << Quote(Rva);
-            if (Rvas.size() == 1) Arguments << Quote(SeedOr("12345"));
-            else Arguments << "--seed=" + SeedOr("12345");
-            Arguments << ProtectionOptions();
-            Start(Arguments, Rvas.size() == 1 ? "protect-function" : "protect-functions");
+            VirtualizeRvas(Picker->Rvas());
         });
         connect(MultiJsonBtn, &QPushButton::clicked, this, [this] {
             if (!RequireInput()) return;
@@ -621,13 +843,27 @@ private:
                 return;
             }
             const auto Manifest = ManifestPath(".multi.json");
+            if (!RequireSeparateOutput(Manifest)) return;
             QStringList Arguments{ "lift-x64-multi", Quote(InputEdit->text()), Quote(Manifest) };
             for (const auto& Rva : Rvas) Arguments << Rva;
             Start(Arguments, "lift-x64-multi");
         });
         connect(ScanBtn, &QPushButton::clicked, this, [this] {
-            if (!RequireInput()) return;
-            Start({ "scan-functions", Quote(InputEdit->text()) }, "scan-functions");
+            if (Running || !RequireInput()) return;
+            Picker->Clear();
+            ScanResult.clear();
+            if (!ScanDirectory.isValid()) {
+                NotifyError({"Scan failed", "扫描失败"}, {"Cannot create a temporary scan directory.", "无法创建扫描临时目录。"});
+                return;
+            }
+            PendingScanJson = ScanDirectory.filePath("functions.json");
+            PendingScanGeneration = ScanGeneration;
+            ScannedFile = QFileInfo(InputEdit->text());
+            ScannedFile.size(); // Cache identity before the child starts.
+            ScannedFile.lastModified();
+            QStringList Arguments{"scan-functions", InputEdit->text(), PendingScanJson, "--min-bytes=" + QString::number(ScanMinimum->value())};
+            if (!Picker->PdbPath().isEmpty()) Arguments << "--pdb=" + Picker->PdbPath();
+            if (!Start(Arguments, "scan-functions")) PendingScanJson.clear();
         });
         connect(ProtectAllBtn, &QPushButton::clicked, this, [this] {
             if (!RequireProtection()) return;
@@ -635,6 +871,8 @@ private:
                                    Quote(OutputOr(".protected.exe")), Quote(PasswordEdit->text()),
                                    Quote(SeedOr("12345")) };
             Arguments << ProtectionOptions();
+            Arguments << "--min-bytes=" + QString::number(ProtectMinimum->value());
+            if (AllowMemoryCheck->isChecked()) Arguments << "--allow-mem";
             Start(Arguments, "protect-all");
         });
         connect(ViewJsonBtn, &QPushButton::clicked, this, [this] {
@@ -659,34 +897,60 @@ private:
         const auto Layout = new QVBoxLayout(Page);
         DemoForm = new QFormLayout;
         DemoInput = new LineEdit;
+        DemoInput->setObjectName("DemoInput");
         DemoInput->setText("10");
         DemoSeed = new LineEdit;
+        DemoSeed->setObjectName("DemoSeed");
         DemoSeed->setText("12345");
-        VmInputLabel = new QLabel;
+        VmInputLabel = new BodyLabel;
         DemoForm->addRow(VmInputLabel, DemoInput);
-        DemoSeedLabel = new QLabel;
+        DemoSeedLabel = new BodyLabel;
         DemoForm->addRow(DemoSeedLabel, DemoSeed);
         Layout->addLayout(DemoForm);
         Layout->addWidget(TraceCheck);
+        TraceCheck->setObjectName("DemoTrace");
         const auto Buttons = new QHBoxLayout;
         FactorialBtn = new PrimaryPushButton(QString(), Fluent::IconType::PLAY);
         CallMemoryBtn = new PushButton(QString(), Fluent::IconType::PLAY);
         SelfTestBtn = new PushButton(QString(), Fluent::IconType::INFO);
+        FactorialBtn->setObjectName("FactorialDemo");
+        CallMemoryBtn->setObjectName("CallMemoryDemo");
+        SelfTestBtn->setObjectName("Vm2SelfTest");
         Buttons->addWidget(FactorialBtn);
         Buttons->addWidget(CallMemoryBtn);
         Buttons->addWidget(SelfTestBtn);
         Buttons->addStretch(1);
         Layout->addLayout(Buttons);
-        DemoDesc = new QLabel;
+        DemoDesc = new BodyLabel;
         Layout->addWidget(DemoDesc);
+        const auto KeyForm = new QFormLayout;
+        DemoPassword = new PasswordLineEdit;
+        DemoPassword->setObjectName("DemoPassword");
+        KeyForm->addRow(Label({"Key-VM password", "密钥 VM 口令"}), DemoPassword);
+        Layout->addLayout(KeyForm);
+        const auto KeyButtons = new QHBoxLayout;
+        auto* KeyDemo = Named(new PushButton, "KeyVmDemo", {"Key-VM demo", "密钥 VM 演示"});
+        auto* FullTest = Named(new PushButton, "FullSelfTest", {"Full self-test", "完整自检"});
+        KeyButtons->addWidget(KeyDemo);
+        KeyButtons->addWidget(FullTest);
+        Layout->addLayout(KeyButtons);
+        connect(KeyDemo, &QPushButton::clicked, this, [this] {
+            if (DemoPassword->text().isEmpty()) { NotifyError({"Missing password", "缺少口令"}, {"Enter a Key-VM password.", "请填写密钥 VM 口令。"}); return; }
+            Start({"vm-demo", DemoPassword->text()}, "vm-demo");
+        });
+        connect(FullTest, &QPushButton::clicked, this, [this] { Start({"self-test"}, "self-test"); });
         Layout->addStretch(1);
         connect(FactorialBtn, &QPushButton::clicked, this, [this] {
             const auto Value = DemoInput->text().isEmpty() ? "10" : DemoInput->text();
-            Start({ "virtualize-demo", Value, SeedOr("12345") }, "virtualize-demo");
+            QStringList Args{"virtualize-demo", Value, DemoSeed->text().trimmed().isEmpty() ? "12345" : DemoSeed->text().trimmed()};
+            if (TraceCheck->isChecked()) Args << "--trace";
+            Start(Args, "virtualize-demo");
         });
         connect(CallMemoryBtn, &QPushButton::clicked, this, [this] {
             const auto Value = DemoInput->text().isEmpty() ? "10" : DemoInput->text();
-            Start({ "call-memory-demo", Value, SeedOr("12345") }, "call-memory-demo");
+            QStringList Args{"call-memory-demo", Value, DemoSeed->text().trimmed().isEmpty() ? "12345" : DemoSeed->text().trimmed()};
+            if (TraceCheck->isChecked()) Args << "--trace";
+            Start(Args, "call-memory-demo");
         });
         connect(SelfTestBtn, &QPushButton::clicked, this, [this] {
             Start({ "vm2-self-test" }, "vm2-self-test");
@@ -705,6 +969,7 @@ private:
     }
 
     QString ManifestPath(const QString& Suffix) const {
+        if (!ManifestEdit->text().trimmed().isEmpty()) return ManifestEdit->text().trimmed();
         const auto Text = OutputEdit->text().trimmed();
         return Text.isEmpty() ? InputEdit->text() + Suffix : Text + Suffix;
     }
@@ -775,22 +1040,42 @@ private:
         Start(Arguments, Verb);
     }
 
-    void Start(const QStringList& Arguments, const QString& Title) {
+    void VirtualizeRvas(const QStringList& Rvas) {
+        if (!RequireProtection()) return;
+        if (Rvas.isEmpty()) {
+            NotifyError({"No functions selected", "未选择函数"},
+                        {"Check one or more functions, or enter RVAs manually.", "请勾选一个或多个函数，或手动填写 RVA。"});
+            return;
+        }
+        QStringList Arguments{Rvas.size() == 1 ? "protect-function" : "protect-functions",
+                              InputEdit->text(), OutputOr(".protected.exe"), PasswordEdit->text()};
+        Arguments << Rvas;
+        Arguments << (Rvas.size() == 1 ? SeedOr("12345") : "--seed=" + SeedOr("12345"));
+        Arguments << ProtectionOptions();
+        Start(Arguments, Arguments.front());
+    }
+
+    bool Start(const QStringList& Arguments, const QString& Title, LicensePage::Completion Completion = {}) {
         if (Running) {
             NotifyInfo({"Busy", "\u5fd9\u788c"},
                        {"Wait for the running command to finish.", "\u8bf7\u7b49\u5f85\u5f53\u524d\u547d\u4ee4\u5b8c\u6210\u3002"});
-            return;
+            return false;
         }
         const auto Program = PevmPath();
         if (!QFileInfo::exists(Program)) {
             NotifyError({"PeVm.exe missing", "\u627e\u4e0d\u5230 PeVm.exe"},
                         {"PeVm.exe must sit next to the GUI executable.",
                          "PeVm.exe \u5fc5\u987b\u4e0e GUI \u4f4d\u4e8e\u540c\u4e00\u76ee\u5f55\u3002"});
-            return;
+            return false;
         }
         Running = true;
+        PendingCompletion = std::move(Completion);
+        CommandOutput.clear();
+        PrivateOutput = Arguments.front() == "license-issue";
+        Licensing->setEnabled(false);
+        VirtualizeSelectedBtn->setEnabled(false);
         Ring->show();
-        statusBar()->showMessage(T({"Running: ", "\u8fd0\u884c\u4e2d: "}) + Title);
+        StatusLabel->setText(T({"Running: ", "\u8fd0\u884c\u4e2d: "}) + Title);
         auto LogArguments = Arguments;
         if (!LogArguments.isEmpty()) {
             const auto& Command = LogArguments.front();
@@ -799,26 +1084,69 @@ private:
                  Command == "protect-all") && LogArguments.size() > 3) {
                 LogArguments[3] = "<redacted>";
             }
+            if (Command == "vm-demo" && LogArguments.size() > 1) LogArguments[1] = "<redacted>";
         }
         AppendLog("PeVm " + LogArguments.join(' ') + "\n");
         Started = std::chrono::steady_clock::now();
         Runner->start(Program, Arguments);
+        return true;
     }
 
-    void FinishRun(const QString& Outcome) {
+    void ReadOutput() {
+        const auto Stdout = Runner->readAllStandardOutput();
+        const auto Stderr = Runner->readAllStandardError();
+        if (PendingCompletion) {
+            // License command results are small; trace output never accumulates here.
+            const qsizetype Room = 65536 - CommandOutput.size();
+            if (Room > 0) CommandOutput += (Stdout + Stderr).left(Room);
+        }
+        if (!PrivateOutput) AppendLog(QString::fromLocal8Bit(Stdout));
+        AppendLog(QString::fromLocal8Bit(Stderr));
+    }
+
+    void FinishRun(const QString& Outcome, bool Success = false) {
         const auto Millis = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - Started).count();
         AppendLog(QString("---- %1 (%2 ms) ----\n\n").arg(Outcome).arg(Millis));
         Ring->hide();
-        statusBar()->showMessage(Outcome + QString(" (%1 ms)").arg(Millis));
+        StatusLabel->setText(Outcome + QString(" (%1 ms)").arg(Millis));
         Running = false;
+        Licensing->setEnabled(true);
+        VirtualizeSelectedBtn->setEnabled(!Picker->Rvas().isEmpty());
         if (Outcome == T({"done", "\u5b8c\u6210"})) {
             NotifyInfo({"Finished", "\u5b8c\u6210"},
                        QString(T({"Command completed in %1 ms.", "\u547d\u4ee4\u5df2\u5728 %1 ms \u5185\u5b8c\u6210\u3002"})).arg(Millis));
         }
+        auto Callback = std::move(PendingCompletion);
+        PendingCompletion = {};
+        const auto Output = std::move(CommandOutput);
+        if (Callback) Callback(Success, Output);
+    }
+
+    bool RequireSeparateOutput(const QString& Path) {
+        const QFileInfo Output(Path), Input(InputEdit->text());
+        const auto OutputPath = Output.exists() ? Output.canonicalFilePath() : Output.absoluteFilePath();
+        const auto InputPath = Input.exists() ? Input.canonicalFilePath() : Input.absoluteFilePath();
+        if (OutputPath.compare(InputPath, Qt::CaseInsensitive) == 0) {
+            NotifyError({"Invalid output", "输出路径无效"}, {"Export must not replace the input file.", "导出路径不能覆盖输入文件。"});
+            return false;
+        }
+        return true;
+    }
+
+    bool SaveText(const QString& Path, const QByteArray& Data) {
+        if (!RequireSeparateOutput(Path)) return false;
+        QSaveFile File(Path);
+        if (!File.open(QIODevice::WriteOnly) || File.write(Data) != Data.size() || !File.commit()) {
+            NotifyError({"Save failed", "保存失败"}, {"Cannot write the selected output file.", "无法写入所选输出文件。"});
+            return false;
+        }
+        AppendLog(T({"Saved: ", "已保存："}) + Path + "\n");
+        return true;
     }
 
     void AppendLog(const QString& Text) {
+        Log->moveCursor(QTextCursor::End);
         Log->insertPlainText(Text);
         Log->moveCursor(QTextCursor::End);
     }

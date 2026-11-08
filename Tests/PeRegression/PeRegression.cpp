@@ -303,6 +303,45 @@ void ContainerTests() {
     }
     Reject("invalid PE before packing", [&] { PackContainer(Bytes(64), "snapshot-password"); });
 }
+void FunctionNameTests() {
+    auto Data = MakePe();
+    Data.resize(0x680);
+    Put(Data, Nt + 12, 0x600); Put(Data, Nt + 16, 2);
+    // A long, decorated COFF function name followed by its function aux record.
+    Put(Data, 0x604, 4); Put(Data, 0x608, 0x10);
+    Put(Data, 0x60c, 1, 2); Put(Data, 0x60e, 0x20, 2);
+    Put(Data, 0x610, IMAGE_SYM_CLASS_EXTERNAL, 1); Put(Data, 0x611, 1, 1);
+    Put(Data, 0x616, 12);
+    Put(Data, 0x624, 0x40); Text(Data, 0x628, "?Named@@YAHH@Z");
+    const auto Functions = x64lift::ScanFunctions(ImageView(Data), 0);
+    Check(Functions.size() == 1 && Functions[0].Rva == 0x1010 && Functions[0].Size == 12,
+          "COFF function address and aux size");
+    Check(Functions[0].Name.find("Named(int)") != std::string::npos && Functions[0].NameSource == "coff" &&
+          Functions[0].DecoratedName == "?Named@@YAHH@Z", "COFF function demangled with original name");
+    Check(x64lift::ScanFunctions(ImageView(Data), 16).empty(), "minimum size filters COFF functions");
+    auto Broken = Data; Put(Broken, 0x611, 2, 1);
+    Reject("COFF aux overrun", [&] { x64lift::ScanFunctions(ImageView(Broken), 0); });
+    Broken = Data; Put(Broken, 0x604, 0x40);
+    Reject("COFF string offset overrun", [&] { x64lift::ScanFunctions(ImageView(Broken), 0); });
+    Broken = Data; Put(Broken, Nt + 16, UINT32_MAX);
+    Reject("COFF table count overrun", [&] { x64lift::ScanFunctions(ImageView(Broken), 0); });
+    Broken = Data; Put(Broken, 0x60c, 2, 2);
+    Check(x64lift::ScanFunctions(ImageView(Broken), 0).empty(), "COFF non-code symbol excluded");
+    auto Exports = WithFunctions();
+    Text(Exports, 0x4a0, "A\"\\\n");
+    x64lift::FunctionScanResult Result;
+    Result.Functions = x64lift::ScanFunctions(ImageView(Exports), 0);
+    Result.Diagnostics = {"line\nquote\"slash\\"};
+    const auto Json = x64lift::FunctionScanJson(Result);
+    Check(Json.find("A\\\"\\\\\\u000a") != std::string::npos &&
+          Json.find("line\\u000aquote\\\"slash\\\\") != std::string::npos, "scan JSON escapes names and diagnostics");
+    Exports = WithFunctions(); Put(Exports, 0x484, 0x1000);
+    const auto Aliases = x64lift::ScanFunctions(ImageView(Exports), 0);
+    Check(Aliases.size() == 1 && Aliases[0].Aliases.size() == 2, "export aliases share one selectable RVA");
+    Exports = WithFunctions(); Put(Exports, 0x440 + 24, 0);
+    const auto Ordinals = x64lift::ScanFunctions(ImageView(Exports), 0);
+    Check(Ordinals.size() == 1 && Ordinals[0].Name.empty(), "ordinal-only export retained without invented name");
+}
 void FileTests() {
     namespace fs = std::filesystem;
     const auto Root = fs::temp_directory_path() / (L"pevm-io-test-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
@@ -328,7 +367,7 @@ void FileTests() {
 }
 int main() {
     try {
-        ParserTests(); LayoutTests(); RelocationTests(); ResourceTests(); LifterTests(); ContainerTests(); FileTests();
+        ParserTests(); LayoutTests(); RelocationTests(); ResourceTests(); LifterTests(); FunctionNameTests(); ContainerTests(); FileTests();
         std::cout << "PE architecture regression: " << Checks << " checks passed\n";
         return 0;
     } catch (const std::exception& Error) {

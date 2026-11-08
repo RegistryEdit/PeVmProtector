@@ -77,13 +77,41 @@ bin\Release\VmRegression.exe --benchmark
   platforms/imageformats plugins are copied automatically after build.
 - GUI theming uses `Theme::setThemeMode(Fluent::ThemeMode::DARK)`; controls
   are QFluent `PushButton`/`PrimaryPushButton`/`LineEdit`/`PasswordLineEdit`/
-  `CheckBox`/`IndeterminateProgressRing`, notifications use `InfoBar`.
+  `CheckBox`/`IndeterminateProgressRing`, notifications use `InfoBar`. Navigation uses
+  `ToggleButton`; function selection uses `TableWidget`; labels, logs and scrolling
+  use `BodyLabel`/`CaptionLabel`, `PlainTextEdit` and `ScrollArea`/`ScrollBar`.
 - The GUI does not use moc: all signal connections are lambdas and the
   projects are plain vcxproj.
 - UI language: English / 中文 one-click switching (persisted via QSettings).
 - Code style: every identifier (types, functions, variables, parameters) is
   PascalCase across the codebase, file and directory names included; Windows/
   Qt/STL API names, entry points and string literals stay as-is.
+
+### Select individual functions and resolve names
+
+In **Function Virtualization**, click **Scan functions**, search by name or RVA,
+check the desired rows, then click **Virtualize checked**. The checkbox state
+controls the build; filtering retains checks on hidden rows and the counter
+includes them. Scans start with no functions selected. Changing the input or
+PDB clears stale choices. Manual RVA input remains available separately.
+
+Names are recovered from PE exports, COFF function symbols and a matching local
+PDB. PDBs are searched beside the input (including the recorded PDB filename)
+and at the recorded build path; **Browse PDB** selects a different local file.
+PDB GUID and age must match the PE. C++ names are demangled; original decorated
+names and aliases appear in tooltips and scan JSON. An unavailable/mismatched
+PDB is reported; unknown names remain `sub_RVA`, rather than invented names.
+Inlined/removed functions and stripped binaries may have no recoverable name.
+The GUI and CLI scanner include small functions by default; `--min-bytes=N`
+can filter known sizes. The existing `protect-all` discovery policy is unchanged.
+
+```powershell
+bin\Release\PeVm.exe scan-functions app.exe functions.json --pdb=C:\symbols\app.pdb
+bin\Release\PeVm.exe protect-functions app.exe selected.exe "build key" 0x1000 0x1234 --seed=12345
+```
+
+A name or checkbox does not imply that the x64 lifter supports that function.
+Unsupported selected instructions still fail with an explicit error.
 
 ## Usage
 
@@ -109,14 +137,42 @@ bin\Release\PeVm.exe license-keygen issuer.private issuer.pub
 bin\Release\PeVm.exe license-issue issuer.private 30 --machine=<64hex> --product=my-product --output=customer.license
 ```
 
-The GUI is a Qt6 front-end (QProcess driving the sibling `PeVm.exe`):
-input/output/password shared area at the top (drag-and-drop onto the input
-box, automatic output suggestion, password visibility toggle), a Fluent nav
-rail on the left, three pages (Container & Wrapper / Function Virtualization /
-VM Demo), a monospace log pane, busy indicator and a status bar with per-step
-timing. The function page accepts multiple RVAs (comma-separated switches to
-`protect-functions`) and offers Scan functions (auto-discovery) and Protect
-ALL (full virtualization) buttons.
+The GUI is a bilingual Qt6 / QFluent front-end driving the sibling `PeVm.exe`
+with QProcess. All 22 existing CLI commands have GUI entries:
+
+| Page | Operations |
+| --- | --- |
+| Container & Wrapper | `wrap`, `pack`, `unpack`, `inspect`, `vm-dump` |
+| Function Virtualization | `scan-functions`, `protect-function`, `protect-functions`, `protect-all`, `lift-x64`, `lift-x64-multi` |
+| License issuance | `license-keygen`, `license-export-public`, `license-machine-id`, `license-issue`, `license-verify` |
+| Raw machine code | `lift-raw`, with entry RVA, seed, RCX/RDX/R8/R9 and trace |
+| VM Demo | `virtualize-demo`, `call-memory-demo`, `vm-demo`, `vm2-self-test`, `self-test` |
+| Protection options | Shared compression, watermark, signed-license public key and product ID |
+
+Input/output/password fields appear on the container and function pages;
+drag-and-drop, automatic output suggestion and password visibility remain
+available. Function selection supports checked rows and manual comma-separated
+RVAs. The function page also exposes scan and Protect ALL minimum sizes,
+Protect ALL's `--allow-mem`, bridge trace, explicit manifest paths and export
+of the current scan JSON. Blank manifest paths use the previous suffix-based
+defaults. Demo seed/trace are independent of function analysis settings.
+
+For licensing, choose **new** private/public file paths and generate a pair,
+or open existing keys. Enter the product ID, customer machine ID and days
+(0 = perpetual), then issue a license. A blank license path displays the card
+for copying; a new file path also saves it. Verification uses the selected
+license file and defaults to this machine when its ID field is blank.
+**Use for protection** transfers the public key and product ID into Protection
+options and enables licensing. Private keys use the current Windows user's
+DPAPI; existing key/license files are never overwritten. See
+[Licensing](Docs/Licensing.md) for deployment and recovery details.
+
+The shared log supports clear/save, busy status and command timing. Build and
+Key-VM passwords are redacted from command logs; issued card text appears only
+in the license result field. `GuiFeatures.exe` exercises every command through
+the real GUI, verifies the license lifecycle and a licensed wrapper execution,
+and saves bilingual offscreen page renders under `bin/Release/TestArtifacts/GuiFeatures`.
+It runs as part of `Tests/RunTests.ps1`; pass `-QtDir` when using another Qt kit.
 
 `pack`, `wrap` and `protect-*` print a detailed build transcript by default.
 Stages flush immediately, including when the CLI is launched by the GUI:

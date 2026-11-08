@@ -1,7 +1,8 @@
 # PeVmProtector test runner (replacement for the retired ctest suite).
 # Usage:  powershell -ExecutionPolicy Bypass -File Tests\RunTests.ps1 [-Configuration Release]
 param(
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [string]$QtDir = 'D:\Qt\6.7.3\msvc2022_64'
 )
 $ErrorActionPreference = "Continue"   # native stderr must not become a terminating error; assertions use exit codes
 
@@ -45,6 +46,45 @@ Run-Step "pe_architecture_regression" {
 }
 
 # ---------------------------------------------------------------------------
+Run-Step "function_names_and_selection" {
+    . (Join-Path $PSScriptRoot 'FunctionSymbols.ps1')
+    $Regression = Join-Path $Bin 'FunctionSelection.exe'
+    if (-not (Test-Path $Regression)) { Fail 'FunctionSelection.exe missing - build the solution first'; return }
+    $PreviousPlatformPath = $env:QT_QPA_PLATFORM_PLUGIN_PATH
+    $PreviousStderr = $env:QT_FORCE_STDERR_LOGGING
+    $PluginPath = Join-Path $QtDir 'plugins\platforms'
+    if (-not (Test-Path (Join-Path $PluginPath 'qoffscreen.dll'))) { Fail 'qoffscreen.dll missing; pass -QtDir'; return }
+    try {
+        $env:QT_QPA_PLATFORM_PLUGIN_PATH = $PluginPath
+        $env:QT_FORCE_STDERR_LOGGING = '1'
+        & $Regression -platform offscreen *> (Join-Path $Work 'function-selection.log')
+        if ($LASTEXITCODE -ne 0) { Fail 'GUI function selection regression failed; see function-selection.log' }
+        else { Ok 'GUI function selection, filtering, exact output and stale scan invalidation' }
+    } finally {
+        $env:QT_QPA_PLATFORM_PLUGIN_PATH = $PreviousPlatformPath
+        $env:QT_FORCE_STDERR_LOGGING = $PreviousStderr
+    }
+}
+
+Run-Step "gui_all_features" {
+    $Regression = Join-Path $Bin 'GuiFeatures.exe'
+    if (-not (Test-Path $Regression)) { Fail 'GuiFeatures.exe missing - build the solution first'; return }
+    $PreviousPlatformPath = $env:QT_QPA_PLATFORM_PLUGIN_PATH
+    $PreviousStderr = $env:QT_FORCE_STDERR_LOGGING
+    $PluginPath = Join-Path $QtDir 'plugins\platforms'
+    if (-not (Test-Path (Join-Path $PluginPath 'qoffscreen.dll'))) { Fail 'qoffscreen.dll missing; pass -QtDir'; return }
+    try {
+        $env:QT_QPA_PLATFORM_PLUGIN_PATH = $PluginPath
+        $env:QT_FORCE_STDERR_LOGGING = '1'
+        & $Regression -platform offscreen *> (Join-Path $Work 'gui-features.log')
+        if ($LASTEXITCODE -ne 0) { Fail 'GUI feature regression failed; see gui-features.log' }
+        else { Ok 'All CLI commands through GUI, license issuance/verification, protected execution, options and bilingual renders' }
+    } finally {
+        $env:QT_QPA_PLATFORM_PLUGIN_PATH = $PreviousPlatformPath
+        $env:QT_FORCE_STDERR_LOGGING = $PreviousStderr
+    }
+}
+
 Run-Step "vm_self_test" {
     $Out = & $Pevm self-test 2>&1
     if ($LASTEXITCODE -ne 0) { Fail "self-test exited $LASTEXITCODE" } else { Ok "self-test" }

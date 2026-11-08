@@ -974,64 +974,6 @@ MultiLiftAttempt LiftPeFunctionsTolerant(const pevm::pe::ImageView& Image,
     return Attempt;
 }
 
-// Enumerates function entries from the exception directory (.pdata) and
-// annotates exported ones with their names. PE32+ only, matching the lifter.
-std::vector<FunctionCandidate> ScanFunctions(const std::filesystem::path& Input,
-                                             std::size_t MinimumBytes) {
-    const auto Data = util::ReadFile(Input);
-    return ScanFunctions(pevm::pe::ImageView(Data), MinimumBytes);
-}
-
-std::vector<FunctionCandidate> ScanFunctions(const pevm::pe::ImageView& Image,
-                                             std::size_t MinimumBytes) {
-    Image.RequireX64();
-    std::map<std::uint32_t, FunctionCandidate> Candidates;
-    const auto Exceptions = Image.DirectoryBytes(IMAGE_DIRECTORY_ENTRY_EXCEPTION);
-    if (Exceptions.size() % 12) throw std::runtime_error("PE exception table has a partial record");
-    for (std::size_t At = 0; At < Exceptions.size(); At += 12) {
-        const auto Begin = Read<std::uint32_t>(Exceptions, At);
-        const auto End = Read<std::uint32_t>(Exceptions, At + 4);
-        const auto* Section = Image.SectionAt(Begin);
-        if (End <= Begin || !Section || !Section->Executable() || Image.SectionAt(End - 1) != Section)
-            throw std::runtime_error("PE exception function range invalid");
-        Image.FileBytesAtRva(Begin, End - Begin);
-        if (End - Begin >= MinimumBytes) Candidates[Begin] = {Begin, End - Begin, {}};
-    }
-
-    const auto Exports = Image.DirectoryBytes(IMAGE_DIRECTORY_ENTRY_EXPORT);
-    if (!Exports.empty()) {
-        if (Exports.size() < sizeof(IMAGE_EXPORT_DIRECTORY)) throw std::runtime_error("PE export directory truncated");
-        const auto NumberOfFunctions = Read<std::uint32_t>(Exports, 20);
-        const auto NumberOfNames = Read<std::uint32_t>(Exports, 24);
-        const auto FunctionsRva = Read<std::uint32_t>(Exports, 28);
-        const auto NamesRva = Read<std::uint32_t>(Exports, 32);
-        const auto OrdinalsRva = Read<std::uint32_t>(Exports, 36);
-        if (NumberOfNames && !NumberOfFunctions) throw std::runtime_error("PE export names without functions");
-        const auto Functions = NumberOfFunctions ? Image.FileBytesAtRva(FunctionsRva, std::size_t{NumberOfFunctions} * 4) : std::span<const std::uint8_t>{};
-        const auto Names = NumberOfNames ? Image.FileBytesAtRva(NamesRva, std::size_t{NumberOfNames} * 4) : std::span<const std::uint8_t>{};
-        const auto Ordinals = NumberOfNames ? Image.FileBytesAtRva(OrdinalsRva, std::size_t{NumberOfNames} * 2) : std::span<const std::uint8_t>{};
-        const auto ExportDirectory = Image.Directory(IMAGE_DIRECTORY_ENTRY_EXPORT);
-        for (std::size_t I = 0; I < NumberOfNames; ++I) {
-            const auto Ordinal = Read<std::uint16_t>(Ordinals, I * 2);
-            if (Ordinal >= NumberOfFunctions) throw std::runtime_error("PE export ordinal outside function table");
-            const auto Name = Image.StringAtRva(Read<std::uint32_t>(Names, I * 4));
-            const auto Rva = Read<std::uint32_t>(Functions, std::size_t{Ordinal} * 4);
-            if (Rva == 0) continue;
-            if (Rva >= ExportDirectory.Address && Rva - ExportDirectory.Address < ExportDirectory.Size) continue;
-            const auto* Section = Image.SectionAt(Rva);
-            // Data exports and forwarders are not executable candidates.
-            if (!Section || !Section->Executable()) continue;
-            Image.FileBytesAtRva(Rva, 1);
-            auto Match = Candidates.find(Rva);
-            if (Match != Candidates.end()) Match->second.Name = Name;
-            else Candidates[Rva] = {Rva, 0U, Name};
-        }
-    }
-    std::vector<FunctionCandidate> Result;
-    Result.reserve(Candidates.size());
-    for (auto& [Rva, Candidate] : Candidates) Result.push_back(std::move(Candidate));
-    return Result;
-}
 std::vector<std::uint8_t> SerializeVmp3(const LiftResult& Result, std::uint64_t Seed,
                                         std::string_view BuildSecret,
                                         std::span<const std::uint8_t> HandlerProfile,

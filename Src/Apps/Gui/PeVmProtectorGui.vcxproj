@@ -42,6 +42,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="QtGui.cpp" />
+    <ClInclude Include="FunctionPicker.h" />
+    <ClInclude Include="LicensePage.h" />
+    <ClInclude Include="RawCodePage.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

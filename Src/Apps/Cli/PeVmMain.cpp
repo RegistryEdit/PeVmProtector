@@ -381,26 +381,22 @@ void CmdVirtualizeAll(const fs::path& Input, const fs::path& Output,
                                Mutate, Watermark, Compress, License, Log);
 }
 
-void CmdScanFunctions(const fs::path& Input, const fs::path& JsonPath, std::size_t MinimumBytes) {
-    const auto Candidates = x64lift::ScanFunctions(Input, MinimumBytes);
+void CmdScanFunctions(const fs::path& Input, const fs::path& JsonPath, std::size_t MinimumBytes,
+                      const fs::path& PdbPath) {
+    const auto Result = x64lift::ScanFunctionDetails(Input, MinimumBytes, PdbPath);
+    const auto& Candidates = Result.Functions;
+    if (!Result.SymbolFile.empty()) std::cout << "symbols: " << Result.SymbolFile << "\n";
+    for (const auto& Diagnostic : Result.Diagnostics) std::cout << "symbols: " << Diagnostic << "\n";
     std::cout << "discovered functions: " << Candidates.size() << "\n";
     for (const auto& Candidate : Candidates) {
         std::cout << "RVA: 0x" << std::hex << Candidate.Rva << std::dec
                   << " size: " << Candidate.Size;
-        if (!Candidate.Name.empty()) std::cout << " name: " << Candidate.Name;
+        if (!Candidate.Name.empty()) std::cout << " name: " << Candidate.Name << " [" << Candidate.NameSource << "]";
         std::cout << "\n";
     }
     if (!JsonPath.empty()) {
-        std::ofstream Json(JsonPath, std::ios::binary | std::ios::trunc);
-        if (!Json) throw std::runtime_error("cannot create scan output");
-        Json << "{\n  \"format\": \"pevm-scan-functions\",\n  \"functions\": [\n";
-        for (std::size_t I = 0; I < Candidates.size(); ++I) {
-            const auto& Candidate = Candidates[I];
-            Json << "    {\"rva\":\"0x" << std::hex << Candidate.Rva << "\",\"size\":"
-                 << std::dec << Candidate.Size << ",\"name\":\"" << Candidate.Name << "\"}"
-                 << (I + 1 == Candidates.size() ? "\n" : ",\n");
-        }
-        Json << "  ]\n}\n";
+        const auto Json = x64lift::FunctionScanJson(Result);
+        util::WriteFileAtomic(JsonPath, {reinterpret_cast<const std::uint8_t*>(Json.data()), Json.size()});
         std::cout << "scan output: " << JsonPath << "\n";
     }
 }
@@ -622,7 +618,7 @@ void Usage() {
              <<"  pevm protect-functions <input.exe> <output.exe> <password> <rva> [rva...] [--seed=N] [--anti-disasm]\n"
              <<"  pevm protect-all <input.exe> <output.exe> <password> [seed] [--anti-disasm] [--allow-mem] [--min-bytes=N] [--mutate] [--watermark=text]\n"
              <<"    wrap/protect-* license options: --license --license-public-key=<file> --license-product=<id>\n"
-             <<"  pevm scan-functions <input.exe> [json-out] [--min-bytes=N]\n"
+             <<"  pevm scan-functions <input.exe> [json-out] [--min-bytes=N] [--pdb=local.pdb]\n"
              <<"  pevm unpack <input.pvm> <output.exe> <password>\n"
              <<"  pevm inspect <input.pvm>\n"
              <<"  pevm vm-dump <input.pvm>\n"
@@ -734,13 +730,16 @@ int main(int Argc,char** Argv) {
         }
         else if(Cmd=="scan-functions" && Argc>=3 && Argc<=6) {
             std::string JsonPath;
-            std::size_t MinimumBytes = 16;
+            std::size_t MinimumBytes = 0;
+            fs::path PdbPath;
             for (int I = 3; I < Argc; ++I) {
                 const std::string_view Arg = Argv[I];
                 if (Arg.starts_with("--min-bytes=")) MinimumBytes = std::stoull(Argv[I] + 12, nullptr, 0);
-                else JsonPath = Argv[I];
+                else if (Arg.starts_with("--pdb=")) PdbPath = Argv[I] + 6;
+                else if (!Arg.starts_with("--") && JsonPath.empty()) JsonPath = Argv[I];
+                else throw std::runtime_error("unknown or duplicate scan-functions argument");
             }
-            CmdScanFunctions(Argv[2], JsonPath, MinimumBytes);
+            CmdScanFunctions(Argv[2], JsonPath, MinimumBytes, PdbPath);
         }
         else if(Cmd=="unpack" && Argc==5) CmdUnpack(Argv[2],Argv[3],Argv[4]);
         else if(Cmd=="inspect" && Argc==3) CmdInspect(Argv[2]);
