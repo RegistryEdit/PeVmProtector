@@ -2,12 +2,13 @@
 # Usage:  powershell -ExecutionPolicy Bypass -File Tests\RunTests.ps1 [-Configuration Release]
 param(
     [string]$Configuration = "Release",
-    [string]$QtDir = 'D:\Qt\6.7.3\msvc2022_64'
+    [string]$QtDir = 'D:\Qt\6.7.3\msvc2022_64',
+    [string]$BinDirectory = ''
 )
 $ErrorActionPreference = "Continue"   # native stderr must not become a terminating error; assertions use exit codes
 
 $Root = Split-Path -Parent $PSScriptRoot
-$Bin = Join-Path $Root "bin\$Configuration"
+$Bin = if ($BinDirectory) { [IO.Path]::GetFullPath($BinDirectory) } else { Join-Path $Root "bin\$Configuration" }
 $Pevm = Join-Path $Bin "PeVm.exe"
 $Fixture = Join-Path $Bin "LifterFixture.exe"
 $Work = Join-Path $Bin "TestArtifacts"
@@ -260,6 +261,24 @@ Run-Step "protected_multi_vm_bridge" {
 }
 
 # ---------------------------------------------------------------------------
+Run-Step "anti_debug_native_regression" {
+    $Regression = Join-Path $Bin 'AntiDebugRegression.exe'
+    if (-not (Test-Path $Regression)) { Fail 'AntiDebugRegression.exe missing - build the solution first'; return }
+    $Proc = Start-Process -FilePath $Regression -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $Work 'anti-debug-native.out.log') `
+        -RedirectStandardError (Join-Path $Work 'anti-debug-native.err.log')
+    # Retain the process handle before a timed wait; Windows PowerShell 5.1
+    # can otherwise lose the exit code for a quickly exiting process.
+    $null = $Proc.Handle
+    if (-not $Proc.WaitForExit(30000)) {
+        $Proc.Kill()
+        $Proc.WaitForExit()
+        Fail 'anti-debug regression timed out (possible suspended-thread hang)'
+    } elseif ($Proc.ExitCode -ne 0) { Fail 'anti-debug regression failed; see anti-debug-native logs' }
+    else { Ok 'real hardware breakpoints, disabled slots, Debug/Release policy, resume and handle lifetime' }
+    $Proc.Dispose()
+}
+
 Run-Step "loader_anti_debug" {
     $Output = Join-Path $Work "LifterFixture.anti.exe"
     Remove-Item $Output, "$Output.loader-error.txt" -ErrorAction SilentlyContinue
@@ -269,7 +288,9 @@ Run-Step "loader_anti_debug" {
     $env:PEVM_TEST_FAKE_DEBUGGER = "1"
     $env:PEVM_TEST_ERROR_LOG = "1"
     $env:PEVM_TEST_NO_DIALOG = "1"
+    $PreviousAllowDebugger = $env:PEVM_ALLOW_DEBUGGER
     try {
+        Remove-Item env:PEVM_ALLOW_DEBUGGER -ErrorAction SilentlyContinue
         $ExitCode = Invoke-Wrapped $Output "fake-debugger-run"
         if ($ExitCode -eq 0) { Fail "loader did not fail closed under simulated debugger" }
         elseif (-not (Test-Path "$Output.loader-error.txt")) { Fail "loader error log missing" }
@@ -278,7 +299,21 @@ Run-Step "loader_anti_debug" {
             if ($ErrLog -notmatch "loader integrity check failed") { Fail "unexpected loader error: $ErrLog" }
             else { Ok "simulated debugger rejected" }
         }
+        foreach ($Value in @('1', '0', 'true', '01', '11', '1 ', ' 1')) {
+            $env:PEVM_ALLOW_DEBUGGER = $Value
+            Remove-Item "$Output.loader-error.txt" -ErrorAction SilentlyContinue
+            $ExitCode = Invoke-Wrapped $Output ('debugger-policy-' + [Array]::IndexOf(@('1', '0', 'true', '01', '11', '1 ', ' 1'), $Value))
+            if ($Configuration -eq 'Debug' -and $Value -ceq '1') {
+                if ($ExitCode -ne 0) { Fail 'Debug exact-value opt-out failed' }
+                else { Ok 'Debug exact-value opt-out' }
+            } elseif ($ExitCode -eq 0) { Fail "$Configuration accepted debugger bypass value '$Value'" }
+            elseif (-not (Test-Path "$Output.loader-error.txt")) { Fail 'debugger policy rejection log missing' }
+            elseif ((Get-Content "$Output.loader-error.txt" -Raw) -notmatch 'loader integrity check failed') {
+                Fail 'debugger policy produced an unrelated failure'
+            } else { Ok "$Configuration rejects bypass value '$Value'" }
+        }
     } finally {
+        $env:PEVM_ALLOW_DEBUGGER = $PreviousAllowDebugger
         Remove-Item env:PEVM_TEST_FAKE_DEBUGGER, env:PEVM_TEST_ERROR_LOG, env:PEVM_TEST_NO_DIALOG -ErrorAction SilentlyContinue
     }
 

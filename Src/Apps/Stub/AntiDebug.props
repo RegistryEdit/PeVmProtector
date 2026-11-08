@@ -1,0 +1,8 @@
+<Project>
+  <!-- Shared by the production stub and its regression executable. -->
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>PEVM_DEVELOPMENT_DEBUGGER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>

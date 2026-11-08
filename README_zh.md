@@ -157,7 +157,7 @@ Wrapper 双击直接运行，不要求最终用户输入口令。构建口令经
   - 直接 PEB 直读：`BeingDebugged`（不经过可被 hook 的 API）与 `NtGlobalFlag` 调试堆标志；
   - `CheckRemoteDebuggerPresent`；
   - 动态解析 `NtQueryInformationProcess` 三重检查：`ProcessDebugPort`、`ProcessDebugObjectHandle`、`ProcessDebugFlags`（NoDebugInherit）；
-  - 硬件断点寄存器 Dr0-Dr3/Dr7；
+  - 加载线程的硬件断点：短生命周期辅助线程通过真实线程句柄挂起加载线程，读取 `CONTEXT_DEBUG_REGISTERS`，读取失败也会恢复线程。按 DR7 启用位判断有效槽位，已禁用但残留地址的 Dr0-Dr3 不算命中；上下文无法获取时启动检查失败。仅在启动的两个检查点执行，不加入周期性看门狗；
   - 进程列表扫描（x64dbg/x32dbg/OllyDbg/IDA/WinDbg/dnSpy/Cheat Engine 等已知调试器进程名）与已加载模块扫描（Sandboxie/Cheat Engine 注入 DLL 等，复用 PEB LDR 遍历）；
   - 经典调试器窗口类扫描（best-effort，user32 未映射时跳过）；
   - `OutputDebugString` last-error 技巧；
@@ -167,7 +167,8 @@ Wrapper 双击直接运行，不要求最终用户输入口令。构建口令经
   - 主动加固：`ThreadHideFromDebugger` 隐藏加载线程；
   - **常驻看门狗线程**：每 250ms 重跑轻量检查（PEB 直读 + debug port），捕捉启动检查之后才 attach 的调试器；命中即快速退出（外部线程无法向主线程的异常处理器 unwind，只能 fail-fast）。
   - 任何一项命中都以与其他完整性失败不可区分的 "loader integrity check failed" 退出。
-- 开发/CI 逃生阀：`PEVM_ALLOW_DEBUGGER=1` 同时禁用全部启动检查与看门狗线程；`PEVM_TEST_FAKE_DEBUGGER=1` 模拟检查命中（供 `loader_anti_debug` 测试验证 fail-closed 管线）。
+- **仅 Debug 构建**：`PEVM_ALLOW_DEBUGGER` 的值严格等于 `1` 时跳过启动反调试检查与看门狗；空值、`0`、`true` 或带空格的值均不放行。Release 编译时移除该变量读取及旁路，设置变量也无法关闭保护。Debug 放行后，卡密、完整性校验及独立的 10 秒解包预算仍然生效；`PEVM_TEST_FAKE_DEBUGGER=1` 用于集成测试模拟命中。
+- `AntiDebugRegression` 复用生产检测代码，覆盖每个槽位的真实硬件断点、禁用后的残留地址、失败恢复、句柄释放和 Debug/Release 开关策略；已接入 `Tests/RunTests.ps1`，可用 `-BinDirectory <路径>` 验证独立构建。现有保护后的 EXE 需要使用新版 stub 重新生成。
 - 每个函数的桥接 trampoline 写入后读回比对；函数入口与 thunk 页统一收敛 `PAGE_EXECUTE_READ`；重复 wrap（入口已是 trampoline）会被明确拒绝。
 - 明文 payload 逐节拷贝到映射镜像后立即与源 buffer 比对（头部 + 每节），再应用节保护。
 - **运行兼容性**：映射镜像的 PE 头保持只读，供 CRT TLS guard、资源与异常处理继续使用。静态 TLS 使用扩大的 Windows 管理槽位，恢复原程序的初始化模板并转发进程/线程通知及析构回调。现有保护产物需使用新版 CLI 和 stub 重新生成，以预留正确的 TLS 大小。

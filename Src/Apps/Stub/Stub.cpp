@@ -28,6 +28,7 @@
 #include "PeVmCrypto.h"
 #include "PeVmLicense.h"
 #include "LicenseRuntime.h"
+#include "AntiDebug.h"
 #include "VmProtect.h"
 #include "WrapperFormat.h"
 
@@ -280,7 +281,6 @@ void* ResolveForwarder(const char* Forwarder, int Depth) {
 
 using NtQuerySystemInformationFn = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
 using CheckRemoteDebuggerPresentFn = BOOL(WINAPI*)(HANDLE, PBOOL);
-using GetThreadContextFn = BOOL(WINAPI*)(HANDLE, LPCONTEXT);
 using CreateToolhelp32SnapshotFn = HANDLE(WINAPI*)(DWORD, DWORD);
 using Process32FirstWFn = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
 using Process32NextWFn = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
@@ -315,7 +315,7 @@ Fs::path SelfPath() {
 
 // Runtime hardening. Every check fails closed with the same generic message
 // so a failed check is indistinguishable from an integrity violation.
-// PEVM_ALLOW_DEBUGGER is the documented development/CI escape hatch;
+// PEVM_ALLOW_DEBUGGER is available only in Debug builds (exact value "1");
 // PEVM_TEST_FAKE_DEBUGGER simulates a triggered check for plumbing tests.
 [[noreturn]] void IntegrityFailure() {
     throw std::runtime_error(PEVM_TEXT("loader integrity check failed"));
@@ -374,16 +374,17 @@ void CheckKernelDebugger() {
 }
 
 void CheckHardwareBreakpoints() {
-    const auto Get = PEVM_API(GetThreadContextFn, KKernel32Module, "GetThreadContext");
-    if (Get == nullptr) return;
-    CONTEXT Context{};
-    Context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (Get(GetCurrentThread(), &Context)) {
-        if (Context.Dr0 != 0 || Context.Dr1 != 0 || Context.Dr2 != 0 || Context.Dr3 != 0 ||
-            (Context.Dr7 & 0xFFU) != 0) {
-            IntegrityFailure();
-        }
-    }
+    const PeVm::Stub::ThreadContextApis Apis{
+        PEVM_API(decltype(&::DuplicateHandle), KKernel32Module, "DuplicateHandle"),
+        PEVM_API(decltype(&::CreateThread), KKernel32Module, "CreateThread"),
+        PEVM_API(decltype(&::SuspendThread), KKernel32Module, "SuspendThread"),
+        PEVM_API(decltype(&::GetThreadContext), KKernel32Module, "GetThreadContext"),
+        PEVM_API(decltype(&::ResumeThread), KKernel32Module, "ResumeThread"),
+        PEVM_API(decltype(&::WaitForSingleObject), KKernel32Module, "WaitForSingleObject"),
+        PEVM_API(decltype(&::CloseHandle), KKernel32Module, "CloseHandle"),
+    };
+    if (PeVm::Stub::ProbeHardwareBreakpoints(Apis) != PeVm::Stub::HardwareBreakpointStatus::Clear)
+        IntegrityFailure();
 }
 
 // Coarse scan of the process list for well-known debugger executables.
@@ -527,6 +528,15 @@ DWORD HideGetEnv(const wchar_t* Name) {
     return Get != nullptr ? Get(Name, nullptr, 0) : 0;
 }
 
+bool AllowDevelopmentDebugger() {
+#if defined(PEVM_DEVELOPMENT_DEBUGGER)
+    const auto Read = PEVM_API(PeVm::Stub::ReadEnvironmentFn, KKernel32Module, "GetEnvironmentVariableW");
+    return PeVm::Stub::DevelopmentDebuggerAllowed(Read, PEVM_WTEXT(L"PEVM_ALLOW_DEBUGGER").c_str());
+#else
+    return false;
+#endif
+}
+
 // Scan loaded modules for known analysis/injection DLLs (Sandboxie, Cheat
 // Engine usermode helpers). Reuses the loader-list walk, so it costs nothing
 // beyond the walk itself.
@@ -583,9 +593,8 @@ DWORD WINAPI WatchdogThread(void*) {
 }
 
 void StartWatchdog() {
-    // The escape hatch disables the watchdog too, not just the startup
-    // checks: development/CI runs must stay attachable end to end.
-    if (HideGetEnv(PEVM_WTEXT(L"PEVM_ALLOW_DEBUGGER").c_str()) != 0) return;
+    // Only Debug builds can opt out, using the same strict startup policy.
+    if (AllowDevelopmentDebugger()) return;
     using CreateThreadFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
                                            LPVOID, DWORD, LPDWORD);
     const auto Create = PEVM_API(CreateThreadFn, KKernel32Module, "CreateThread");
@@ -596,7 +605,7 @@ void StartWatchdog() {
 }
 
 void RunAntiDebugChecks(bool Light = false) {
-    if (HideGetEnv(PEVM_WTEXT(L"PEVM_ALLOW_DEBUGGER").c_str()) != 0) return;
+    if (AllowDevelopmentDebugger()) return;
     if (HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_FAKE_DEBUGGER").c_str()) != 0) IntegrityFailure();
     CheckPebDebugFlags();
     CheckRemoteDebugger();

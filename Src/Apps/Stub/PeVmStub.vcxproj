@@ -20,6 +20,7 @@
     <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="AntiDebug.props" />
   <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
   <ItemGroup><MASM Include="VmEntry.asm" /></ItemGroup>
   <ItemDefinitionGroup>
@@ -36,6 +37,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Stub.cpp" />
+    <ClCompile Include="AntiDebug.cpp" />
+    <ClInclude Include="AntiDebug.h" />
     <ClCompile Include="LicenseCache.cpp" />
     <ClCompile Include="LicenseDialog.cpp" />
     <ClCompile Include="LicenseRuntime.cpp" />

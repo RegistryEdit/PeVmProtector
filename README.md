@@ -286,7 +286,12 @@ wrapper's directory; working directory and command line stay compatible.
   - `CheckRemoteDebuggerPresent`;
   - Hidden `NtQueryInformationProcess` triple check: `ProcessDebugPort`,
     `ProcessDebugObjectHandle`, `ProcessDebugFlags` (NoDebugInherit);
-  - Hardware breakpoint registers Dr0-Dr3/Dr7;
+  - Hardware breakpoints on the loading thread: a short-lived helper
+    suspends that thread, reads `CONTEXT_DEBUG_REGISTERS` through a real
+    thread handle, then resumes it even if the read fails. Active slots
+    are determined by DR7 enable bits; stale disabled Dr0-Dr3 addresses
+    do not count. An unavailable context fails the startup check. This
+    runs at the two startup checkpoints, not in the periodic watchdog;
   - Process scan (x64dbg/x32dbg/OllyDbg/IDA/WinDbg/dnSpy/Cheat Engine names)
     and loaded-module scan (Sandboxie/CE injection DLLs via the PEB LDR walk);
   - Classic debugger window-class scan (best effort, skipped when user32 is
@@ -304,9 +309,18 @@ wrapper's directory; working directory and command line stay compatible.
     fast (a foreign thread cannot unwind into the main handler).
   - Any hit exits with "loader integrity check failed", indistinguishable
     from other integrity failures.
-- Development/CI escape hatch: `PEVM_ALLOW_DEBUGGER=1` disables all startup
-  checks and the watchdog; `PEVM_TEST_FAKE_DEBUGGER=1` simulates a hit (used
-  by the test runner to verify the fail-closed pipeline).
+- **Debug builds only**: the exact value `PEVM_ALLOW_DEBUGGER=1` skips
+  startup anti-debug checks and the watchdog. Empty, `0`, `true`, and
+  whitespace-padded values do not opt out. Release compiles out the
+  variable lookup and bypass; setting it cannot disable protection.
+  License/integrity verification and the separate 10-second unpack budget
+  remain active even with the Debug opt-out. `PEVM_TEST_FAKE_DEBUGGER=1`
+  simulates a hit for integration tests.
+- `AntiDebugRegression` tests the production probe with real hardware
+  breakpoints in each slot, disabled stale addresses, failure recovery,
+  handle lifetime, and the Debug/Release policy. It is included in
+  `Tests/RunTests.ps1`; use `-BinDirectory <path>` for an isolated build.
+  Existing protected executables need to be regenerated with the new stub.
 - Every bridge trampoline is read back after patching; function entries and
   the thunk page converge to `PAGE_EXECUTE_READ`; double-wrapping (entry
   already a trampoline) is rejected explicitly.

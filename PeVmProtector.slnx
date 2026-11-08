@@ -16,6 +16,7 @@
   <Project Path="Tests\PeRegression\PeRegression.vcxproj" />
   <Project Path="Tests\LicenseRegression\LicenseRegression.vcxproj" />
   <Project Path="Tests\LicenseRuntime\LicenseRuntime.vcxproj" />
+  <Project Path="Tests\AntiDebugRegression\AntiDebugRegression.vcxproj" />
   <Project Path="Tests\DependencyFixture\DepFixture.vcxproj" />
   <Project Path="Tests\DependencyFixture\DependencyApp.vcxproj" />
   <Project Path="Tests\FunctionSelection\FunctionSelection.vcxproj" />
