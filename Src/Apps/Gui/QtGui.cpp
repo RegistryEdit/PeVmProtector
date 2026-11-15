@@ -127,10 +127,13 @@ private:
     CheckBox* AllowMemoryCheck{};
     CheckBox* FunctionTrace{};
     SpinBox *ScanMinimum{}, *ProtectMinimum{};
+    SpinBox *VmInstances{}, *VmComplexity{};
     LineEdit *ManifestEdit{}, *ScanExportEdit{};
     QByteArray ScanResult;
     LineEdit* WatermarkEdit{};
     LineEdit* LicensePublicKeyEdit{};
+    LineEdit* LicenseBuildKeyEdit{};
+    QPushButton* BrowseLicenseBuildKeyBtn{};
     LineEdit* LicenseProductEdit{};
     PushButton* BrowseLicenseKeyBtn{};
 
@@ -294,6 +297,16 @@ private:
         CompressCheck->setObjectName("CompressPayload");
         LicensePublicKeyEdit = new LineEdit;
         LicensePublicKeyEdit->setObjectName("ProtectionPublicKey");
+        LicenseBuildKeyEdit = new LineEdit;
+        LicenseBuildKeyEdit->setObjectName("ProtectionBuildKey");
+        LicenseBuildKeyEdit->setEnabled(false);
+        BrowseLicenseBuildKeyBtn = new PushButton(QString(), Fluent::IconType::FOLDER);
+        BrowseLicenseBuildKeyBtn->setEnabled(false);
+        connect(BrowseLicenseBuildKeyBtn, &QPushButton::clicked, this, [this] {
+            const auto Path = QFileDialog::getOpenFileName(this, T({"Select product build key", "选择产品保护密钥"}),
+                QString(), "Build keys (*.buildkey);;All files (*)");
+            if (!Path.isEmpty()) LicenseBuildKeyEdit->setText(Path);
+        });
         LicenseProductEdit = new LineEdit;
         LicenseProductEdit->setObjectName("ProtectionProduct");
         BrowseLicenseKeyBtn = new PushButton(QString(), Fluent::IconType::FOLDER);
@@ -309,6 +322,8 @@ private:
             LicensePublicKeyEdit->setEnabled(Enabled);
             LicenseProductEdit->setEnabled(Enabled);
             BrowseLicenseKeyBtn->setEnabled(Enabled);
+            LicenseBuildKeyEdit->setEnabled(Enabled);
+            BrowseLicenseBuildKeyBtn->setEnabled(Enabled);
         });
 
         BrowseInputBtn = new PushButton(QString(), Fluent::IconType::FOLDER);
@@ -366,9 +381,10 @@ private:
         Licensing->Run = [this](const QStringList& Args, LicensePage::Completion Callback) {
             return Start(Args, Args.front(), std::move(Callback));
         };
-        Licensing->ApplyProtection = [this](const QString& PublicKey, const QString& Product) {
+        Licensing->ApplyProtection = [this](const QString& PublicKey, const QString& Product, const QString& BuildKey) {
             LicensePublicKeyEdit->setText(PublicKey);
             LicenseProductEdit->setText(Product);
+            LicenseBuildKeyEdit->setText(BuildKey);
             LicenseCheck->setChecked(true);
             NavSettingsBtn->click();
         };
@@ -573,10 +589,11 @@ private:
         CompressCheck->setText(T({"Compress payload", "\u538b\u7f29 payload"}));
         LicenseCheck->setText(T({"Require signed license (wrap / virtualize)", "启用签名卡密（封装 / 虚拟化）"}));
         LicenseCheck->setToolTip(T({
-            "Require a signed license. Existing licenses must be reissued. Does not apply to pack/unpack.",
-            "仅接受 签名卡密，旧卡需重新签发。此设置不影响打包 / 解包。"}));
+            "Require a signed license and a matching product build key for payload encryption. Existing v2 licenses must be reissued; valid v3 licenses remain usable. Does not apply to pack/unpack.",
+            "启用签名卡密和对应产品保护密钥进行载荷加密，旧 v2 卡需重新签发，有效 v3 卡仍可使用。此设置不影响打包 / 解包。"}));
         LicensePublicKeyLabel->setText(T({"License public key", "卡密公钥"}));
         LicensePublicKeyEdit->setPlaceholderText(T({"Select a .pub file", "选择 .pub 公钥文件"}));
+        LicenseBuildKeyEdit->setPlaceholderText(T({"Required .buildkey for license-held payload encryption", "必填 .buildkey 产品保护密钥，用于卡密绑定解密"}));
         LicensePublicKeyEdit->setToolTip(T({"Generate keys on the License issuance page; select the public file.",
                                            "在卡密签发页生成密钥，然后选择公钥文件。"}));
         BrowseLicenseKeyBtn->setText(T({"Browse...", "浏览..."}));
@@ -622,12 +639,15 @@ private:
     // Shared tail options appended to every protection command.
     QStringList ProtectionOptions(bool Virtualize = true) const {
         QStringList Options;
-        if (Virtualize && AntiDisasmCheck->isChecked()) Options << "--anti-disasm";
-        if (Virtualize && MutateCheck->isChecked()) Options << "--mutate";
+        if (Virtualize) Options << "--vm-instances=" + QString::number(VmInstances->value())
+                                << "--vm-complexity=" + QString::number(VmComplexity->value());
+        if (Virtualize && VmInstances->value() && AntiDisasmCheck->isChecked()) Options << "--anti-disasm";
+        if (Virtualize && VmInstances->value() && MutateCheck->isChecked()) Options << "--mutate";
         if (CompressCheck->isChecked()) Options << "--compress";
         if (LicenseCheck->isChecked()) {
             Options << "--license" << "--license-public-key=" + LicensePublicKeyEdit->text()
-                    << "--license-product=" + LicenseProductEdit->text();
+                    << "--license-product=" + LicenseProductEdit->text()
+                    << "--license-build-key=" + LicenseBuildKeyEdit->text().trimmed();
         }
         if (!WatermarkEdit->text().isEmpty()) Options << "--watermark=" + WatermarkEdit->text();
         return Options;
@@ -692,6 +712,12 @@ private:
         PublicLayout->addWidget(LicensePublicKeyEdit, 1);
         PublicLayout->addWidget(BrowseLicenseKeyBtn);
         Form->addRow(LicensePublicKeyLabel, PublicRow);
+        auto* BuildKeyRow = new QWidget;
+        auto* BuildKeyLayout = new QHBoxLayout(BuildKeyRow);
+        BuildKeyLayout->setContentsMargins(0, 0, 0, 0);
+        BuildKeyLayout->addWidget(LicenseBuildKeyEdit, 1);
+        BuildKeyLayout->addWidget(BrowseLicenseBuildKeyBtn);
+        Form->addRow(Named(new BodyLabel, "ProtectionBuildKeyLabel", {"Product build key", "产品保护密钥"}), BuildKeyRow);
         Form->addRow(LicenseProductLabel, LicenseProductEdit);
         Layout->addLayout(Form);
         auto* Keys = Named(new PushButton, "OpenLicenseIssuance", {"Generate keys / issue licenses…", "生成密钥 / 签发卡密…"});
@@ -715,6 +741,38 @@ private:
         ScanRow->addWidget(VirtualizeSelectedBtn);
         ScanRow->addWidget(ProtectAllBtn);
         Layout->addLayout(ScanRow);
+        VmInstances = new SpinBox;
+        VmInstances->setObjectName("VmInstances");
+        VmInstances->setRange(0, 10);
+        VmInstances->setValue(QSettings().value("VM/Instances", 1).toInt());
+        VmComplexity = new SpinBox;
+        VmComplexity->setObjectName("VmComplexity");
+        VmComplexity->setRange(0, 100);
+        VmComplexity->setValue(QSettings().value("VM/Complexity", 50).toInt());
+        const auto VmRow = new QHBoxLayout;
+        VmRow->addWidget(Label({"VM instances (0–10)", "虚拟机实例数（0–10）"}));
+        VmRow->addWidget(VmInstances, 1);
+        VmRow->addWidget(Label({"VM complexity (0–100)", "虚拟机复杂度（0–100）"}));
+        VmRow->addWidget(VmComplexity, 1);
+        Layout->addLayout(VmRow);
+        auto* VmHelp = Label({"0 instances disables function virtualization. More instances use more memory and startup time; higher complexity increases execution cost.",
+                              "实例数为 0 时关闭函数虚拟化。增加实例会占用更多内存和启动时间；提高复杂度会增加运行开销。"});
+        VmHelp->setWordWrap(true);
+        Layout->addWidget(VmHelp);
+        const auto UpdateVmControls = [this] {
+            const bool Enabled = VmInstances->value() != 0;
+            VmComplexity->setEnabled(Enabled);
+            AntiDisasmCheck->setEnabled(Enabled);
+            MutateCheck->setEnabled(Enabled);
+        };
+        UpdateVmControls();
+        connect(VmInstances, &QSpinBox::valueChanged, this, [this, UpdateVmControls](int Value) {
+            QSettings().setValue("VM/Instances", Value);
+            UpdateVmControls();
+        });
+        connect(VmComplexity, &QSpinBox::valueChanged, this, [](int Value) {
+            QSettings().setValue("VM/Complexity", Value);
+        });
         Picker = new FunctionPicker;
         Picker->SelectionChanged = [this] { VirtualizeSelectedBtn->setEnabled(!Running && !Picker->Rvas().isEmpty()); };
         Picker->SymbolsChanged = [this] { ++ScanGeneration; ScanResult.clear(); };
@@ -743,7 +801,9 @@ private:
         FunctionRvaEdit->setPlaceholderText("0x1000, 0x1234");
         LiftSeedEdit = new LineEdit;
         LiftSeedEdit->setObjectName("FunctionSeed");
-        LiftSeedEdit->setText("12345");
+        Translations.push_back([this] {
+            LiftSeedEdit->setPlaceholderText(T({"Automatic random seed (optional override)", "留空自动随机，可填写固定种子"}));
+        });
         BridgeRcx = new LineEdit;
         BridgeRcx->setText("0");
         BridgeRdx = new LineEdit;
@@ -871,8 +931,8 @@ private:
         connect(ProtectAllBtn, &QPushButton::clicked, this, [this] {
             if (!RequireProtection()) return;
             QStringList Arguments{ "protect-all", Quote(InputEdit->text()),
-                                   Quote(OutputOr(".protected.exe")), Quote(PasswordEdit->text()),
-                                   Quote(SeedOr("12345")) };
+                                   Quote(OutputOr(".protected.exe")), Quote(PasswordEdit->text()) };
+            if (!LiftSeedEdit->text().trimmed().isEmpty()) Arguments << "--seed=" + LiftSeedEdit->text().trimmed();
             Arguments << ProtectionOptions();
             Arguments << "--min-bytes=" + QString::number(ProtectMinimum->value());
             if (AllowMemoryCheck->isChecked()) Arguments << "--allow-mem";
@@ -1021,14 +1081,18 @@ private:
         }
         if (UsesLicense && LicenseCheck->isChecked()) {
             QFile PublicFile(LicensePublicKeyEdit->text());
+            const auto BuildKeyPath = LicenseBuildKeyEdit->text().trimmed();
+            QFile BuildKeyFile(BuildKeyPath);
             const QRegularExpression ProductPattern("^[A-Za-z0-9._-]{1,64}$");
             if (!QFileInfo(LicensePublicKeyEdit->text()).isFile() ||
                 !PublicFile.open(QIODevice::ReadOnly) || PublicFile.size() > 4096 ||
                 !PublicFile.readAll().trimmed().startsWith(pevm::license::KPublicKeyPrefix) ||
+                !QFileInfo(BuildKeyPath).isFile() || !BuildKeyFile.open(QIODevice::ReadOnly) ||
+                BuildKeyFile.size() > 4096 || !BuildKeyFile.readAll().trimmed().startsWith(pevm::license::KBuildKeyPrefix) ||
                 !ProductPattern.match(LicenseProductEdit->text()).hasMatch()) {
                 NotifyError({"Invalid license settings", "卡密设置无效"},
-                            {"Select a license public key file and enter a product ID (1-64 ASCII letters/digits/._-).",
-                             "请选择卡密公钥文件，并填写产品 ID（1-64 位英文字母、数字或 ._-）。"});
+                            {"Select a license public key and matching product build key, then enter a product ID (1-64 ASCII letters/digits/._-).",
+                             "请选择卡密公钥和对应产品保护密钥，并填写产品 ID（1-64 位英文字母、数字或 ._-）。"});
                 return false;
             }
         }
@@ -1053,7 +1117,7 @@ private:
         QStringList Arguments{Rvas.size() == 1 ? "protect-function" : "protect-functions",
                               InputEdit->text(), OutputOr(".protected.exe"), PasswordEdit->text()};
         Arguments << Rvas;
-        Arguments << (Rvas.size() == 1 ? SeedOr("12345") : "--seed=" + SeedOr("12345"));
+        if (!LiftSeedEdit->text().trimmed().isEmpty()) Arguments << "--seed=" + LiftSeedEdit->text().trimmed();
         Arguments << ProtectionOptions();
         Start(Arguments, Arguments.front());
     }

@@ -100,6 +100,7 @@ std::vector<std::uint8_t> SerializeVmp3Multi(const MultiLiftResult& Results, std
                                              std::string_view BuildSecret,
                                              std::span<const std::uint8_t> HandlerProfile,
                                              bool AntiDisassembly = false,
-                                             std::vector<vmprotect::CompilationStats>* Statistics = nullptr);
+                                             std::vector<vmprotect::CompilationStats>* Statistics = nullptr,
+                                             const vmprotect::ProtectionOptions& Options = {});
 
 } // namespace x64lift

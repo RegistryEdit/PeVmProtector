@@ -6,6 +6,7 @@
 
 using PeVm::Stub::HardwareBreakpointStatus;
 using PeVm::Stub::ThreadContextApis;
+unsigned AnalysisToolsTests();
 
 namespace {
 
@@ -175,6 +176,7 @@ int main() {
     for (unsigned Slot = 0; Slot != 4; ++Slot) TestRealRegisters(1ULL << (Slot * 2), false);
     TestRealRegisters(0x55, false);
     TestFailuresAndLifetime();
-    std::printf("Anti-debug regression: %d checks passed (real DR0-DR3/DR7, policy, recovery, handles).\n", Checks);
+    Checks += static_cast<int>(AnalysisToolsTests());
+    std::printf("Anti-debug regression: %d checks passed (real DR0-DR3/DR7, tool processes/windows, policy, recovery, handles).\n", Checks);
     return 0;
 }

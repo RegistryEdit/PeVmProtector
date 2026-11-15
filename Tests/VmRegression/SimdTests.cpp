@@ -48,9 +48,9 @@ void TestSimd() {
         std::memcpy(Code,Cases[Case].data(),Cases[Case].size());
         VirtualProtect(Code,4096,PAGE_EXECUTE_READ,&Old); FlushInstructionCache(GetCurrentProcess(),Code,Cases[Case].size());
         const auto Lifted=x64lift::LiftRawCode(Cases[Case],0).Program;
-        for(auto Seed:{1ULL,17ULL}) {
+        for(auto Complexity:{0U,50U,100U}) for(auto Seed:{1ULL,17ULL}) {
             auto P=Lifted; x64lift::MutateProgram(P,Seed);
-            const auto Compiled=CompileLiftedProgram(P,Seed);
+            const auto Compiled=CompileLiftedProgram(P,Seed,Complexity);
             for(unsigned Mode=0;Mode<16;++Mode) for(std::size_t Pattern=0;Pattern<Patterns.size();++Pattern) {
                 VmBridgeContext Input{};
                 for(unsigned R=0;R<16;++R) for(unsigned Lane=0;Lane<2;++Lane) {

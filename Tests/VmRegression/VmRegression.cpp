@@ -232,7 +232,8 @@ void TestVmImage() {
         // Header and both entries: reserved fields, zero count, overflow,
         // overlap, gap, duplicate entry RVA and invalid entry boundary.
         for (const auto [Offset, Value] : std::vector<std::pair<std::size_t, std::uint32_t>>{
-            {8, 3}, {12, 0}, {12, UINT32_MAX}, {24, 1}, {24, UINT32_MAX}, {28, 1},
+            {8, 3}, {12, 0}, {12, UINT32_MAX}, {24, 1}, {24, UINT32_MAX},
+            {28, 0}, {28, 11}, {28, 0x6501}, {28, 0x10001},
             {32, 0x3333}, {36, 1}, {40, 0}, {40, UINT32_MAX}, {44, 1},
             {48, 0x1000}, {52, 0}, {52, 5}, {56, 0}, {56, 3}, {60, 1}}) {
             Changed = Image; Set32(Changed, Offset, Value); Resign(Changed); Reject(Changed);
@@ -371,6 +372,109 @@ LiftedProgram SumLoop() {
              {O::Cmp, 1, 2, 0, 0x1002}, {O::Jz, 0, 0, 0, 0x1003, 0x1007},
              {O::Add, 0, 1, 0, 0x1004}, {O::SubI, 1, 0, 1, 0x1005},
              {O::Jmp, 0, 0, 0, 0x1006, 0x1002}, {O::Ret, 0, 0, 0, 0x1007}}, 0x1000};
+}
+
+std::string ExecutionShape(const CompiledProgram& Compiled) {
+    std::ostringstream Output;
+    auto* Previous = std::cout.rdbuf(Output.rdbuf());
+    const auto Flags = std::cout.flags();
+    const auto Fill = std::cout.fill();
+    struct Restore {
+        std::streambuf* Buffer; std::ios::fmtflags Flags; char Fill;
+        ~Restore() { std::cout.rdbuf(Buffer); std::cout.flags(Flags); std::cout.fill(Fill); }
+    } Guard{Previous, Flags, Fill};
+    auto Context = Inputs(7);
+    InvokeCompiledProgram(Compiled, Context, true);
+    std::istringstream Lines(Output.str());
+    std::string Line, Shape;
+    while (std::getline(Lines, Line)) {
+        // Exclude randomized opcode bytes and data values from this comparison.
+        Shape += Line.substr(0, Line.find(" enc="));
+        const auto At = Line.find(" op=");
+        if (At != std::string::npos) Shape += Line.substr(At, Line.find(" r0=") - At);
+        Shape += ';';
+    }
+    return Shape;
+}
+
+void TestVmOptions() {
+    const auto Source = SumLoop();
+    std::size_t Executions = 0;
+    for (std::uint32_t Count = 0; Count <= 10; ++Count) {
+        for (std::uint32_t Complexity = 0; Complexity <= 100; ++Complexity) {
+            const auto Pool = CompileProgramInstances(Source, 0, {Count, Complexity});
+            Require(Pool.size() == Count, "VM instance count ignored");
+            for (const auto& Compiled : Pool) {
+                const auto Stats = GetCompilationStats(Compiled);
+                if (Complexity == 0) Require(Stats.SplitBlocks == 0 && Stats.PaddingBytes == 0 && Stats.EncodingMask == 1,
+                                             "complexity zero must retain minimal encoding");
+                for (const auto Input : {0ULL, 1ULL, 7ULL}) {
+                    auto Context = Inputs(Input);
+                    InvokeCompiledProgram(Compiled, Context, false);
+                    Require(Context.Registers[0] == Input * (Input + 1) / 2, "VM option sweep changed loop result");
+                    ++Executions;
+                }
+            }
+        }
+    }
+    LiftedProgram Linear;
+    Linear.EntryAddress = 0x4000;
+    for (std::uint32_t I = 0; I < 64; ++I)
+        Linear.Instructions.push_back({O::AddI, 0, 0, (I & 1) ? UINT64_MAX : 0x100, 0x4000 + I});
+    Linear.Instructions.push_back({O::Ret, 0, 0, 0, 0x4040});
+    const auto Pool = CompileProgramInstances(Linear, 17, {10, 100});
+    const auto Again = CompileProgramInstances(Linear, 17, {10, 100});
+    std::set<std::string> Shapes;
+    std::uint32_t Encodings = 0;
+    std::size_t Splits = 0, Padding = 0;
+    for (std::size_t I = 0; I < Pool.size(); ++I) {
+        const auto Shape = ExecutionShape(Pool[I]);
+        Require(Shape == ExecutionShape(Again[I]), "same seed/options must compile deterministically");
+        Shapes.insert(Shape);
+        const auto Stats = GetCompilationStats(Pool[I]);
+        Encodings |= Stats.EncodingMask; Splits += Stats.SplitBlocks; Padding += Stats.PaddingBytes;
+    }
+    Require(Shapes.size() == 10 && Encodings == 15 && Splits > 0 && Padding > 0,
+            "instances changed only encrypted bytes, not executable layouts");
+    std::vector<std::future<void>> Jobs;
+    for (unsigned T = 0; T < 4; ++T) Jobs.push_back(std::async(std::launch::async, [&, T] {
+        for (unsigned I = 0; I < 100; ++I) {
+            auto Context = Inputs(I + T);
+            InvokeCompiledProgram(Pool[I % Pool.size()], Context, false);
+            Require(Context.Registers[0] == I + T + 32 * 255, "multi-instance concurrent state leaked");
+        }
+    }));
+    for (auto& Job : Jobs) Job.get();
+
+    const std::array Programs{Source};
+    const auto Profile = MakeHandlerProfile(99);
+    for (const auto Count : {1U, 5U, 10U}) for (const auto Complexity : {0U, 50U, 100U}) {
+        std::vector<CompilationStats> Statistics;
+        const auto Image = pevm::EncodeVmImage(Programs, 17, "options-test", Profile, true, &Statistics, {Count, Complexity});
+        const auto Decoded = pevm::DecodeVmImage(Image, "options-test", Profile);
+        Require(Decoded.size() == 1 && Decoded[0].Options.Instances == Count && Decoded[0].Options.Complexity == Complexity,
+                "VM options lost in authenticated image");
+        const auto Loaded = CompileProgramInstances(Decoded[0].Program, Decoded[0].Seed, Decoded[0].Options);
+        std::size_t Bytes = 0, Instructions = 0;
+        for (const auto& Instance : Loaded) {
+            Bytes += GetCompilationStats(Instance).BytecodeBytes;
+            Instructions += GetCompilationStats(Instance).BytecodeInstructions;
+            auto Context = Inputs(7); InvokeCompiledProgram(Instance, Context, false);
+            Require(Context.Registers[0] == 28, "serialized instance changed semantics");
+        }
+        Require(Bytes == Statistics[0].BytecodeBytes && Instructions == Statistics[0].BytecodeInstructions,
+                "build/loader instance metrics differ");
+        for (const auto Offset : {offsetof(Vmp3Header, Instances), offsetof(Vmp3Header, Complexity)}) {
+            auto Corrupt = Image; Corrupt[Offset] ^= 1;
+            ExpectRejected([&] { (void)pevm::DecodeVmImage(Corrupt, "options-test", Profile); }, "authentication");
+        }
+    }
+    ExpectRejected([&] { (void)CompileProgramInstances(Source, 0, {11, 50}); }, "instances");
+    ExpectRejected([&] { (void)CompileProgramInstances(Source, 0, {1, 101}); }, "complexity");
+    ExpectRejected([&] { (void)CompileLiftedProgram(Source, 0, UINT32_MAX); }, "complexity");
+    ExpectRejected([&] { (void)pevm::EncodeVmImage(Programs, 17, "options-test", Profile, false, nullptr, {0, 50}); }, "instance");
+    std::cout << "VM options: OK (1111 count/complexity combinations, " << Executions
+              << " native-result comparisons, 10 distinct layouts, 4 encodings, authenticated round trips, concurrency)\n";
 }
 
 void TestControlFlow() {
@@ -624,9 +728,9 @@ void TestNativeWidths() {
         Require(VirtualProtect(Native,4096,PAGE_EXECUTE_READ,&Old) != 0,"native code execute protection");
         FlushInstructionCache(GetCurrentProcess(),Native,Test.Code.size());
         const auto Lifted = x64lift::LiftRawCode(Test.Code,0).Program;
-        for (const auto Seed : {1ULL,17ULL}) {
+        for (const auto Complexity : {0U, 50U, 100U}) for (const auto Seed : {1ULL,17ULL}) {
             auto Mutated = Lifted; x64lift::MutateProgram(Mutated,Seed);
-            const auto Compiled = CompileLiftedProgram(Mutated,Seed);
+            const auto Compiled = CompileLiftedProgram(Mutated,Seed,Complexity);
             for (const auto A : Inputs) for (const auto B : Inputs) {
                 VmBridgeContext Context{};
                 Context.Registers[1]=A; Context.Registers[2]=B;
@@ -659,7 +763,7 @@ void TestSimd();
 int main(int Argc, char** Argv) {
     try {
         if (Argc == 2 && std::string_view(Argv[1]) == "--benchmark") Benchmark();
-        else if (Argc == 1) { TestCompiledPrograms(); TestVmImage(); TestSimdImageFragments(); TestMutation(); TestControlFlow(); TestNativeWidths(); TestNativeCalls(); TestSimd(); }
+        else if (Argc == 1) { TestCompiledPrograms(); TestVmImage(); TestSimdImageFragments(); TestMutation(); TestVmOptions(); TestControlFlow(); TestNativeWidths(); TestNativeCalls(); TestSimd(); }
         else throw std::runtime_error("usage: VmRegression [--benchmark]");
         return 0;
     } catch (const std::exception& Error) {

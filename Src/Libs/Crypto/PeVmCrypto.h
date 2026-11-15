@@ -18,6 +18,10 @@ using XteaKey = std::array<std::uint32_t, 4>;
 
 class Sha256 {
 public:
+    Sha256() = default;
+    ~Sha256();
+    Sha256(const Sha256&) = delete;
+    Sha256& operator=(const Sha256&) = delete;
     void Update(std::span<const std::uint8_t> Input);
     Sha256Digest Finish();
 
@@ -31,11 +35,15 @@ private:
     std::array<std::uint8_t, 64> Block{};
     std::size_t Used{};
     std::uint64_t Total{};
+    bool Finished{};
 };
 
 class HmacSha256 {
 public:
     explicit HmacSha256(std::span<const std::uint8_t> Key);
+    ~HmacSha256();
+    HmacSha256(const HmacSha256&) = delete;
+    HmacSha256& operator=(const HmacSha256&) = delete;
     void Update(std::span<const std::uint8_t> Input) { Hash.Update(Input); }
     Sha256Digest Finish();
 

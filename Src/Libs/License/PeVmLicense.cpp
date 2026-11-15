@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
@@ -111,8 +112,21 @@ void ImportPrivate(const Algorithm& Provider, Key& Result, const std::filesystem
 Digest SignatureHash(const LicensePayload& Payload) {
     crypto::Sha256 Hash;
     // Protocol domain bytes are stable even when public names change.
-    Hash.Update(Bytes("PeVmProtector-License-v2"));
-    Hash.Update({reinterpret_cast<const std::uint8_t*>(&Payload), offsetof(LicensePayload, Signature)});
+    Hash.Update(Bytes(Payload.Version == KLegacyPayloadVersion ? "PeVmProtector-License-v2" : "PeVmProtector-License-v3"));
+    const auto Size = Payload.Version == KLegacyPayloadVersion ? offsetof(LicensePayload, UnlockKey) : offsetof(LicensePayload, Signature);
+    Hash.Update({reinterpret_cast<const std::uint8_t*>(&Payload), Size});
+    return Hash.Finish();
+}
+Digest ProductUnlockKey(const Key& SigningKey, const Digest& Product) {
+    SecretBytes Private;
+    Private.Data.resize(104);
+    ULONG Written{};
+    Check(BCryptExportKey(SigningKey.Handle, nullptr, BCRYPT_ECCPRIVATE_BLOB, Private.Data.data(),
+                         static_cast<ULONG>(Private.Data.size()), &Written, 0), "cannot derive product key");
+    if (Written != Private.Data.size()) throw std::runtime_error("invalid signing key size");
+    crypto::HmacSha256 Hash(std::span(Private.Data).subspan(72, 32));
+    Hash.Update(Bytes("PeVmProtector-ProductUnlock-v1"));
+    Hash.Update(Product);
     return Hash.Finish();
 }
 } // namespace
@@ -251,7 +265,7 @@ LicensePolicy MakePolicy(const std::filesystem::path& PublicPath, std::string_vi
     return Policy;
 }
 void ValidatePolicy(const LicensePolicy& Policy) {
-    if (Policy.Required > 1) throw std::runtime_error("invalid license policy");
+    if (Policy.Required > 2) throw std::runtime_error("invalid license policy");
     if (Policy.Required == 0) {
         if (Nonzero(Policy.PublicKey) || Nonzero(Policy.ProductId)) throw std::runtime_error("disabled license policy has key data");
         return;
@@ -262,7 +276,7 @@ void ValidatePolicy(const LicensePolicy& Policy) {
     ImportPublic(Provider, VerificationKey, Policy.PublicKey);
 }
 LicensePayload IssueLicense(const std::filesystem::path& PrivatePath, std::string_view Product,
-                            const Digest& Machine, std::uint32_t Days, std::uint64_t IssuedFileTime) {
+                            const Digest& Machine, std::uint32_t Days, std::uint64_t IssuedFileTime, bool Legacy) {
     if (!Nonzero(Machine)) throw std::runtime_error("machine id cannot be zero");
     if (Days > KMaximumDays || IssuedFileTime == 0 || IssuedFileTime > KMaximumTimestamp ||
         Days > (KMaximumTimestamp - IssuedFileTime) / KTicksPerDay) {
@@ -279,6 +293,8 @@ LicensePayload IssueLicense(const std::filesystem::path& PrivatePath, std::strin
     Key SigningKey;
     ImportPrivate(Provider, SigningKey, PrivatePath);
     Payload.KeyId = crypto::Sha256::Digest(ExportPublic(SigningKey));
+    if (Legacy) Payload.Version = KLegacyPayloadVersion;
+    else Payload.UnlockKey = ProductUnlockKey(SigningKey, Payload.ProductId);
     auto Hash = SignatureHash(Payload);
     ULONG Written{};
     Check(BCryptSignHash(SigningKey.Handle, nullptr, Hash.data(), static_cast<ULONG>(Hash.size()),
@@ -288,21 +304,41 @@ LicensePayload IssueLicense(const std::filesystem::path& PrivatePath, std::strin
     return Payload;
 }
 std::string FormatLicense(const LicensePayload& Payload) {
+    if (Payload.Version == KLegacyPayloadVersion) {
+        std::array<std::uint8_t, 196> Raw{};
+        std::memcpy(Raw.data(), &Payload, offsetof(LicensePayload, UnlockKey));
+        std::memcpy(Raw.data() + offsetof(LicensePayload, UnlockKey), Payload.Signature.data(), Payload.Signature.size());
+        return KLicensePrefix + crypto::Base64Encode(Raw);
+    }
     return KLicensePrefix + crypto::Base64Encode({reinterpret_cast<const std::uint8_t*>(&Payload), sizeof(Payload)});
 }
 LicensePayload ParseLicense(std::string_view Text) {
-    const auto Raw = Decode(Text, KLicensePrefix);
-    if (Raw.size() != sizeof(LicensePayload)) throw std::runtime_error("invalid license length");
+    const SecretBytes Decoded{Decode(Text, KLicensePrefix)};
+    const auto& Raw = Decoded.Data;
+    if (Raw.size() != sizeof(LicensePayload) && Raw.size() != 196) throw std::runtime_error("invalid license length");
     LicensePayload Payload{};
-    std::memcpy(&Payload, Raw.data(), sizeof(Payload));
-    if (Payload.Version != KPayloadVersion) throw std::runtime_error("unsupported license version");
+    if (Raw.size() == 196) {
+        std::memcpy(&Payload, Raw.data(), offsetof(LicensePayload, UnlockKey));
+        std::memcpy(Payload.Signature.data(), Raw.data() + offsetof(LicensePayload, UnlockKey), Payload.Signature.size());
+        if (Payload.Version != KLegacyPayloadVersion) {
+            SecureZeroMemory(&Payload, sizeof(Payload));
+            throw std::runtime_error("unsupported license version");
+        }
+    } else {
+        std::memcpy(&Payload, Raw.data(), sizeof(Payload));
+        if (Payload.Version != KPayloadVersion) {
+            SecureZeroMemory(&Payload, sizeof(Payload));
+            throw std::runtime_error("unsupported license version");
+        }
+    }
     return Payload;
 }
 std::string VerifyPayload(const LicensePayload& Payload, const LicensePolicy& Policy,
                            const Digest& CurrentMachine, std::uint64_t NowFileTime) {
-    if (Policy.Required != 1) return "license policy is not enabled";
+    if (Policy.Required == 0) return "license policy is not enabled";
     ValidatePolicy(Policy);
-    if (Payload.Version != KPayloadVersion) return "unsupported license version";
+    if (Payload.Version != KPayloadVersion && Payload.Version != KLegacyPayloadVersion) return "unsupported license version";
+    if (Policy.Required == 2 && Payload.Version != KPayloadVersion) return "license upgrade required";
     if (!crypto::ConstantEqual(Payload.KeyId, crypto::Sha256::Digest(Policy.PublicKey))) return "license signing key mismatch";
     Algorithm Provider;
     Key VerificationKey;
@@ -313,6 +349,7 @@ std::string VerifyPayload(const LicensePayload& Payload, const LicensePolicy& Po
     if (Status == KInvalidSignature) return "license signature invalid";
     Check(Status, "license signature verification failed");
     if (!Nonzero(Payload.LicenseId)) return "license id is missing";
+    if (Payload.Version == KPayloadVersion && !Nonzero(Payload.UnlockKey)) return "license unlock key missing";
     if (!crypto::ConstantEqual(Payload.ProductId, Policy.ProductId)) return "license product mismatch";
     if (!Nonzero(CurrentMachine) || !crypto::ConstantEqual(Payload.Machine, CurrentMachine)) return "license machine mismatch";
     if (NowFileTime == 0 || NowFileTime > KMaximumTimestamp || Payload.IssuedFileTime == 0 ||
@@ -323,6 +360,74 @@ std::string VerifyPayload(const LicensePayload& Payload, const LicensePolicy& Po
     }
     if (Payload.ExpiresFileTime != 0 && NowFileTime >= Payload.ExpiresFileTime) return "license expired";
     return {};
+}
+namespace {
+#pragma pack(push, 1)
+struct BuildKeyPayload {
+    std::uint32_t Version{1};
+    PublicKey Public{};
+    Digest Product{};
+    Digest Unlock{};
+    std::array<std::uint8_t, 64> Signature{};
+};
+#pragma pack(pop)
+static_assert(sizeof(BuildKeyPayload) == 204);
+static_assert(std::is_trivially_copyable_v<BuildKeyPayload>);
+struct EraseBuildKey {
+    BuildKeyPayload& Payload;
+    ~EraseBuildKey() { SecureZeroMemory(Payload.Unlock.data(), Payload.Unlock.size()); }
+};
+Digest BuildKeyHash(const BuildKeyPayload& Payload) {
+    crypto::Sha256 Hash;
+    Hash.Update(Bytes("PeVmProtector-BuildKey-v1"));
+    Hash.Update({reinterpret_cast<const std::uint8_t*>(&Payload), offsetof(BuildKeyPayload, Signature)});
+    return Hash.Finish();
+}
+} // namespace
+void ExportBuildKeyFile(const std::filesystem::path& PrivatePath, const std::filesystem::path& Output,
+                        std::string_view Product) {
+    if (std::filesystem::exists(Output)) throw std::runtime_error("refusing to overwrite existing build key");
+    BuildKeyPayload Payload;
+    EraseBuildKey Eraser{Payload};
+    Payload.Product = ProductId(Product);
+    Algorithm Provider;
+    Key SigningKey;
+    ImportPrivate(Provider, SigningKey, PrivatePath);
+    Payload.Public = ExportPublic(SigningKey);
+    Payload.Unlock = ProductUnlockKey(SigningKey, Payload.Product);
+    auto Hash = BuildKeyHash(Payload);
+    ULONG Written{};
+    Check(BCryptSignHash(SigningKey.Handle, nullptr, Hash.data(), static_cast<ULONG>(Hash.size()),
+                         Payload.Signature.data(), static_cast<ULONG>(Payload.Signature.size()), &Written, 0), "cannot sign build key");
+    if (Written != Payload.Signature.size()) throw std::runtime_error("invalid build key signature size");
+    DATA_BLOB Input{sizeof(Payload), reinterpret_cast<BYTE*>(&Payload)};
+    LocalBlob Protected;
+    if (!CryptProtectData(&Input, L"PeVmProtector build key", nullptr, nullptr, nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN, &Protected.Blob)) throw std::runtime_error("cannot seal build key");
+    WriteNewTextFile(Output, KBuildKeyPrefix + crypto::Base64Encode({Protected.Blob.pbData, Protected.Blob.cbData}) + "\n");
+}
+Digest ReadBuildKey(const std::filesystem::path& Path, const LicensePolicy& Policy) {
+    ValidatePolicy(Policy);
+    if (Policy.Required == 0) throw std::runtime_error("build key requires an enabled license policy");
+    auto Protected = Decode(ReadTextFile(Path), KBuildKeyPrefix);
+    DATA_BLOB Input{static_cast<DWORD>(Protected.size()), Protected.data()};
+    LocalBlob Plain;
+    if (!CryptUnprotectData(&Input, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &Plain.Blob))
+        throw std::runtime_error("cannot unlock build key: use the exporting Windows user and machine");
+    if (Plain.Blob.cbData != sizeof(BuildKeyPayload)) throw std::runtime_error("invalid build key length");
+    BuildKeyPayload Payload;
+    EraseBuildKey Eraser{Payload};
+    std::memcpy(&Payload, Plain.Blob.pbData, sizeof(Payload));
+    if (Payload.Version != 1 || !Nonzero(Payload.Unlock)) throw std::runtime_error("invalid build key format");
+    if (!crypto::ConstantEqual(Payload.Public, Policy.PublicKey) || !crypto::ConstantEqual(Payload.Product, Policy.ProductId))
+        throw std::runtime_error("build key product or issuer mismatch");
+    Algorithm Provider;
+    Key VerificationKey;
+    ImportPublic(Provider, VerificationKey, Policy.PublicKey);
+    auto Hash = BuildKeyHash(Payload);
+    Check(BCryptVerifySignature(VerificationKey.Handle, nullptr, Hash.data(), static_cast<ULONG>(Hash.size()),
+                               Payload.Signature.data(), static_cast<ULONG>(Payload.Signature.size()), 0), "build key signature invalid");
+    return Payload.Unlock;
 }
 std::string ReadRuntimeLicense(const std::filesystem::path& WrapperPath) {
     SetLastError(ERROR_SUCCESS);

@@ -260,6 +260,10 @@ Run-Step "protected_multi_vm_bridge" {
     else { Ok "both functions bridged" }
 }
 
+Run-Step "vm_instances_and_complexity" {
+    . (Join-Path $PSScriptRoot 'VmOptions.ps1')
+}
+
 # ---------------------------------------------------------------------------
 Run-Step "anti_debug_native_regression" {
     $Regression = Join-Path $Bin 'AntiDebugRegression.exe'
@@ -483,6 +487,7 @@ Run-Step "licensing_and_compression" {
     else { Ok "compressed container roundtrip" }
 
     . (Join-Path $PSScriptRoot 'LicenseIntegration.ps1')
+    . (Join-Path $PSScriptRoot 'LicenseProtection.ps1')
 }
 
 # ---------------------------------------------------------------------------

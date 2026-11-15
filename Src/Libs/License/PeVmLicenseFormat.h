@@ -8,5 +8,7 @@ namespace pevm::license {
 inline constexpr char KLicensePrefix[] = "PEVM-LICENSE.";
 inline constexpr char KPublicKeyPrefix[] = "PEVM-PUBLIC.";
 inline constexpr char KPrivateKeyPrefix[] = "PEVM-PRIVATE.";
-inline constexpr std::uint32_t KPayloadVersion = 2;
+inline constexpr char KBuildKeyPrefix[] = "PEVM-BUILDKEY.";
+inline constexpr std::uint32_t KLegacyPayloadVersion = 2;
+inline constexpr std::uint32_t KPayloadVersion = 3;
 } // namespace pevm::license

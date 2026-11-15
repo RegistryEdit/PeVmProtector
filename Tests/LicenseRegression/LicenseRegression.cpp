@@ -1,11 +1,13 @@
 #include "PeVmLicense.h"
 #include "PeVmCrypto.h"
 #include <windows.h>
+#include <dpapi.h>
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -21,6 +23,52 @@ template<class F> void Reject(F&& Action) {
     try { Action(); }
     catch (const std::exception&) { return; }
     throw std::runtime_error("invalid input unexpectedly accepted");
+}
+struct LocalBlob {
+    DATA_BLOB Blob{};
+    ~LocalBlob() {
+        if (Blob.pbData) {
+            SecureZeroMemory(Blob.pbData, Blob.cbData);
+            LocalFree(Blob.pbData);
+        }
+    }
+};
+static_assert(!std::is_copy_constructible_v<pevm::crypto::Sha256>);
+static_assert(!std::is_move_constructible_v<pevm::crypto::Sha256>);
+static_assert(!std::is_copy_constructible_v<pevm::crypto::HmacSha256>);
+static_assert(!std::is_move_constructible_v<pevm::crypto::HmacSha256>);
+
+void TestRewrappedBuildKey(const fs::path& Work, const fs::path& BuildKey, const LicensePolicy& Policy,
+                           const Digest& ExpectedUnlock) {
+    auto Text = ReadTextFile(BuildKey);
+    auto Encoded = std::string_view(Text).substr(sizeof(KBuildKeyPrefix) - 1);
+    Encoded.remove_suffix(1); // issuer writes exactly one newline
+    auto Protected = pevm::crypto::Base64Decode(Encoded);
+    DATA_BLOB Input{static_cast<DWORD>(Protected.size()), Protected.data()};
+    LocalBlob Plain;
+    Require(CryptUnprotectData(&Input, nullptr, nullptr, nullptr, nullptr,
+                               CRYPTPROTECT_UI_FORBIDDEN, &Plain.Blob) != 0, "unseal test build credential");
+    Require(Plain.Blob.cbData == 204, "build credential v1 layout");
+    const auto Rewrap = [&](const fs::path& Path) {
+        LocalBlob Envelope;
+        Require(CryptProtectData(&Plain.Blob, L"rewrapped test build credential", nullptr, nullptr,
+                                 nullptr, CRYPTPROTECT_UI_FORBIDDEN, &Envelope.Blob) != 0,
+                "rewrap test build credential");
+        WriteNewTextFile(Path, KBuildKeyPrefix + pevm::crypto::Base64Encode(
+            {Envelope.Blob.pbData, Envelope.Blob.cbData}) + "\n");
+    };
+    const auto Unchanged = Work / "rewrapped-original.buildkey";
+    Rewrap(Unchanged);
+    Require(ReadBuildKey(Unchanged, Policy) == ExpectedUnlock, "valid rewrapped credential remains usable");
+    // DPAPI succeeds for every fixture: the inner format, issuer/product binding
+    // and ECDSA signature must independently reject changes by the build user.
+    for (const auto Offset : {0U, 4U, 76U, 108U, 140U, 203U}) {
+        Plain.Blob.pbData[Offset] ^= 1;
+        const auto Path = Work / ("rewrapped-tampered-" + std::to_string(Offset) + ".buildkey");
+        Rewrap(Path);
+        Reject([&] { ReadBuildKey(Path, Policy); });
+        Plain.Blob.pbData[Offset] ^= 1;
+    }
 }
 struct EnvironmentGuard {
     std::vector<wchar_t> Original;
@@ -93,6 +141,56 @@ void TestLicense(const fs::path& Work) {
     const auto Roundtrip = ParseLicense(" \t" + Token + "\r\n");
     Require(FormatLicense(Roundtrip) == Token, "license serialization roundtrip");
     Require(VerifyPayload(Roundtrip, Policy, Machine, Now).empty(), "fresh signed license");
+    const auto Legacy = IssueLicense(Private, "regression.product", Machine, 30, Now, true);
+    Require(FormatLicense(ParseLicense(FormatLicense(Legacy))) == FormatLicense(Legacy), "legacy v2 roundtrip");
+    Require(VerifyPayload(Legacy, Policy, Machine, Now).empty(), "legacy v2 signature remains valid");
+    auto StrongPolicy = Policy;
+    StrongPolicy.Required = 2;
+    Require(VerifyPayload(Legacy, StrongPolicy, Machine, Now) == "license upgrade required", "strong policy rejects legacy v2");
+    const auto BuildKey = Work / "product.buildkey";
+    ExportBuildKeyFile(Private, BuildKey, "regression.product");
+    const auto Unlock = ReadBuildKey(BuildKey, StrongPolicy);
+    Require(Unlock == Payload.UnlockKey, "issuer license and build key share product secret");
+    Require(Unlock == IssueLicense(Private, "regression.product", Machine, 0, Now).UnlockKey, "product key stable across reissuance");
+    Require(Unlock != IssueLicense(Private, "different-product", Machine, 30, Now).UnlockKey, "product key separation");
+    Require(Unlock != IssueLicense(OtherPrivate, "regression.product", Machine, 30, Now).UnlockKey, "issuer key separation");
+    const auto SealedBuildKey = ReadTextFile(BuildKey);
+    Reject([&] { ExportBuildKeyFile(Private, BuildKey, "regression.product"); });
+    Require(ReadTextFile(BuildKey) == SealedBuildKey, "build key overwrite preserved original");
+    Reject([&] { ReadBuildKey(BuildKey, MakePolicy(Public, "wrong.product")); });
+    Reject([&] { ReadBuildKey(BuildKey, MakePolicy(OtherPublic, "regression.product")); });
+    auto BrokenBuildKey = SealedBuildKey;
+    const auto CorruptAt = BrokenBuildKey.size() - 10;
+    BrokenBuildKey[CorruptAt] = BrokenBuildKey[CorruptAt] == 'A' ? 'B' : 'A';
+    WriteNewTextFile(Work / "corrupt.buildkey", BrokenBuildKey);
+    Reject([&] { ReadBuildKey(Work / "corrupt.buildkey", StrongPolicy); });
+    TestRewrappedBuildKey(Work, BuildKey, StrongPolicy, Unlock);
+    const std::vector<std::uint8_t> Image(400, 0x52);
+    WrapperFooter Footer{};
+    Footer.Magic = KWrapperMagic;
+    Footer.StubSize = Image.size();
+    Footer.PayloadOffset = 200;
+    Footer.PayloadSize = 150;
+    const auto Sealed = SealLicensedSecret(Unlock, Image, Footer, "strong-build-password");
+    Require(OpenLicensedSecret(Payload.UnlockKey, Image, Footer, Sealed) == "strong-build-password", "license-held AES-GCM roundtrip");
+    const auto Empty = SealLicensedSecret(Unlock, Image, Footer, "");
+    Require(OpenLicensedSecret(Unlock, Image, Footer, Empty).empty(), "AES-GCM empty build password");
+    auto SealedAgain = SealLicensedSecret(Unlock, Image, Footer, "strong-build-password");
+    for (std::size_t I = 0; I < Image.size(); ++I) {
+        auto Altered = Image; Altered[I] ^= 1;
+        Reject([&] { OpenLicensedSecret(Unlock, Altered, Footer, SealedAgain); });
+    }
+    for (std::size_t I = 0; I < sizeof(Footer); ++I) {
+        auto Altered = Footer; reinterpret_cast<std::uint8_t*>(&Altered)[I] ^= 1;
+        Reject([&] { OpenLicensedSecret(Unlock, Image, Altered, SealedAgain); });
+    }
+    for (std::size_t I = 0; I < SealedAgain.size(); ++I) {
+        auto Altered = SealedAgain; Altered[I] ^= 1;
+        Reject([&] { OpenLicensedSecret(Unlock, Image, Footer, Altered); });
+    }
+    auto WrongUnlock = Unlock; WrongUnlock[0] ^= 1;
+    Reject([&] { OpenLicensedSecret(WrongUnlock, Image, Footer, SealedAgain); });
+    Reject([&] { OpenLicensedSecret({}, Image, Footer, SealedAgain); });
     Require(VerifyPayload(Payload, Policy, Machine, Payload.ExpiresFileTime - 1).empty(), "before expiry");
     Require(VerifyPayload(Payload, Policy, Machine, Payload.ExpiresFileTime) == "license expired", "exact expiry");
     Require(VerifyPayload(Payload, Policy, Machine, Now - KClockSkewTicks).empty(), "clock skew boundary");
@@ -128,7 +226,7 @@ void TestLicense(const fs::path& Work) {
     auto InvalidPolicy = Policy;
     InvalidPolicy.Required = 0;
     Reject([&] { ValidatePolicy(InvalidPolicy); });
-    InvalidPolicy.Required = 2;
+    InvalidPolicy.Required = 3;
     Reject([&] { ValidatePolicy(InvalidPolicy); });
     InvalidPolicy = Policy;
     InvalidPolicy.PublicKey.fill(0);
@@ -144,7 +242,8 @@ void TestLicense(const fs::path& Work) {
                             std::string(KPublicKeyPrefix) + EncodedPayload, std::string(KPrivateKeyPrefix) + EncodedPayload}) {
         Reject([&] { ParseLicense(Bad); });
     }
-    auto Noncanonical = Token;
+    // v3 is divisible by three; use v2's padded Base64 to exercise unused pad bits.
+    auto Noncanonical = FormatLicense(Legacy);
     constexpr std::string_view Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     Noncanonical[Noncanonical.size() - 3] = Alphabet[Alphabet.find(Noncanonical[Noncanonical.size() - 3]) + 1];
     Reject([&] { ParseLicense(Noncanonical); });

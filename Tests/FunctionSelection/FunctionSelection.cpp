@@ -32,6 +32,7 @@ int main(int Argc, char** Argv) {
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, Work);
     QSettings().setValue("Language", 1);
+    QSettings().remove("VM");
     const auto Font = QFontDatabase::addApplicationFont("C:/Windows/Fonts/msyh.ttc");
     const auto Families = QFontDatabase::applicationFontFamilies(Font);
     if (!Families.isEmpty()) App.setFont(QFont(Families.front(), 9));
@@ -73,9 +74,10 @@ int main(int Argc, char** Argv) {
         Check(!Table->isRowHidden(First->row()) && Table->isRowHidden(Second->row()) && Protect->isEnabled(), "filter should retain checked hidden functions");
         Protect->click();
         const auto Arguments = Runner->arguments();
-        Check(Arguments[0] == "protect-functions" && Arguments.mid(4, 2) == Expected && Arguments.size() == 7,
-              "GUI did not send exactly the two checked RVAs");
         Wait(Runner);
+        Check(Arguments[0] == "protect-functions" && Arguments.mid(4, 2) == Expected && Arguments.size() == 8 &&
+              Arguments.contains("--vm-instances=1") && Arguments.contains("--vm-complexity=50"),
+              "GUI did not send exactly the two checked RVAs");
         Check(Runner->exitCode() == 0 && QFileInfo::exists(Output->text()), "selected virtualization failed");
         QProcess Inspect;
         Inspect.start(QCoreApplication::applicationDirPath() + "/PeVm.exe", {"inspect", Output->text()});

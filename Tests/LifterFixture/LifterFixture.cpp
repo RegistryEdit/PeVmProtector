@@ -94,6 +94,10 @@ static void PrintFixtureRva(const char* Name, const void* Function,
 }
 
 int main() {
+    // Exercise every independently compiled instance across repeated bridge calls.
+    auto* volatile RepeatedTarget = &LiftTarget;
+    for (std::uint64_t I = 0; I < 20; ++I)
+        if (RepeatedTarget(I, I * 3, I + 7, ~I) != (I ^ (I * 3) ^ (I + 7) ^ ~I)) return 1;
     const std::uint64_t Mem[4] = {0x1111, 0x2222, 0x3333, 0x4444};
     volatile std::uint64_t MemImmBuffer = 0;
     volatile std::uint64_t SetccBuffer = 0;

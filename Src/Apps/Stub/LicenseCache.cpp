@@ -1,4 +1,5 @@
 #include "LicenseRuntime.h"
+#include "LicenseClock.h"
 #include "PeVmCrypto.h"
 #include "FileIo.h"
 #include <windows.h>
@@ -53,10 +54,27 @@ std::string Decrypt(std::span<const std::uint8_t> Data, license::Digest& Identit
 }
 } // namespace
 
-bool TryVerifyLicense(const LicensePolicy& Policy, std::string_view Text, std::string& Reason) {
+bool TryVerifyLicense(const LicensePolicy& Policy, std::string_view Text, std::string& Reason, bool* InvalidLicense) {
+    if (InvalidLicense) *InvalidLicense = false;
     try {
-        const auto Payload = license::ParseLicense(Text);
-        Reason = license::VerifyPayload(Payload, Policy, license::MachineId(), license::CurrentFileTime());
+        license::LicensePayload Payload{};
+        struct Erase { license::LicensePayload& Value; ~Erase() { SecureZeroMemory(&Value, sizeof(Value)); } } Eraser{Payload};
+        try { Payload = license::ParseLicense(Text); }
+        catch (...) { if (InvalidLicense) *InvalidLicense = true; throw; }
+        const auto Machine = license::MachineId();
+        const auto Now = license::CurrentFileTime();
+        // Authenticate before touching persistent state; forged cards cannot advance
+        // the product clock or create an authorization record.
+        Reason = license::VerifyPayload(Payload, Policy, Machine, Now);
+        if (!Reason.empty()) {
+            if (InvalidLicense) *InvalidLicense = Reason != "license issued in the future or system clock rolled back" &&
+                !(Reason == "invalid license time" && (Now == 0 || Now > license::KMaximumTimestamp));
+            return false;
+        }
+        LicenseClockTransaction Clock(Policy, Machine, LicenseClockDirectory(), Now);
+        Reason = license::VerifyPayload(Payload, Policy, Machine, Clock.EffectiveTime());
+        if (Reason.empty()) Clock.Commit();
+        else if (InvalidLicense) *InvalidLicense = true;
         return Reason.empty();
     } catch (const std::exception& Error) {
         Reason = Error.what();
@@ -95,9 +113,15 @@ std::string ReadLicenseCache(const LicensePolicy& Policy, const std::filesystem:
         if (File.bad() || Size <= 0 || Size > static_cast<std::streamsize>(KMaximumCacheBytes))
             throw std::runtime_error("invalid saved license size");
         Data.resize(static_cast<std::size_t>(Size));
+        File.close(); // Release the read handle before removing an invalid/expired card.
         auto Identity = CacheIdentity(Policy, Wrapper);
         auto Text = Decrypt(Data, Identity);
-        if (!TryVerifyLicense(Policy, Text, Reason)) throw std::runtime_error(Reason);
+        bool InvalidLicense{};
+        if (!TryVerifyLicense(Policy, Text, Reason, &InvalidLicense)) {
+            // Clock/profile/lock failures deny startup without discarding a valid card.
+            if (InvalidLicense) DeleteFileW(Path.c_str());
+            return {};
+        }
         return Text;
     } catch (const std::exception& Error) {
         Reason = Error.what();

@@ -74,6 +74,12 @@ struct RunConfig {
     std::uint64_t StackUpper = 0;
 };
 
+struct ProtectionOptions {
+    std::uint32_t Instances = 1; // 0 disables function virtualization at build time.
+    std::uint32_t Complexity = 50;
+};
+void ValidateProtectionOptions(const ProtectionOptions& Options);
+
 // Non-secret build metrics; no bytecode, keys or address maps are exposed.
 struct CompilationStats {
     std::size_t BasicBlocks{};
@@ -81,6 +87,9 @@ struct CompilationStats {
     std::size_t LinkInstructions{};
     std::size_t BytecodeInstructions{};
     std::size_t BytecodeBytes{};
+    std::size_t SplitBlocks{};
+    std::size_t PaddingBytes{};
+    std::uint32_t EncodingMask{};
 };
 
 // Immutable encrypted bytecode, reusable across calls and threads. Registers,
@@ -92,13 +101,16 @@ public:
 private:
     struct Storage;
     std::shared_ptr<const Storage> Data;
-    friend CompiledProgram CompileLiftedProgram(const LiftedProgram&, std::uint64_t);
+    friend CompiledProgram CompileLiftedProgram(const LiftedProgram&, std::uint64_t, std::uint32_t);
     friend CompilationStats GetCompilationStats(const CompiledProgram&);
     friend void InvokeCompiledProgram(const CompiledProgram&, VmBridgeContext&, bool,
                                        const RunConfig&);
 };
 
-CompiledProgram CompileLiftedProgram(const LiftedProgram& Program, std::uint64_t Seed);
+CompiledProgram CompileLiftedProgram(const LiftedProgram& Program, std::uint64_t Seed,
+                                     std::uint32_t Complexity = 50);
+std::vector<CompiledProgram> CompileProgramInstances(const LiftedProgram& Program,
+    std::uint64_t Seed, const ProtectionOptions& Options = {});
 CompilationStats GetCompilationStats(const CompiledProgram& Program);
 void InvokeCompiledProgram(const CompiledProgram& Program, VmBridgeContext& Context,
                             bool Trace, const RunConfig& Config = {});

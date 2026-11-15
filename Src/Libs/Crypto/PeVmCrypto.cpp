@@ -10,6 +10,17 @@
 namespace pevm::crypto {
 namespace {
 
+// Volatile stores keep erasure observable even under link-time optimization.
+// This shared primitive deliberately does not depend on Windows headers.
+void Erase(void* Data, std::size_t Size) noexcept {
+    auto* Bytes = static_cast<volatile std::uint8_t*>(Data);
+    while (Size--) *Bytes++ = 0;
+}
+template<class T> struct EraseOnExit {
+    T& Value;
+    ~EraseOnExit() { Erase(&Value, sizeof(Value)); }
+};
+
 constexpr std::uint32_t Bswap32(std::uint32_t Value) {
     return ((Value & 0x000000ffU) << 24) | ((Value & 0x0000ff00U) << 8) |
            ((Value & 0x00ff0000U) >> 8) | ((Value & 0xff000000U) >> 24);
@@ -28,18 +39,29 @@ constexpr std::array<std::uint32_t, 64> KSha256K = {
 
 } // namespace
 
+Sha256::~Sha256() {
+    Erase(State.data(), sizeof(State));
+    Erase(Block.data(), sizeof(Block));
+    Erase(&Used, sizeof(Used));
+    Erase(&Total, sizeof(Total));
+    Erase(&Finished, sizeof(Finished));
+}
+
 void Sha256::Update(std::span<const std::uint8_t> Input) {
+    if (Finished) throw std::runtime_error("SHA-256 state already finalized");
     Total += Input.size();
     for (const auto Byte : Input) {
         Block[Used++] = Byte;
         if (Used == Block.size()) {
             Compress(Block.data());
+            Erase(Block.data(), Block.size());
             Used = 0;
         }
     }
 }
 
 Sha256Digest Sha256::Finish() {
+    if (Finished) throw std::runtime_error("SHA-256 state already finalized");
     const std::uint64_t Bits = Total * 8;
     Block[Used++] = 0x80;
     if (Used > 56) {
@@ -58,6 +80,11 @@ Sha256Digest Sha256::Finish() {
         Out[I * 4 + 2] = static_cast<std::uint8_t>(State[I] >> 8);
         Out[I * 4 + 3] = static_cast<std::uint8_t>(State[I]);
     }
+    Erase(State.data(), sizeof(State));
+    Erase(Block.data(), sizeof(Block));
+    Erase(&Used, sizeof(Used));
+    Erase(&Total, sizeof(Total));
+    Finished = true;
     return Out;
 }
 
@@ -69,6 +96,7 @@ Sha256Digest Sha256::Digest(std::span<const std::uint8_t> Input) {
 
 void Sha256::Compress(const std::uint8_t* InputBlock) {
     std::array<std::uint32_t, 64> W{};
+    EraseOnExit EraseWords{W};
     for (std::size_t I = 0; I < 16; ++I) {
         W[I] = (static_cast<std::uint32_t>(InputBlock[I * 4]) << 24) |
                (static_cast<std::uint32_t>(InputBlock[I * 4 + 1]) << 16) |
@@ -80,7 +108,9 @@ void Sha256::Compress(const std::uint8_t* InputBlock) {
         const auto S1 = std::rotr(W[I - 2], 17) ^ std::rotr(W[I - 2], 19) ^ (W[I - 2] >> 10);
         W[I] = W[I - 16] + S0 + W[I - 7] + S1;
     }
-    auto [A,B,C,D,E,F,G,H] = State;
+    auto Working = State;
+    EraseOnExit EraseWorking{Working};
+    auto& [A,B,C,D,E,F,G,H] = Working;
     for (std::size_t I = 0; I < 64; ++I) {
         const auto S1 = std::rotr(E, 6) ^ std::rotr(E, 11) ^ std::rotr(E, 25);
         const auto Ch = (E & F) ^ (~E & G);
@@ -96,8 +126,10 @@ void Sha256::Compress(const std::uint8_t* InputBlock) {
 
 HmacSha256::HmacSha256(std::span<const std::uint8_t> Key) {
     std::array<std::uint8_t, 64> Pad{};
+    EraseOnExit ErasePad{Pad};
     if (Key.size() > Pad.size()) {
         auto Compressed = Sha256::Digest(Key);
+        EraseOnExit EraseCompressed{Compressed};
         std::copy_n(Compressed.begin(), Compressed.size(), Pad.begin());
     } else {
         std::copy(Key.begin(), Key.end(), Pad.begin());
@@ -109,10 +141,16 @@ HmacSha256::HmacSha256(std::span<const std::uint8_t> Key) {
     Hash.Update(Pad);
 }
 
+HmacSha256::~HmacSha256() {
+    Erase(Opad.data(), Opad.size());
+}
+
 Sha256Digest HmacSha256::Finish() {
     auto Inner = Hash.Finish();
+    EraseOnExit EraseInner{Inner};
     Sha256 Outer;
     Outer.Update(Opad);
+    Erase(Opad.data(), Opad.size());
     Outer.Update(Inner);
     return Outer.Finish();
 }

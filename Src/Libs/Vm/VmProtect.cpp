@@ -32,7 +32,7 @@ enum class Op : std::uint8_t {
     Cmp, Jmp, Jz, Jnz,
     Ja, Jae, Jb, Jbe, Js, Jns, Jl, Jge, Jle, Jg, Jo, Jno, Jp, Jnp,
     Push, Pop, Call, Ret, Load64, Load64D, Store64, Store64D, Nop, Halt,
-    Trap, Sized, Count
+    Trap, Sized, SizedReverse, SizedMasked, SizedCompact, Padding, Count
 };
 
 constexpr std::size_t KOpCount = static_cast<std::size_t>(Op::Count);
@@ -97,6 +97,7 @@ void SetLogicFlags(Flags& F, std::uint64_t Result) {
 }
 
 std::uint64_t NextRandom(std::uint64_t& State) {
+    if (State == 0) State = 0xD1B54A32D192ED03ULL;
     State ^= State >> 12;
     State ^= State << 25;
     State ^= State >> 27;
@@ -135,7 +136,8 @@ const char* Name(Op Operation) {
         "SHLI","SHRI","SHLR","SHRR","SARI","SARR","ROLI","RORI","ROLR","RORR",
         "CMP","JMP","JZ","JNZ",
         "JA","JAE","JB","JBE","JS","JNS","JL","JGE","JLE","JG","JO","JNO","JP","JNP",
-        "PUSH","POP","CALL","RET","LOAD64","LOAD64D","STORE64","STORE64D","NOP","HALT","TRAP","SIZED"
+        "PUSH","POP","CALL","RET","LOAD64","LOAD64D","STORE64","STORE64D","NOP","HALT","TRAP",
+        "SIZED","SIZED_REV","SIZED_MASK","SIZED_SMALL","PAD"
     };
     return Names[static_cast<std::size_t>(Operation)];
 }
@@ -149,6 +151,10 @@ void AppendU64(Bytes& Out, std::uint64_t Value) {
 }
 
 std::uint64_t Mix64(std::uint64_t Value);
+
+std::uint8_t SizedKindMask(std::uint64_t Key, std::size_t Offset) {
+    return static_cast<std::uint8_t>(Mix64(Key ^ Offset ^ 0x8CB92BA72F3D8DD7ULL));
+}
 
 std::uint32_t BranchMask(std::uint64_t Key, std::size_t OperandOffset) {
     return static_cast<std::uint32_t>(Mix64(Key ^ (static_cast<std::uint64_t>(OperandOffset) * 0x9E3779B185EBCA87ULL)));
@@ -171,11 +177,40 @@ public:
     }
     void R(Op Operation, std::uint8_t Value) { Opcode(Operation); Reg(Value); }
     void None(Op Operation) { Opcode(Operation); }
-    void Sized(const LiftedInstruction& I) {
-        Opcode(Op::Sized);
-        Code.push_back(static_cast<std::uint8_t>(I.Op));
-        Code.push_back(I.Width);
-        Reg(I.Dst); Reg(I.Src); AppendU64(Code, I.Immediate);
+    unsigned Sized(const LiftedInstruction& I, std::uint32_t Complexity) {
+        const auto Variant = static_cast<unsigned>(NextRandom(RandomState) % (1 + (Complexity + 33) / 34));
+        const auto Kind = static_cast<std::uint8_t>(static_cast<std::uint8_t>(I.Op) ^ SizedKindMask(BranchKey, Code.size()));
+        Opcode(static_cast<Op>(static_cast<unsigned>(Op::Sized) + Variant));
+        switch (Variant) {
+        case 0:
+            Code.push_back(Kind); Code.push_back(I.Width);
+            Reg(I.Dst); Reg(I.Src); AppendU64(Code, I.Immediate); break;
+        case 1:
+            AppendU64(Code, I.Immediate); Reg(I.Src); Code.push_back(I.Width);
+            Reg(I.Dst); Code.push_back(Kind); break;
+        case 2: {
+            const auto Mask = NextRandom(RandomState);
+            Reg(I.Dst); AppendU64(Code, Mask); Code.push_back(Kind);
+            AppendU64(Code, I.Immediate ^ Mask); Reg(I.Src); Code.push_back(I.Width); break;
+        }
+        case 3: {
+            const auto Length = std::max(1U, (static_cast<unsigned>(std::bit_width(I.Immediate)) + 7) / 8);
+            Code.push_back(I.Width); Code.push_back(Kind); Reg(I.Src); Reg(I.Dst);
+            Code.push_back(static_cast<std::uint8_t>(Length));
+            for (unsigned B = 0; B < Length; ++B) Code.push_back(static_cast<std::uint8_t>(I.Immediate >> (B * 8)));
+            break;
+        }
+        }
+        return Variant;
+    }
+
+    std::size_t Padding(std::uint32_t Complexity) {
+        if (NextRandom(RandomState) % 100 >= Complexity / 4) return 0;
+        const auto Length = 1U + static_cast<unsigned>(NextRandom(RandomState) % (1 + Complexity / 10));
+        Opcode(Op::Padding);
+        Code.push_back(static_cast<std::uint8_t>(Length));
+        for (unsigned I = 0; I < Length; ++I) Code.push_back(static_cast<std::uint8_t>(NextRandom(RandomState)));
+        return Length + 2;
     }
 
     void Junk() {
@@ -329,7 +364,9 @@ template<class P> void ValidateProgramLayout(const P& Program) {
 
 std::size_t EncodedInstructionSize(Op Operation) {
     switch (Operation) {
-    case Op::Sized: return 13;
+    case Op::Sized: case Op::SizedReverse: return 13;
+    case Op::SizedMasked: return 21;
+    case Op::SizedCompact: case Op::Padding: return 0; // length checked by the bounded decoder
     case Op::MovI: case Op::AddI: case Op::SubI: case Op::MulI: case Op::AndI:
     case Op::ShlI: case Op::ShrI: case Op::SarI: case Op::RolI: case Op::RorI:
         return 10;
@@ -763,7 +800,10 @@ public:
                 if constexpr (std::is_same_v<P, FrozenProgram>) return Program.Decoder[Encoded];
                 else return Decode(Encoded, Program.Map);
             }();
-            if (InstructionEnd - At != EncodedInstructionSize(Op)) {
+            const auto FixedSize = EncodedInstructionSize(Op);
+            if ((FixedSize && InstructionEnd - At != FixedSize) ||
+                (Op == Op::SizedCompact && (InstructionEnd - At < 7 || InstructionEnd - At > 14)) ||
+                (Op == Op::Padding && (InstructionEnd - At < 3 || InstructionEnd - At > 34))) {
                 throw std::runtime_error("VM instruction size mismatch");
             }
             if (Trace) {
@@ -776,12 +816,33 @@ public:
                           << " sf=" << Flags.Sf << " of=" << Flags.Of << std::dec << "\n";
             }
             switch (Op) {
-            case Op::Sized: {
-                const auto Kind = static_cast<LiftedOp>(Byte());
-                const auto Width = Byte();
-                const auto D = Reg(), S = Reg();
-                const auto Imm = U64();
-                ExecuteSized(Kind, Width, D, S, Imm, Config);
+            case Op::Sized: case Op::SizedReverse: case Op::SizedMasked: case Op::SizedCompact: {
+                std::uint8_t Kind{}, Width{}, D{}, S{};
+                std::uint64_t Imm{};
+                const auto Variant = static_cast<unsigned>(Op) - static_cast<unsigned>(vmprotect::Op::Sized);
+                switch (Variant) {
+                case 0: Kind=Byte(); Width=Byte(); D=Reg(); S=Reg(); Imm=U64(); break;
+                case 1: Imm=U64(); S=Reg(); Width=Byte(); D=Reg(); Kind=Byte(); break;
+                case 2: {
+                    D=Reg(); const auto Mask=U64(); Kind=Byte(); Imm=U64() ^ Mask; S=Reg(); Width=Byte(); break;
+                }
+                case 3: {
+                    Width=Byte(); Kind=Byte(); S=Reg(); D=Reg(); const auto Length=Byte();
+                    if (Length == 0 || Length > 8 || Pc + Length != OperandEnd)
+                        throw std::runtime_error("VM compact operand length invalid");
+                    for (unsigned B=0; B<Length; ++B) Imm |= std::uint64_t{Byte()} << (B*8);
+                    break;
+                }
+                }
+                ExecuteSized(static_cast<LiftedOp>(Kind ^ SizedKindMask(Program.Key, At)),
+                             Width, D, S, Imm, Config, Variant);
+                break;
+            }
+            case Op::Padding: {
+                const auto Length=Byte();
+                if (Length == 0 || Length > 32 || Pc + Length != OperandEnd)
+                    throw std::runtime_error("VM padding length invalid");
+                for (unsigned I=0; I<Length; ++I) (void)Byte();
                 break;
             }
             case Op::MovI: { const auto D=Reg(); Regs[D]=U64(); break; }
@@ -991,11 +1052,11 @@ private:
         Flags.Cf = F & 1; Flags.Pf = F & 4; Flags.Zf = F & 64; Flags.Sf = F & 128; Flags.Of = F & 2048;
     }
     std::uint64_t NativeFlags(std::uint64_t F) const {
-        return (F & ~0x8c5ULL) | Flags.Cf | (std::uint64_t{Flags.Pf} << 2) |
+        return (F & ~0x8c5ULL) | std::uint64_t{Flags.Cf} | (std::uint64_t{Flags.Pf} << 2) |
                (std::uint64_t{Flags.Zf} << 6) | (std::uint64_t{Flags.Sf} << 7) | (std::uint64_t{Flags.Of} << 11);
     }
     void ExecuteSized(LiftedOp Op, std::uint8_t Width, std::uint8_t D,
-                      std::uint8_t S, std::uint64_t Imm, const RunConfig& Config) {
+                      std::uint8_t S, std::uint64_t Imm, const RunConfig& Config, unsigned Variant) {
         using O = LiftedOp;
         if (!ValidOperandWidth(Width)) throw std::runtime_error("VM invalid operand width");
         const unsigned Bits = Width & 0x7f;
@@ -1010,14 +1071,19 @@ private:
             Flags.Zf = R == 0; Flags.Sf = (R & Sign) != 0; Flags.Pf = EvenParity(R);
         };
         auto Add = [&](std::uint64_t X, std::uint64_t Y, bool Carry) {
-            const auto Sum = (X + Y) & Mask;
+            const auto Sum = (Variant == 1 ? (X ^ Y) + 2 * (X & Y) :
+                              Variant == 2 ? (X | Y) + (X & Y) :
+                              Variant == 3 ? X - (~Y + 1) : X + Y) & Mask;
             R = (Sum + static_cast<unsigned>(Carry)) & Mask;
             Flags.Cf = Sum < X || (Carry && R == 0);
             Flags.Of = (~(X ^ Y) & (X ^ R) & Sign) != 0;
             Zsp();
         };
         auto Sub = [&](std::uint64_t X, std::uint64_t Y, bool Borrow) {
-            R = (X - Y - static_cast<unsigned>(Borrow)) & Mask;
+            const auto Difference = Variant == 1 ? X + ~Y + 1 :
+                                    Variant == 2 ? (X ^ Y) - 2 * (~X & Y) :
+                                    Variant == 3 ? ~(~X + Y) : X - Y;
+            R = (Difference - static_cast<unsigned>(Borrow)) & Mask;
             Flags.Cf = X < Y || (Borrow && X == Y);
             Flags.Of = ((X ^ Y) & (X ^ R) & Sign) != 0;
             Zsp();
@@ -1306,7 +1372,8 @@ struct CompiledProgram::Storage {
 };
 
 namespace {
-Program CompileLiftedBytecode(const LiftedProgram& Lifted, std::uint64_t Seed, CompilationStats& Stats) {
+Program CompileLiftedBytecode(const LiftedProgram& Lifted, std::uint64_t Seed, CompilationStats& Stats,
+                             std::uint32_t Complexity) {
     if (Lifted.Instructions.empty()) throw std::runtime_error("VM bridge received an empty program");
     if(Lifted.ResumeAddress) {
         if(Lifted.ResumeAddress<Lifted.EntryAddress || Lifted.ResumeAddress-Lifted.EntryAddress<5 ||
@@ -1390,9 +1457,17 @@ Program CompileLiftedBytecode(const LiftedProgram& Lifted, std::uint64_t Seed, C
         }
         if (EndsBlock(Instruction.Op) && I + 1 < Leader.size()) Leader[I + 1] = true;
     }
+    Stats.BasicBlocks = static_cast<std::size_t>(std::count(Leader.begin(), Leader.end(), true));
+    auto SplitState = Mix64(Seed ^ 0xDB4F0B9175AE2165ULL);
+    for (std::size_t I = 1; I < Leader.size(); ++I) {
+        if (!Leader[I] && Lifted.Instructions[I].Op != LiftedOp::Nop &&
+            NextRandom(SplitState) % 100 < Complexity / 4) {
+            Leader[I] = true;
+            ++Stats.SplitBlocks;
+        }
+    }
     std::vector<std::size_t> Starts;
     for (std::size_t I = 0; I < Leader.size(); ++I) if (Leader[I]) Starts.push_back(I);
-    Stats.BasicBlocks = Starts.size();
     std::vector<std::size_t> Order(Starts.size());
     for (std::size_t I = 0; I < Order.size(); ++I) Order[I] = I;
     auto LayoutState = Mix64(Seed ^ 0xA0761D6478BD642FULL);
@@ -1414,46 +1489,16 @@ Program CompileLiftedBytecode(const LiftedProgram& Lifted, std::uint64_t Seed, C
             // need no runtime dispatch of their own.
             if (Instruction.Op == LiftedOp::Nop) continue;
             if (!ValidOperandWidth(Instruction.Width)) throw std::runtime_error("VM invalid operand width");
+            Stats.PaddingBytes += A.Padding(Complexity);
             if (Instruction.Op <= LiftedOp::Cmp || Instruction.Op == LiftedOp::LoadMem ||
                 Instruction.Op == LiftedOp::StoreMem || Instruction.Op >= LiftedOp::ZeroExtend) {
-                A.Sized(Instruction);
+                Stats.EncodingMask |= 1U << A.Sized(Instruction, Complexity);
                 continue;
             }
             if (Instruction.Width != 64) throw std::runtime_error("VM invalid control operand width");
             switch (Instruction.Op) {
-            case LiftedOp::MovI: A.Ri(Op::MovI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::Mov: A.Rr(Op::Mov, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::Add: A.Rr(Op::Add, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::AddI: A.Ri(Op::AddI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::Sub: A.Rr(Op::Sub, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::SubI: A.Ri(Op::SubI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::Adc: A.Rr(Op::Adc, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::Sbb: A.Rr(Op::Sbb, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::Mul: A.Rr(Op::Mul, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::MulI: A.Ri(Op::MulI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::Xor: A.Rr(Op::Xor, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::And: A.Rr(Op::And, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::AndI: A.Ri(Op::AndI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::Neg: A.R(Op::Neg, Register(Instruction.Dst)); break;
-            case LiftedOp::Not: A.R(Op::Not, Register(Instruction.Dst)); break;
-            case LiftedOp::Or: A.Rr(Op::Or, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::Test: A.Rr(Op::Test, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::ShlI: A.Ri(Op::ShlI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::ShrI: A.Ri(Op::ShrI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::ShlR: A.Rr(Op::ShlR, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::ShrR: A.Rr(Op::ShrR, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::SarI: A.Ri(Op::SarI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::SarR: A.Rr(Op::SarR, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::RolI: A.Ri(Op::RolI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::RorI: A.Ri(Op::RorI, Register(Instruction.Dst), Instruction.Immediate); break;
-            case LiftedOp::RolR: A.Rr(Op::RolR, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::RorR: A.Rr(Op::RorR, Register(Instruction.Dst), Register(Instruction.Src)); break;
-            case LiftedOp::Bswap: A.R(Op::Bswap, Register(Instruction.Dst)); break;
-            case LiftedOp::Cmp: A.Rr(Op::Cmp, Register(Instruction.Dst), Register(Instruction.Src)); break;
             case LiftedOp::Push: A.R(Op::Push, Register(Instruction.Dst)); break;
             case LiftedOp::Pop: A.R(Op::Pop, Register(Instruction.Dst)); break;
-            case LiftedOp::LoadMem: A.RrI(Op::Load64D, Register(Instruction.Dst), Register(Instruction.Src), Instruction.Immediate); break;
-            case LiftedOp::StoreMem: A.RrI(Op::Store64D, Register(Instruction.Dst), Register(Instruction.Src), Instruction.Immediate); break;
             case LiftedOp::Call: A.Jump(Op::Call, Target(Instruction.Target)); break;
             case LiftedOp::Ret: A.None(Op::Ret); break;
             case LiftedOp::Nop: A.None(Op::Nop); break;
@@ -1479,12 +1524,33 @@ Program CompileLiftedBytecode(const LiftedProgram& Lifted, std::uint64_t Seed, C
 }
 } // namespace
 
-CompiledProgram CompileLiftedProgram(const LiftedProgram& Lifted, std::uint64_t Seed) {
+void ValidateProtectionOptions(const ProtectionOptions& Options) {
+    if (Options.Instances > 10) throw std::runtime_error("VM instances must be in 0..10");
+    if (Options.Complexity > 100) throw std::runtime_error("VM complexity must be in 0..100");
+}
+
+CompiledProgram CompileLiftedProgram(const LiftedProgram& Lifted, std::uint64_t Seed,
+                                     std::uint32_t Complexity) {
+    ValidateProtectionOptions({1, Complexity});
     CompilationStats Stats{};
-    auto Result = CompileLiftedBytecode(Lifted, Seed, Stats);
+    auto Result = CompileLiftedBytecode(Lifted, Seed, Stats, Complexity);
     CompiledProgram Compiled;
     Compiled.Data = std::make_shared<CompiledProgram::Storage>(Result, Stats);
     return Compiled;
+}
+
+std::vector<CompiledProgram> CompileProgramInstances(const LiftedProgram& Lifted,
+    std::uint64_t Seed, const ProtectionOptions& Options) {
+    ValidateProtectionOptions(Options);
+    std::vector<CompiledProgram> Instances;
+    Instances.reserve(Options.Instances);
+    for (std::uint32_t I = 0; I < Options.Instances; ++I) {
+        // Keep instance zero compatible with standalone compilation. Further
+        // instances use independent maps, instruction keys and physical layouts.
+        const auto InstanceSeed = I == 0 ? Seed : Mix64(Seed ^ (0xD6E8FEB86659FD93ULL * I));
+        Instances.push_back(CompileLiftedProgram(Lifted, InstanceSeed, Options.Complexity));
+    }
+    return Instances;
 }
 
 CompilationStats GetCompilationStats(const CompiledProgram& Compiled) {

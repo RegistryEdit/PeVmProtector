@@ -2,11 +2,13 @@
 #include "PeLayout.h"
 #include "PeRelocations.h"
 #include "PeTls.h"
+#include "PeReleaseImage.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <charconv>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +24,9 @@
 #include <type_traits>
 #include <vector>
 #include <windows.h>
+#include <bcrypt.h>
+
+#pragma comment(lib, "bcrypt.lib")
 
 #include "PeVmContainer.h"
 #include "BuildLog.h"
@@ -43,10 +48,24 @@ struct EmbeddedImage {
     VmpMetadata Metadata{};
 };
 
+std::uint64_t SecureBuildRandom() {
+    std::uint64_t Value{};
+    for (unsigned Attempt = 0; Attempt < 8; ++Attempt) {
+        if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&Value), sizeof(Value),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0)
+            throw std::runtime_error("cannot generate secure build randomness");
+        if (Value != 0) return Value;
+    }
+    throw std::runtime_error("invalid secure build randomness");
+}
+
 EmbeddedImage AddVmpSection(Bytes Stub, std::span<const std::uint8_t> Payload,
                             std::span<const std::uint8_t> VmData,
                             std::uint64_t BuildId, std::string_view Watermark,
-                            const LicensePolicy& License) {
+                            const licensecli::BuildPolicy& License) {
+    // All carrier transformations precede region tags and AES-GCM authentication.
+    // Keep runtime directories while removing distributable debug/symbol hints.
+    (void)pevm::pe::StripDebugMetadata(Stub);
     pevm::pe::AppendLayout Layout;
     std::optional<pevm::pe::TlsLayout> CarrierTls;
     Bytes CarrierTemplate;
@@ -166,7 +185,7 @@ EmbeddedImage AddVmpSection(Bytes Stub, std::span<const std::uint8_t> Payload,
 // the wrapper footer to an embedded stub image. Shared by wrap and the
 // function-virtualization commands.
 Bytes SealWrapper(EmbeddedImage Embedded, const Bytes& Payload,
-                  std::string_view Password) {
+                  std::string_view Password, const licensecli::BuildPolicy& License) {
     WrapperFooter Footer{};
     Footer.Magic = KWrapperMagic;
     Footer.Version = 2;
@@ -176,16 +195,20 @@ Bytes SealWrapper(EmbeddedImage Embedded, const Bytes& Payload,
     Footer.MetadataOffset = Embedded.MetadataOffset;
     Footer.MetadataSize = sizeof(VmpMetadata);
     Footer.SecretSize = static_cast<std::uint32_t>(Password.size());
-    const auto Ticks = static_cast<std::uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-    for (std::size_t I = 0; I < Footer.Salt.size(); ++I) {
-        Footer.Salt[I] = static_cast<std::uint8_t>(WrapperMix64(Ticks ^ (I * 0x9E3779B97F4A7C15ULL)) >> 32);
+    if (BCryptGenRandom(nullptr, Footer.Salt.data(), static_cast<ULONG>(Footer.Salt.size()),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0)
+        throw std::runtime_error("cannot generate wrapper nonce");
+    Bytes SealedSecret;
+    if (License.Required == 2) {
+        SealedSecret = pevm::license::SealLicensedSecret(License.UnlockKey, Embedded.Image, Footer, Password);
+    } else {
+        const auto Fingerprint = WrapperFingerprint(Embedded.Image, Payload, Footer.Salt);
+        SealedSecret.resize(Password.size());
+        for (std::size_t I = 0; I < Password.size(); ++I) {
+            SealedSecret[I] = static_cast<std::uint8_t>(Password[I]) ^ WrapperSecretByte(Fingerprint, I);
+        }
+        Footer.SecretTag = WrapperSecretTag(SealedSecret, Fingerprint);
     }
-    const auto Fingerprint = WrapperFingerprint(Embedded.Image, Payload, Footer.Salt);
-    Bytes SealedSecret(Password.size());
-    for (std::size_t I = 0; I < Password.size(); ++I) {
-        SealedSecret[I] = static_cast<std::uint8_t>(Password[I]) ^ WrapperSecretByte(Fingerprint, I);
-    }
-    Footer.SecretTag = WrapperSecretTag(SealedSecret, Fingerprint);
     Bytes Wrapped = std::move(Embedded.Image);
     Wrapped.insert(Wrapped.end(), SealedSecret.begin(), SealedSecret.end());
     const auto* FooterBytes = reinterpret_cast<const std::uint8_t*>(&Footer);
@@ -193,9 +216,8 @@ Bytes SealWrapper(EmbeddedImage Embedded, const Bytes& Payload,
     return Wrapped;
 }
 
-std::uint64_t NewBuildId(std::size_t PayloadSize) {
-    return WrapperMix64(static_cast<std::uint64_t>(
-        std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^ PayloadSize);
+std::uint64_t NewBuildId(std::size_t) {
+    return SecureBuildRandom();
 }
 
 // Runnable wrappers host user-mode payloads only: the stub maps the image and
@@ -225,7 +247,7 @@ Bytes ReadWrapperPayload(const fs::path& Input, pevm::build::Log& Log) {
 
 void LogProtectionOptions(pevm::build::Log& Log, bool Virtualize, bool AntiDisassembly,
                           bool Mutate, std::string_view Watermark, bool Compress,
-                          const LicensePolicy& License) {
+                          const licensecli::BuildPolicy& License) {
     Log.Step("Configure protection");
     Log.Detail("function virtualization", Virtualize ? "enabled" : "off");
     Log.Detail("instruction mutation", Mutate ? "enabled" : "off");
@@ -235,10 +257,37 @@ void LogProtectionOptions(pevm::build::Log& Log, bool Virtualize, bool AntiDisas
         pevm::build::Number(std::min<std::size_t>(Watermark.size(), 63)) + " bytes embedded" +
         (Watermark.size() > 63 ? " (truncated to metadata capacity)" : ""));
     Log.Detail("license", License.Required ? "required; ECDSA P-256 / SHA-256; product and device bound" : "off");
+    if (License.Required) Log.Detail("license payload encryption",
+        "AES-256-GCM; key supplied only by signed license; entire wrapper authenticated");
+    Log.Detail("runtime code verification", "disk-derived executable sections; ASLR fixups; periodic memory/page checks");
+    Log.Detail("release symbol hygiene", "carrier CodeView/PDB hints and COFF symbols removed; runtime directories retained");
+    Log.Detail("build randomization", "Windows CNG system RNG; independent build IDs and default VM seeds");
     if (License.Required) {
         Log.Detail("license public key fingerprint", crypto::Hex(crypto::Sha256::Digest(License.PublicKey)));
         Log.Detail("license product digest", crypto::Hex(License.ProductId));
     }
+}
+
+bool ParseVmOption(std::string_view Arg, vmprotect::ProtectionOptions& Options) {
+    const bool Instances = Arg.starts_with("--vm-instances=");
+    if (!Instances && !Arg.starts_with("--vm-complexity=")) return false;
+    const auto Text = Arg.substr(Instances ? 15 : 16);
+    std::uint32_t Value{};
+    const auto Parsed = std::from_chars(Text.data(), Text.data() + Text.size(), Value);
+    if (Parsed.ec != std::errc{} || Parsed.ptr != Text.data() + Text.size() ||
+        Value > (Instances ? 10U : 100U)) {
+        throw std::runtime_error(Instances ? "--vm-instances requires an integer in 0..10" :
+                                            "--vm-complexity requires an integer in 0..100");
+    }
+    (Instances ? Options.Instances : Options.Complexity) = Value;
+    return true;
+}
+
+void LogVmOptions(pevm::build::Log& Log, const vmprotect::ProtectionOptions& Options) {
+    vmprotect::ValidateProtectionOptions(Options);
+    Log.Detail("VM instances", pevm::build::Number(Options.Instances) +
+        (Options.Instances ? " per function; round-robin invocation" : " (function virtualization disabled)"));
+    Log.Detail("VM complexity", pevm::build::Number(Options.Complexity) + " / 100");
 }
 
 void LogWrapperLayout(pevm::build::Log& Log, const VmpMetadata& Metadata) {
@@ -255,7 +304,7 @@ void LogWrapperLayout(pevm::build::Log& Log, const VmpMetadata& Metadata) {
 void AssemblePlainWrapper(std::span<const std::uint8_t> Plain, const fs::path& Output,
                           std::string_view Password, const fs::path& StubPath,
                           std::string_view Watermark, bool Compress,
-                          const LicensePolicy& License, pevm::build::Log& Log) {
+                          const licensecli::BuildPolicy& License, pevm::build::Log& Log) {
     Log.Step("Check loader availability");
     if (!fs::exists(StubPath)) throw std::runtime_error("PeVmStub.exe not found beside pevm.exe");
     Log.Detail("loader", fs::absolute(StubPath).lexically_normal().string());
@@ -269,7 +318,7 @@ void AssemblePlainWrapper(std::span<const std::uint8_t> Plain, const fs::path& O
                                         Watermark, License);
     LogWrapperLayout(Log, Embedded.Metadata);
     Log.Step("Seal wrapper and write executable");
-    const auto Wrapped = SealWrapper(std::move(Embedded), Payload, Password);
+    const auto Wrapped = SealWrapper(std::move(Embedded), Payload, Password, License);
     pevm::pe::ImageView Verified(Wrapped);
     util::WriteFileAtomic(Output, Wrapped);
     Log.Finish(Wrapped, OriginalSize);
@@ -277,7 +326,7 @@ void AssemblePlainWrapper(std::span<const std::uint8_t> Plain, const fs::path& O
 
 void CmdWrap(const fs::path& Input, const fs::path& Output, std::string_view Password,
              const fs::path& StubPath, std::string_view Watermark, bool Compress,
-             const LicensePolicy& License) {
+             const licensecli::BuildPolicy& License) {
     pevm::build::Log Log("wrap", Input, Output);
     const auto Plain = ReadWrapperPayload(Input, Log);
     LogProtectionOptions(Log, false, false, false, Watermark, Compress, License);
@@ -290,7 +339,8 @@ void AssembleVirtualizedWrapper(std::span<const std::uint8_t> Plain, const fs::p
                                 std::string_view Password, const x64lift::MultiLiftResult& Lifted,
                                 std::uint64_t Seed, const fs::path& StubPath, bool AntiDisassembly,
                                 bool Mutate, std::string_view Watermark, bool Compress,
-                                const LicensePolicy& License, pevm::build::Log& Log) {
+                                const licensecli::BuildPolicy& License, pevm::build::Log& Log,
+                                const vmprotect::ProtectionOptions& VmOptions) {
     Log.Step("Prepare virtualized functions");
     const auto BuildId = NewBuildId(0);
     auto Prepared = Lifted;
@@ -321,13 +371,13 @@ void AssembleVirtualizedWrapper(std::span<const std::uint8_t> Plain, const fs::p
     Log.Step("Encrypt and serialize VM program");
     std::vector<vmprotect::CompilationStats> CompiledStats;
     const auto VmData = x64lift::SerializeVmp3Multi(Prepared, Seed, Password,
-                                                    MakeHandlerProfile(BuildId), AntiDisassembly, &CompiledStats);
+                                                    MakeHandlerProfile(BuildId), AntiDisassembly, &CompiledStats, VmOptions);
     Log.Detail("VM program size", pevm::build::Size(VmData.size()));
     Log.Detail("VM authentication", "HMAC-SHA256 | 32-byte tag | header + entries + ciphertext + decoys");
     Log.Detail("VM key separation", "encryption / authentication / per-function seeds");
     Log.Detail("VM runtime checks", "instruction boundaries + register maps + instruction tags + CFI + fuel");
     Log.Detail("VM code layout", "shuffled basic blocks with linked fallthrough paths");
-    Log.Detail("VM decoding", "per-instruction rolling state and handler selection");
+    Log.Detail("VM decoding", "masked sub-opcodes; variable operand layouts; per-instruction rolling state");
     for (std::size_t I = 0; I < CompiledStats.size(); ++I) {
         const auto& Stats = CompiledStats[I];
         Log.Detail("compiled function RVA", pevm::build::Hex(Prepared.Functions[I].Program.EntryAddress) +
@@ -335,7 +385,11 @@ void AssembleVirtualizedWrapper(std::span<const std::uint8_t> Plain, const fs::p
             " | relocated=" + pevm::build::Number(Stats.RelocatedBlocks) +
             " | link instructions=" + pevm::build::Number(Stats.LinkInstructions) +
             " | bytecode instructions=" + pevm::build::Number(Stats.BytecodeInstructions) +
-            " | encrypted bytes=" + pevm::build::Number(Stats.BytecodeBytes));
+            " | encrypted bytes=" + pevm::build::Number(Stats.BytecodeBytes) +
+            " | split blocks=" + pevm::build::Number(Stats.SplitBlocks) +
+            " | padding bytes=" + pevm::build::Number(Stats.PaddingBytes) +
+            " | encoding formats=" + pevm::build::Number(std::popcount(Stats.EncodingMask)) +
+            " | instances=" + pevm::build::Number(VmOptions.Instances));
     }
     const auto Payload = PackContainer(Plain, Password, Compress, &Log);
     Log.Step("Embed payload and VM program into loader");
@@ -348,7 +402,7 @@ void AssembleVirtualizedWrapper(std::span<const std::uint8_t> Plain, const fs::p
                                         License);
     LogWrapperLayout(Log, Embedded.Metadata);
     Log.Step("Seal wrapper and write executable");
-    const auto Wrapped = SealWrapper(std::move(Embedded), Payload, Password);
+    const auto Wrapped = SealWrapper(std::move(Embedded), Payload, Password, License);
     pevm::pe::ImageView Verified(Wrapped);
     util::WriteFileAtomic(Output, Wrapped);
     Log.Finish(Wrapped, OriginalSize);
@@ -358,18 +412,25 @@ void CmdVirtualizeFunctions(const fs::path& Input, const fs::path& Output,
                             std::string_view Password, const std::vector<std::uint32_t>& FunctionRvas,
                             std::uint64_t Seed, const fs::path& StubPath, bool AntiDisassembly,
                             bool Mutate, std::string_view Watermark, bool Compress,
-                            const LicensePolicy& License) {
+                            const licensecli::BuildPolicy& License, const vmprotect::ProtectionOptions& VmOptions = {}) {
     pevm::build::Log Log(FunctionRvas.size() == 1 ? "protect-function" : "protect-functions", Input, Output);
     if (FunctionRvas.empty()) throw std::runtime_error("function virtualization requires at least one RVA");
     const auto Plain = ReadWrapperPayload(Input, Log);
-    LogProtectionOptions(Log, true, AntiDisassembly, Mutate, Watermark, Compress, License);
+    vmprotect::ValidateProtectionOptions(VmOptions);
+    LogProtectionOptions(Log, VmOptions.Instances != 0, AntiDisassembly && VmOptions.Instances != 0,
+                         Mutate && VmOptions.Instances != 0, Watermark, Compress, License);
+    LogVmOptions(Log, VmOptions);
+    if (VmOptions.Instances == 0) {
+        AssemblePlainWrapper(Plain, Output, Password, StubPath, Watermark, Compress, License, Log);
+        return;
+    }
     Log.Step("Lift selected functions");
     Log.Detail("requested count", pevm::build::Number(FunctionRvas.size()));
     if (!fs::exists(StubPath)) throw std::runtime_error("PeVmStub.exe not found beside pevm.exe");
     const pevm::pe::ImageView Image(Plain);
     const auto Lifted = x64lift::LiftPeFunctions(Image, FunctionRvas);
     AssembleVirtualizedWrapper(Plain, Output, Password, Lifted, Seed, StubPath, AntiDisassembly,
-                               Mutate, Watermark, Compress, License, Log);
+                               Mutate, Watermark, Compress, License, Log, VmOptions);
 }
 
 // VMP-style "virtualize everything": discover every function (.pdata and
@@ -380,10 +441,17 @@ void CmdVirtualizeAll(const fs::path& Input, const fs::path& Output,
                       std::string_view Password, std::uint64_t Seed, const fs::path& StubPath,
                       bool AntiDisassembly, bool AllowMemory, std::size_t MinimumBytes,
                       bool Mutate, std::string_view Watermark, bool Compress,
-                      const LicensePolicy& License) {
+                      const licensecli::BuildPolicy& License, const vmprotect::ProtectionOptions& VmOptions = {}) {
     pevm::build::Log Log("protect-all", Input, Output);
     const auto Plain = ReadWrapperPayload(Input, Log);
-    LogProtectionOptions(Log, true, AntiDisassembly, Mutate, Watermark, Compress, License);
+    vmprotect::ValidateProtectionOptions(VmOptions);
+    LogProtectionOptions(Log, VmOptions.Instances != 0, AntiDisassembly && VmOptions.Instances != 0,
+                         Mutate && VmOptions.Instances != 0, Watermark, Compress, License);
+    LogVmOptions(Log, VmOptions);
+    if (VmOptions.Instances == 0) {
+        AssemblePlainWrapper(Plain, Output, Password, StubPath, Watermark, Compress, License, Log);
+        return;
+    }
     Log.Step("Discover function candidates");
     Log.Detail("minimum function bytes", pevm::build::Number(MinimumBytes));
     Log.Detail("VM memory operands", "native pointers and isolated VM stack");
@@ -424,7 +492,7 @@ void CmdVirtualizeAll(const fs::path& Input, const fs::path& Output,
         return;
     }
     AssembleVirtualizedWrapper(Plain, Output, Password, Lifted, Seed, StubPath, AntiDisassembly,
-                               Mutate, Watermark, Compress, License, Log);
+                               Mutate, Watermark, Compress, License, Log, VmOptions);
 }
 
 void CmdScanFunctions(const fs::path& Input, const fs::path& JsonPath, std::size_t MinimumBytes,
@@ -451,7 +519,7 @@ void InspectWrapper(std::span<const std::uint8_t> File) {
     if (File.size() < sizeof(WrapperFooter)) throw std::runtime_error("wrapper footer missing");
     WrapperFooter Footer{};
     std::memcpy(&Footer, File.data() + File.size() - sizeof(Footer), sizeof(Footer));
-    if (Footer.Magic != KWrapperMagic || Footer.Version != 2) throw std::runtime_error("not a PeVmProtector wrapper");
+    if (Footer.Magic != KWrapperMagic || (Footer.Version != 2 && Footer.Version != 3)) throw std::runtime_error("not a PeVmProtector wrapper");
     if (Footer.MetadataSize != sizeof(VmpMetadata) || Footer.MetadataOffset > File.size() || Footer.MetadataSize > File.size() - Footer.MetadataOffset) {
         throw std::runtime_error("wrapper metadata range invalid");
     }
@@ -461,8 +529,10 @@ void InspectWrapper(std::span<const std::uint8_t> File) {
         throw std::runtime_error("unsupported wrapper metadata; rebuild with signed licensing");
     }
     pevm::license::ValidatePolicy(Metadata.License);
+    if ((Footer.Version == 3) != (Metadata.License.Required == 2)) throw std::runtime_error("wrapper license encryption policy mismatch");
     if (Metadata.License.Required != 0) {
         std::cout << "license: ECDSA P-256\n"
+                  << "license payload encryption: " << (Footer.Version == 3 ? "AES-256-GCM (license-held key)" : "legacy startup policy") << "\n"
                   << "license key id: " << crypto::Hex(crypto::Sha256::Digest(Metadata.License.PublicKey)) << "\n"
                   << "license product hash: " << crypto::Hex(Metadata.License.ProductId) << "\n";
     }
@@ -498,6 +568,8 @@ void InspectWrapper(std::span<const std::uint8_t> File) {
         std::cout << ".vmp3 version: " << Vmp3.Version << " (instruction table encrypted)\n"
                   << "VM authentication: HMAC-SHA256 (entire image, verified before decryption)\n"
                   << ".vmp3 functions: " << Vmp3.FunctionCount << "\n"
+                  << ".vmp3 VM instances: " << static_cast<unsigned>(Vmp3.Instances) << "\n"
+                  << ".vmp3 VM complexity: " << static_cast<unsigned>(Vmp3.Complexity) << "\n"
                   << ".vmp3 seed: 0x" << std::hex << Vmp3.Seed << std::dec << "\n"
                   << ".vmp3 decoy bytes: " << Vmp3.DecoySize << "\n";
         for (std::uint32_t I = 0; I < Vmp3.FunctionCount; ++I) {
@@ -654,16 +726,20 @@ void SelfTest() {
 void Usage() {
     std::cout<<"PeVmProtector\n"
              <<"  pevm pack <input.exe> <output.pvm> <password> [--compress]\n"
-             <<"  pevm wrap <input.exe> <output.exe> <password> [--watermark=text] [--compress] [--license --license-public-key=<file> --license-product=<id>]\n"
+             <<"  pevm wrap <input.exe> <output.exe> <password> [--watermark=text] [--compress] [--license --license-public-key=<file> --license-product=<id> --license-build-key=<file>]\n"
              <<"  pevm license-machine-id\n"
              <<"  pevm license-keygen <private-file> <public-file>\n"
              <<"  pevm license-export-public <private-file> <public-file>\n"
+             <<"  pevm license-export-build-key <private-file> <build-key-file> --product=<id>\n"
              <<"  pevm license-issue <private-file> [days=30] --machine=<64hex> --product=<id> [--output=<file>]\n"
              <<"  pevm license-verify <public-file> <license-file> --product=<id> [--machine=<64hex>]\n"
              <<"  pevm protect-function <input.exe> <output.exe> <password> <function-rva> [seed] [--anti-disasm]\n"
              <<"  pevm protect-functions <input.exe> <output.exe> <password> <rva> [rva...] [--seed=N] [--anti-disasm]\n"
              <<"  pevm protect-all <input.exe> <output.exe> <password> [seed] [--anti-disasm] [--allow-mem] [--min-bytes=N] [--mutate] [--watermark=text]\n"
-             <<"    wrap/protect-* license options: --license --license-public-key=<file> --license-product=<id>\n"
+             <<"    wrap/protect-* license options: --license --license-public-key=<file> --license-product=<id> --license-build-key=<file>\n"
+             <<"    licensed builds require a matching DPAPI-protected .buildkey and v3 card for AES-256-GCM payload encryption\n"
+             <<"    protect-* VM options: --vm-instances=0..10 (default 1; 0 disables VM) --vm-complexity=0..100 (default 50)\n"
+             <<"    protect-* seeds: randomized by default; [seed] or --seed=N overrides\n"
              <<"  pevm scan-functions <input.exe> [json-out] [--min-bytes=N] [--pdb=local.pdb]\n"
              <<"  pevm unpack <input.pvm> <output.exe> <password>\n"
              <<"  pevm inspect <input.pvm>\n"
@@ -692,6 +768,7 @@ int main(int Argc,char** Argv) {
             pevm::license::GenerateKeyFiles(Argv[2], Argv[3]);
             std::cout << "signing key saved (DPAPI protected)\npublic key: " << Argv[3] << "\n";
         }
+        else if(Cmd=="license-export-build-key") licensecli::ExportBuildKey(Argc, Argv);
         else if(Cmd=="license-export-public" && Argc==4) {
             pevm::license::ExportPublicKeyFile(Argv[2], Argv[3]);
             std::cout << "public key: " << Argv[3] << "\n";
@@ -717,48 +794,56 @@ int main(int Argc,char** Argv) {
         else if(Cmd=="protect-function" && Argc>=6) {
             const auto StubPath = fs::absolute(Argv[0]).parent_path() / "PeVmStub.exe";
             const auto Rva = static_cast<std::uint32_t>(std::stoul(Argv[5], nullptr, 0));
-            std::uint64_t Seed = 0xC001D00D5EED1234ULL;
+            std::uint64_t Seed = NewBuildId(0);
             bool AntiDisassembly = false, Mutate = false, Compress = false;
             std::string Watermark;
             licensecli::Options License;
+            vmprotect::ProtectionOptions VmOptions;
             for (int I = 6; I < Argc; ++I) {
                 const std::string_view Arg = Argv[I];
                 if (Arg == "--anti-disasm") AntiDisassembly = true;
                 else if (Arg == "--mutate") Mutate = true;
                 else if (Arg == "--compress") Compress = true;
                 else if (License.Parse(Arg)) {}
+                else if (ParseVmOption(Arg, VmOptions)) {}
                 else if (Arg.starts_with("--watermark=")) Watermark = Argv[I] + 12;
+                else if (Arg.starts_with("--seed=")) Seed = std::stoull(Argv[I] + 7, nullptr, 0);
+                else if (Arg.starts_with("--")) throw std::runtime_error("unknown protection option");
                 else Seed = std::stoull(Argv[I], nullptr, 0);
             }
             CmdVirtualizeFunctions(Argv[2], Argv[3], Argv[4], {Rva}, Seed, StubPath, AntiDisassembly,
-                                   Mutate, Watermark, Compress, License.Resolve());
+                                   Mutate, Watermark, Compress, License.Resolve(), VmOptions);
         }
         else if(Cmd=="protect-functions" && Argc>=7) {
             const auto StubPath = fs::absolute(Argv[0]).parent_path() / "PeVmStub.exe";
             std::vector<std::uint32_t> Rvas;
-            std::uint64_t Seed = 0xC001D00D5EED1234ULL;
+            std::uint64_t Seed = NewBuildId(0);
             bool AntiDisassembly = false, Mutate = false, Compress = false;
             std::string Watermark;
             licensecli::Options License;
+            vmprotect::ProtectionOptions VmOptions;
             for (int I = 5; I < Argc; ++I) {
                 const std::string_view Arg = Argv[I];
                 if (Arg == "--anti-disasm") AntiDisassembly = true;
                 else if (Arg == "--mutate") Mutate = true;
                 else if (Arg == "--compress") Compress = true;
                 else if (License.Parse(Arg)) {}
+                else if (ParseVmOption(Arg, VmOptions)) {}
                 else if (Arg.starts_with("--watermark=")) Watermark = Argv[I] + 12;
                 else if (Arg.starts_with("--seed=")) Seed = std::stoull(Argv[I] + 7, nullptr, 0);
+                else if (Arg.starts_with("--")) throw std::runtime_error("unknown protection option");
                 else Rvas.push_back(static_cast<std::uint32_t>(std::stoul(Argv[I], nullptr, 0)));
             }
             CmdVirtualizeFunctions(Argv[2], Argv[3], Argv[4], Rvas, Seed, StubPath, AntiDisassembly,
-                                   Mutate, Watermark, Compress, License.Resolve());
+                                   Mutate, Watermark, Compress, License.Resolve(), VmOptions);
         }
         else if(Cmd=="protect-all" && Argc>=5) {
             const auto StubPath = fs::absolute(Argv[0]).parent_path() / "PeVmStub.exe";
-            std::uint64_t Seed = 0xC001D00D5EED1234ULL;
+            std::uint64_t Seed = NewBuildId(0);
             bool AntiDisassembly = false, AllowMemory = false, Mutate = false, Compress = false;
             std::string Watermark;
             licensecli::Options License;
+            vmprotect::ProtectionOptions VmOptions;
             std::size_t MinimumBytes = 16;
             for (int I = 5; I < Argc; ++I) {
                 const std::string_view Arg = Argv[I];
@@ -767,12 +852,15 @@ int main(int Argc,char** Argv) {
                 else if (Arg == "--mutate") Mutate = true;
                 else if (Arg == "--compress") Compress = true;
                 else if (License.Parse(Arg)) {}
+                else if (ParseVmOption(Arg, VmOptions)) {}
                 else if (Arg.starts_with("--watermark=")) Watermark = Argv[I] + 12;
                 else if (Arg.starts_with("--min-bytes=")) MinimumBytes = std::stoull(Argv[I] + 12, nullptr, 0);
+                else if (Arg.starts_with("--seed=")) Seed = std::stoull(Argv[I] + 7, nullptr, 0);
+                else if (Arg.starts_with("--")) throw std::runtime_error("unknown protection option");
                 else Seed = std::stoull(Argv[I], nullptr, 0);
             }
             CmdVirtualizeAll(Argv[2], Argv[3], Argv[4], Seed, StubPath, AntiDisassembly, AllowMemory,
-                             MinimumBytes, Mutate, Watermark, Compress, License.Resolve());
+                             MinimumBytes, Mutate, Watermark, Compress, License.Resolve(), VmOptions);
         }
         else if(Cmd=="scan-functions" && Argc>=3 && Argc<=6) {
             std::string JsonPath;

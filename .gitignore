@@ -12,6 +12,7 @@ out/
 .mimosa/
 
 # Temporary artifacts
+/TestArtifacts/
 *.tmp
 *.payload.tmp
 *.loader-error.txt
@@ -20,4 +21,5 @@ out/
 # Local signing keys and issued customer licenses
 /license-keys/
 *.private
+*.buildkey
 *.license

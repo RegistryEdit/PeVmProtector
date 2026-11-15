@@ -12,6 +12,9 @@
 #include <stdexcept>
 #include <windows.h>
 
+unsigned CodeIntegrityTests();
+unsigned ReleaseImageTests();
+
 namespace {
 using pevm::pe::ImageView;
 constexpr std::size_t Nt = 0x80, Optional = Nt + 24, Table = Optional + 240;
@@ -412,6 +415,8 @@ void FileTests() {
 int main() {
     try {
         ParserTests(); TlsTests(); LayoutTests(); RelocationTests(); ResourceTests(); LifterTests(); FunctionNameTests(); ContainerTests(); FileTests();
+        Checks += CodeIntegrityTests();
+        Checks += ReleaseImageTests();
         std::cout << "PE architecture regression: " << Checks << " checks passed\n";
         return 0;
     } catch (const std::exception& Error) {

@@ -26,11 +26,14 @@
     <ClCompile Include="..\Pe\PeImage.cpp" />
     <ClCompile Include="..\Pe\PeLayout.cpp" />
     <ClCompile Include="..\Pe\PeRelocations.cpp" />
+    <ClCompile Include="..\Pe\PeCodeIntegrity.cpp" />
+    <ClCompile Include="..\Pe\PeReleaseImage.cpp" />
     <ClCompile Include="..\Pe\FileIo.cpp" />
     <ClCompile Include="..\Container\PeVmContainer.cpp" />
     <ClCompile Include="..\Container\VmImageCodec.cpp" />
     <ClCompile Include="..\Crypto\PeVmCrypto.cpp" />
     <ClCompile Include="..\License\PeVmLicense.cpp" />
+    <ClCompile Include="..\License\LicenseProtection.cpp" />
     <ClCompile Include="..\Lifter\X64Lifter.cpp" />
     <ClCompile Include="..\Lifter\FunctionScanner.cpp" />
     <ClCompile Include="..\Vm\VmProtect.cpp" />
@@ -40,6 +43,8 @@
     <ClInclude Include="..\Pe\PeImage.h" />
     <ClInclude Include="..\Pe\PeLayout.h" />
     <ClInclude Include="..\Pe\PeRelocations.h" />
+    <ClInclude Include="..\Pe\PeCodeIntegrity.h" />
+    <ClInclude Include="..\Pe\PeReleaseImage.h" />
     <ClInclude Include="..\Pe\PeTls.h" />
     <ClInclude Include="..\Pe\WindowsResources.h" />
     <ClInclude Include="..\Pe\FileIo.h" />

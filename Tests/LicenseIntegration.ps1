@@ -3,6 +3,7 @@ $LicenseWork = Join-Path $Work ("licenses-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $LicenseWork | Out-Null
 $Private = Join-Path $LicenseWork 'issuer.private'
 $Public = Join-Path $LicenseWork 'issuer.pub'
+$BuildKey = Join-Path $LicenseWork 'product.buildkey'
 $LicenseFile = Join-Path $LicenseWork 'customer.license'
 $Output = Join-Path $LicenseWork 'LifterFixture.licensed.exe'
 $Product = 'pevm.regression'
@@ -16,6 +17,8 @@ if ($LASTEXITCODE -ne 0 -or ($MachineOutput -join "`n") -notmatch '^machine id: 
 $Machine = $Matches[1]
 & $Pevm license-keygen $Private $Public *> (Join-Path $LicenseWork 'keygen.log')
 if ($LASTEXITCODE -ne 0) { throw 'license-keygen failed (requires Windows user DPAPI access)' }
+& $Pevm license-export-build-key $Private $BuildKey "--product=$Product" *> (Join-Path $LicenseWork 'export-build-key.log')
+if ($LASTEXITCODE -ne 0) { throw 'license-export-build-key failed' }
 & $Pevm license-issue $Private 30 "--machine=$Machine" "--product=$Product" "--output=$LicenseFile" *> (Join-Path $LicenseWork 'issue.log')
 if ($LASTEXITCODE -ne 0) { throw 'license-issue failed' }
 $LicenseKey = (Get-Content $LicenseFile -Raw).Trim()
@@ -30,7 +33,7 @@ if ($LASTEXITCODE -ne 0 -or (Get-Content $RecoveredPublic -Raw) -ne (Get-Content
 }
 
 $Rva = if ((Get-FixtureText) -match 'PEVM-FIXTURE-RVA LiftTarget=0x([0-9A-Fa-f]+)') { '0x' + $Matches[1] } else { throw 'no LiftTarget RVA' }
-$LicenseOptions = @('--license', "--license-public-key=$Public", "--license-product=$Product")
+$LicenseOptions = @('--license', "--license-public-key=$Public", "--license-product=$Product", "--license-build-key=$BuildKey")
 & $Pevm protect-function $Fixture $Output build-key $Rva @LicenseOptions *> (Join-Path $LicenseWork 'build.log')
 if ($LASTEXITCODE -ne 0) { throw 'licensed protect-function failed' }
 $BuildTranscript = Get-Content (Join-Path $LicenseWork 'build.log') -Raw
@@ -39,7 +42,8 @@ if ($BuildTranscript -notmatch 'license: required; ECDSA P-256' -or
     $BuildTranscript -notmatch 'license product digest:') { Fail 'licensed build omitted public policy details' }
 if ($BuildTranscript.Contains($LicenseKey) -or $BuildTranscript -match 'PEVM-PRIVATE\.') { Fail 'licensed build exposed card/private key material' }
 & $Pevm inspect $Output *> (Join-Path $LicenseWork 'inspect.log')
-if ($LASTEXITCODE -ne 0 -or (Get-Content (Join-Path $LicenseWork 'inspect.log') -Raw) -notmatch 'ECDSA P-256') {
+if ($LASTEXITCODE -ne 0 -or (Get-Content (Join-Path $LicenseWork 'inspect.log') -Raw) -notmatch 'ECDSA P-256' -or
+    (Get-Content (Join-Path $LicenseWork 'inspect.log') -Raw) -notmatch 'AES-256-GCM \(license-held key\)') {
     Fail 'inspect did not recognize signed license policy'
 }
 
@@ -49,6 +53,10 @@ $MetadataOffset = [int][BitConverter]::ToUInt64($WrapperBytes, $WrapperBytes.Len
 $MetadataSize = [BitConverter]::ToUInt32($WrapperBytes, $WrapperBytes.Length - 76 + 44)
 if ($MetadataSize -ne 272 -or [BitConverter]::ToUInt32($WrapperBytes, $MetadataOffset + 8) -ne 5) {
     throw 'wrapper metadata version/size mismatch'
+}
+if ([BitConverter]::ToUInt32($WrapperBytes, $WrapperBytes.Length - 76 + 8) -ne 3 -or
+    [BitConverter]::ToUInt32($WrapperBytes, $MetadataOffset + 164) -ne 2) {
+    Fail 'licensed build did not require license-held payload encryption'
 }
 $PublicText = (Get-Content $Public -Raw).Trim()
 if (-not $PublicText.StartsWith($PublicPrefix)) { throw 'unexpected public key prefix' }
@@ -74,14 +82,35 @@ $NegativeOptions = @(
     @('--license'),
     @('--license', "--license-public-key=$Public"),
     @('--license', "--license-product=$Product"),
+    @('--license', "--license-public-key=$Public", "--license-product=$Product"),
     @("--license-public-key=$Public", "--license-product=$Product"),
     @('--license', '--license-secret=removed'),
-    @('--license', "--license-public-key=$Private", "--license-product=$Product")
+    @('--license', "--license-public-key=$Private", "--license-product=$Product", "--license-build-key=$BuildKey")
 )
 foreach ($Arguments in $NegativeOptions) {
     $RejectedOutput = Join-Path $LicenseWork ('invalid-' + [Guid]::NewGuid().ToString('N') + '.exe')
     & $Pevm wrap $Fixture $RejectedOutput build-key @Arguments *> (Join-Path $LicenseWork 'invalid-cli.log')
     if ($LASTEXITCODE -eq 0 -or (Test-Path $RejectedOutput)) { Fail 'invalid license options produced a wrapper' }
+}
+# Every protection command must reject a missing build key before writing output,
+# including paths that disable virtualized functions entirely.
+foreach ($Command in @('wrap', 'protect-function', 'protect-functions', 'protect-all')) {
+    $Cases = @('default')
+    if ($Command -ne 'wrap') { $Cases += 'no-vm' }
+    if ($Command -eq 'protect-all') { $Cases += 'no-functions' }
+    foreach ($Case in $Cases) {
+        $Extra = @()
+        if ($Case -eq 'no-vm') { $Extra = @('--vm-instances=0') }
+        if ($Case -eq 'no-functions') { $Extra = @('--min-bytes=4294967295') }
+        $RejectedOutput = Join-Path $LicenseWork ('missing-build-key-' + [Guid]::NewGuid().ToString('N') + '.exe')
+        $Arguments = @($Command, $Fixture, $RejectedOutput, 'build-key')
+        if ($Command -in @('protect-function', 'protect-functions')) { $Arguments += $Rva }
+        & $Pevm @Arguments --license "--license-public-key=$Public" "--license-product=$Product" @Extra *> (Join-Path $LicenseWork 'missing-build-key.log')
+        if ($LASTEXITCODE -eq 0 -or (Test-Path $RejectedOutput)) { Fail "$Command accepted a missing product build key" }
+        elseif ((Get-Content (Join-Path $LicenseWork 'missing-build-key.log') -Raw) -notmatch '--license-build-key') {
+            Fail "$Command failed for an unrelated reason instead of requiring a product build key"
+        } else { Ok "$Command rejects missing product build key before output" }
+    }
 }
 foreach ($Days in @('-1', '1x', '36501', '4294967296')) {
     & $Pevm license-issue $Private $Days "--machine=$Machine" "--product=$Product" *> (Join-Path $LicenseWork 'invalid-days.log')
@@ -89,7 +118,7 @@ foreach ($Days in @('-1', '1x', '36501', '4294967296')) {
 }
 & $Pevm license-issue $Private 30 "--machine=$Machine" "--product=$Product" "--output=$LicenseFile" *> (Join-Path $LicenseWork 'overwrite.log')
 if ($LASTEXITCODE -eq 0 -or (Get-Content $LicenseFile -Raw).Trim() -ne $LicenseKey) { Fail 'issuance overwrote existing license' }
-Ok 'required public key/product, legacy flag rejection and strict CLI days checked'
+Ok 'required public key/product/build key, legacy flag rejection and strict CLI days checked'
 
 $WrongProductFile = Join-Path $LicenseWork 'wrong-product.license'
 $WrongMachineFile = Join-Path $LicenseWork 'wrong-machine.license'
@@ -100,7 +129,7 @@ if ($LASTEXITCODE -ne 0) { throw 'wrong-product fixture signing failed' }
 if ($LASTEXITCODE -ne 0) { throw 'wrong-machine fixture signing failed' }
 $EncodedPayload = $LicenseKey.Substring($LicensePrefix.Length)
 $RawToken = [Convert]::FromBase64String($EncodedPayload)
-$RawToken[132] = $RawToken[132] -bxor 1
+$RawToken[164] = $RawToken[164] -bxor 1
 $BadLicenses = @{
     'legacy' = 'PEVML1.' + $EncodedPayload
     'numbered-prefix' = 'PEVML2.' + $EncodedPayload

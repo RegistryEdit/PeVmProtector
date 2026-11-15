@@ -14,12 +14,13 @@
     <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
-  <ItemDefinitionGroup><Link><AdditionalDependencies>user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link></ItemDefinitionGroup>
+  <ItemDefinitionGroup><Link><AdditionalDependencies>user32.lib;gdi32.lib;comctl32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link></ItemDefinitionGroup>
   <ItemGroup><ProjectReference Include="..\..\Src\Libs\PeVmCore\PeVmCore.vcxproj" /></ItemGroup>
   <ItemGroup>
     <ClCompile Include="RuntimeTests.cpp" />
     <ClCompile Include="..\..\Src\Apps\Stub\LicenseCache.cpp" />
     <ClCompile Include="..\..\Src\Apps\Stub\LicenseRuntime.cpp" />
+    <ClCompile Include="..\..\Src\Apps\Stub\LicenseClock.cpp" />
     <ClCompile Include="..\..\Src\Apps\Stub\LicenseDialog.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

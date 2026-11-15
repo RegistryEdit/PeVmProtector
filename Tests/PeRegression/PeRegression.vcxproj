@@ -15,6 +15,10 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ItemGroup><ProjectReference Include="..\..\Src\Libs\PeVmCore\PeVmCore.vcxproj" /></ItemGroup>
-  <ItemGroup><ClCompile Include="PeRegression.cpp" /></ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="PeRegression.cpp" />
+    <ClCompile Include="CodeIntegrityTests.cpp" />
+    <ClCompile Include="ReleaseImageTests.cpp" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

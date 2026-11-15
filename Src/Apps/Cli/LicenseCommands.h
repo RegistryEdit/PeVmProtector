@@ -8,10 +8,21 @@
 #include <stdexcept>
 
 namespace licensecli {
+struct ErasePayload {
+    pevm::license::LicensePayload& Value;
+    ~ErasePayload() { SecureZeroMemory(&Value, sizeof(Value)); }
+};
+struct BuildPolicy : LicensePolicy {
+    pevm::license::Digest UnlockKey{};
+    BuildPolicy() = default;
+    BuildPolicy(const LicensePolicy& Policy) : LicensePolicy(Policy) {}
+    ~BuildPolicy() { SecureZeroMemory(UnlockKey.data(), UnlockKey.size()); }
+};
 struct Options {
     bool Required{};
     std::string PublicPath;
     std::string Product;
+    std::string BuildKeyPath;
     bool Parse(std::string_view Arg) {
         if (Arg == "--license") {
             if (Required) throw std::runtime_error("duplicate --license");
@@ -22,20 +33,33 @@ struct Options {
         } else if (Arg.starts_with("--license-product=")) {
             if (!Product.empty() || Arg.size() == 18) throw std::runtime_error("invalid/duplicate product option");
             Product = Arg.substr(18);
+        } else if (Arg.starts_with("--license-build-key=")) {
+            if (!BuildKeyPath.empty() || Arg.size() == 20) throw std::runtime_error("invalid/duplicate build key option");
+            BuildKeyPath = Arg.substr(20);
         } else if (Arg.starts_with("--license-secret")) {
             throw std::runtime_error("--license-secret was removed; use --license-public-key and reissue signed licenses");
         } else return false;
         return true;
     }
-    LicensePolicy Resolve() const {
+    BuildPolicy Resolve() const {
         if (!Required) {
-            if (!PublicPath.empty() || !Product.empty()) throw std::runtime_error("license options require --license");
+            if (!PublicPath.empty() || !Product.empty() || !BuildKeyPath.empty()) throw std::runtime_error("license options require --license");
             return {};
         }
-        if (PublicPath.empty() || Product.empty()) throw std::runtime_error("--license requires --license-public-key=<file> and --license-product=<id>");
-        return pevm::license::MakePolicy(PublicPath, Product);
+        if (PublicPath.empty() || Product.empty() || BuildKeyPath.empty())
+            throw std::runtime_error("--license requires --license-public-key=<file>, --license-product=<id> and --license-build-key=<file> for license-held payload encryption");
+        BuildPolicy Policy(pevm::license::MakePolicy(PublicPath, Product));
+        Policy.Required = 2;
+        Policy.UnlockKey = pevm::license::ReadBuildKey(BuildKeyPath, Policy);
+        return Policy;
     }
 };
+inline void ExportBuildKey(int Argc, char** Argv) {
+    if (Argc != 5 || !std::string_view(Argv[4]).starts_with("--product=") || std::string_view(Argv[4]).size() == 10)
+        throw std::runtime_error("license-export-build-key <private-file> <build-key-file> --product=<id>");
+    pevm::license::ExportBuildKeyFile(Argv[2], Argv[3], std::string_view(Argv[4]).substr(10));
+    std::cout << "product build key saved (DPAPI protected)\n";
+}
 
 inline std::string Expiry(std::uint64_t Time) {
     if (Time == 0) return "perpetual";
@@ -73,7 +97,8 @@ inline void MakeLicense(int Argc, char** Argv) {
         }
     }
     if (!MachineSet || Product.empty()) throw std::runtime_error("license-issue requires --machine=<64hex> and --product=<id>");
-    const auto Payload = pevm::license::IssueLicense(Argv[2], Product, Machine, Days, pevm::license::CurrentFileTime());
+    auto Payload = pevm::license::IssueLicense(Argv[2], Product, Machine, Days, pevm::license::CurrentFileTime());
+    ErasePayload Eraser{Payload};
     const auto Text = pevm::license::FormatLicense(Payload);
     if (Output.empty()) std::cout << Text << "\n";
     else {
@@ -101,7 +126,8 @@ inline void VerifyLicense(int Argc, char** Argv) {
     if (Product.empty()) throw std::runtime_error("license-verify requires --product=<id>");
     if (!MachineSet) Machine = pevm::license::MachineId();
     const auto Policy = pevm::license::MakePolicy(Argv[2], Product);
-    const auto Payload = pevm::license::ParseLicense(pevm::license::ReadTextFile(Argv[3]));
+    auto Payload = pevm::license::ParseLicense(pevm::license::ReadTextFile(Argv[3]));
+    ErasePayload Eraser{Payload};
     const auto Reason = pevm::license::VerifyPayload(Payload, Policy, Machine, pevm::license::CurrentFileTime());
     if (!Reason.empty()) throw std::runtime_error(Reason);
     std::cout << "license valid\nlicense id: " << pevm::crypto::Hex(Payload.LicenseId)

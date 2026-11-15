@@ -720,11 +720,12 @@ std::vector<std::uint8_t> SerializeVmp3Multi(const MultiLiftResult& Results, std
                                              std::string_view BuildSecret,
                                              std::span<const std::uint8_t> HandlerProfile,
                                              bool AntiDisassembly,
-                                             std::vector<vmprotect::CompilationStats>* Statistics) {
+                                             std::vector<vmprotect::CompilationStats>* Statistics,
+                                             const vmprotect::ProtectionOptions& Options) {
     std::vector<vmprotect::LiftedProgram> Programs;
     Programs.reserve(Results.Functions.size());
     for (const auto& Function : Results.Functions) Programs.push_back(Function.Program);
-    return pevm::EncodeVmImage(Programs, Seed, BuildSecret, HandlerProfile, AntiDisassembly, Statistics);
+    return pevm::EncodeVmImage(Programs, Seed, BuildSecret, HandlerProfile, AntiDisassembly, Statistics, Options);
 }
 
 void MutateProgram(vmprotect::LiftedProgram& Program, std::uint64_t Seed) {

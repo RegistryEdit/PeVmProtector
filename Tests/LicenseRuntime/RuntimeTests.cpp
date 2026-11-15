@@ -1,11 +1,14 @@
 #include "../../Src/Apps/Stub/LicenseRuntime.h"
+#include "../../Src/Apps/Stub/LicenseClock.h"
 #include "../../Src/Apps/Stub/LicenseDialog.h"
 #include "PeVmCrypto.h"
 #include "FileIo.h"
 #include <windows.h>
 #include <dpapi.h>
+#include <ole2.h>
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -26,6 +29,15 @@ template<class F> void Reject(F&& Action) {
     try { Action(); } catch (const std::exception&) { return; }
     throw std::runtime_error("invalid operation accepted");
 }
+template<class F> void RejectWith(F&& Action, std::string_view Expected) {
+    ++Checks;
+    try { Action(); }
+    catch (const std::exception& Error) {
+        if (std::string_view(Error.what()).find(Expected) != std::string_view::npos) return;
+        throw std::runtime_error("unexpected rejection: " + std::string(Error.what()));
+    }
+    throw std::runtime_error("invalid operation accepted");
+}
 struct EnvironmentGuard {
     std::wstring Name, Value;
     bool Present{};
@@ -40,6 +52,98 @@ struct EnvironmentGuard {
     ~EnvironmentGuard() { SetEnvironmentVariableW(Name.c_str(), Present ? Value.c_str() : nullptr); }
 };
 std::wstring Wide(const std::string& Text) { return {Text.begin(), Text.end()}; }
+void SealFixture(const fs::path& Path, const std::string& Text);
+
+void TestPersistentClock(const fs::path& Work, const fs::path& Private, const LicensePolicy& Policy) {
+    const auto Directory = Work / "clocks";
+    const auto Machine = MachineId();
+    const auto Path = LicenseClockPath(Policy, Machine, Directory);
+    const auto Now = CurrentFileTime();
+    const auto Advance = [&](std::uint64_t Time) {
+        LicenseClockTransaction Clock(Policy, Machine, Directory, Time);
+        const auto Effective = Clock.EffectiveTime();
+        Clock.Commit();
+        return Effective;
+    };
+    {
+        LicenseClockTransaction Cancelled(Policy, Machine, Directory, Now);
+        Require(Cancelled.EffectiveTime() == Now, "first clock observation");
+    }
+    Require(!fs::exists(Path), "uncommitted clock created a time record");
+    Require(Advance(Now) == Now, "first clock commit");
+    const auto First = util::ReadFile(Path);
+    {
+        LicenseClockTransaction Invalid(Policy, Machine, Directory, Now + KTicksPerDay);
+        auto Forged = IssueLicense(Private, "runtime.test", Machine, 30, Now);
+        Forged.Signature[0] ^= 1;
+        Require(!VerifyPayload(Forged, Policy, Machine, Invalid.EffectiveTime()).empty(), "forged card accepted");
+    }
+    Require(util::ReadFile(Path) == First, "failed authorization advanced persistent clock");
+    {
+        LicenseClockTransaction Expired(Policy, Machine, Directory, Now + 2 * KTicksPerDay);
+        const auto Card = IssueLicense(Private, "runtime.test", Machine, 1, Now);
+        Require(VerifyPayload(Card, Policy, Machine, Expired.EffectiveTime()) == "license expired",
+                "expired card accepted at persistent time");
+    }
+    Require(util::ReadFile(Path) == First, "expired authorization advanced persistent clock");
+    Require(Advance(Now + KTicksPerDay) == Now + KTicksPerDay, "forward clock correction");
+    Require(Advance(Now + KTicksPerDay - 1) == Now + KTicksPerDay, "small rollback lowered effective time");
+    Reject([&] { Advance(Now); }); // A new transaction models a subsequent process startup.
+    Require(fs::exists(Path), "rollback removed persistent state");
+    Reject([&] { Advance(0); });
+    Reject([&] { Advance(KMaximumTimestamp + 1); });
+    auto OtherPolicy = Policy; OtherPolicy.ProductId = ProductId("different.product");
+    auto OtherMachine = Machine; OtherMachine[0] ^= 1;
+    Require(LicenseClockPath(OtherPolicy, Machine, Directory) != Path, "clock product isolation");
+    Require(LicenseClockPath(Policy, OtherMachine, Directory) != Path, "clock device isolation");
+    const auto OtherPath = LicenseClockPath(OtherPolicy, Machine, Directory);
+    util::WriteFileAtomic(OtherPath, util::ReadFile(Path));
+    Reject([&] { LicenseClockTransaction WrongIdentity(OtherPolicy, Machine, Directory, Now + KTicksPerDay); });
+    const auto Healthy = util::ReadFile(Path);
+    SealFixture(Path, std::string(56, '\0'));
+    Reject([&] { Advance(Now + KTicksPerDay); });
+    Require(fs::exists(Path), "malformed DPAPI clock record removed");
+    util::WriteFileAtomic(Path, std::vector<std::uint8_t>{1, 2, 3});
+    Reject([&] { Advance(Now + KTicksPerDay); });
+    Require(util::ReadFile(Path).size() == 3, "corrupt clock was silently reset");
+    util::WriteFileAtomic(Path, std::vector<std::uint8_t>(4097, 0));
+    Reject([&] { Advance(Now + KTicksPerDay); });
+    util::WriteFileAtomic(Path, Healthy);
+    {
+        auto Held = std::make_unique<LicenseClockTransaction>(Policy, Machine, Directory, Now + KTicksPerDay + 10000);
+        std::atomic<bool> Entered{}, Finished{};
+        std::exception_ptr Failure;
+        std::jthread Contender([&] {
+            Entered = true;
+            try { Advance(Now + KTicksPerDay); Finished = true; }
+            catch (...) { Failure = std::current_exception(); }
+        });
+        while (!Entered) Sleep(1);
+        Sleep(50);
+        const auto Premature = Finished.load();
+        Held->Commit();
+        Held.reset();
+        Contender.join();
+        if (Failure) std::rethrow_exception(Failure);
+        Require(!Premature && Finished, "concurrent transaction bypassed product clock lock");
+        Require(Advance(Now + KTicksPerDay) == Now + KTicksPerDay + 10000,
+                "concurrent writer lowered persistent clock");
+    }
+    fs::remove(Path);
+    fs::create_directory(Path);
+    Reject([&] { Advance(Now + KTicksPerDay); });
+    fs::remove(Path);
+    util::WriteFileAtomic(Path, Healthy);
+    const auto Alias = Work / "clock-hardlink.bin";
+    Require(CreateHardLinkW(Alias.c_str(), Path.c_str(), nullptr) != FALSE, "clock hardlink fixture");
+    Reject([&] { Advance(Now + KTicksPerDay); });
+    fs::remove(Alias);
+    {
+        LicenseClockTransaction Clock(Policy, Machine, Directory, Now + KTicksPerDay);
+        Clock.Commit();
+        Reject([&] { Clock.Commit(); });
+    }
+}
 
 // Expired/forged cache fixtures are DPAPI-sealed exactly as a previous installation
 // would have saved them. The public filename contains the optional-entropy digest.
@@ -65,6 +169,14 @@ void TestCache(const fs::path& Work, const fs::path& Private, const LicensePolic
     const auto Sealed = util::ReadFile(Path);
     Require(std::search(Sealed.begin(), Sealed.end(), Token.begin(), Token.end()) == Sealed.end(), "plaintext token in cache");
     Require(ReadLicenseCache(Policy, Wrapper, Directory, Reason) == Token, "cache roundtrip");
+    const auto ClockFile = LicenseClockPath(Policy, MachineId(), LicenseClockDirectory());
+    const auto ClockBefore = util::ReadFile(ClockFile);
+    util::WriteFileAtomic(ClockFile, std::vector<std::uint8_t>{1, 2, 3});
+    Require(ReadLicenseCache(Policy, Wrapper, Directory, Reason).empty() && fs::exists(Path),
+            "clock failure removed valid cached card");
+    Require(util::ReadFile(ClockFile).size() == 3, "clock failure reset persistent state");
+    util::WriteFileAtomic(ClockFile, ClockBefore);
+    Require(ReadLicenseCache(Policy, Wrapper, Directory, Reason) == Token, "clock repair did not restore authorization");
     Require(CachePath(Policy, Work / "APP.exe", Directory) == CachePath(Policy, Work / "app.exe", Directory), "path case normalization");
     Require(CachePath(Policy, Work / "sub" / ".." / L"应用.exe", Directory) == Path, "path lexical normalization");
     Reject([&] { WriteLicenseCache(Policy, Wrapper, Directory, "bad"); });
@@ -81,6 +193,10 @@ void TestCache(const fs::path& Work, const fs::path& Private, const LicensePolic
     SealFixture(Path, Expired);
     Require(ReadLicenseCache(Policy, Wrapper, Directory, Reason).empty() && Reason == "license expired", "cached expiry not rechecked");
     Require(!fs::exists(Path), "expired cache not removed");
+    const auto Future = FormatLicense(IssueLicense(Private, "runtime.test", MachineId(), 1, CurrentFileTime() + KTicksPerDay));
+    SealFixture(Path, Future);
+    Require(ReadLicenseCache(Policy, Wrapper, Directory, Reason).empty() && fs::exists(Path) &&
+            Reason == "license issued in the future or system clock rolled back", "clock skew removed signed cache");
     auto Forged = ParseLicense(Token); Forged.Signature[0] ^= 1;
     SealFixture(Path, FormatLicense(Forged));
     Require(ReadLicenseCache(Policy, Wrapper, Directory, Reason).empty() && Reason == "license signature invalid", "cached signature not rechecked");
@@ -153,9 +269,92 @@ BOOL CALLBACK FindDialog(HWND Window, LPARAM Param) {
 }
 LRESULT Send(HWND Window, UINT Message, WPARAM W = 0, LPARAM L = 0) {
     DWORD_PTR Result{};
-    if (!SendMessageTimeoutW(Window, Message, W, L, SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, &Result))
-        throw std::runtime_error("dialog message timed out");
+    // Clipboard operations may synchronously notify this thread's clipboard owner.
+    if (!SendMessageTimeoutW(Window, Message, W, L, SMTO_ABORTIFHUNG, 5000, &Result))
+        throw std::runtime_error("dialog message timed out: message=" + std::to_string(Message) +
+            "; control=" + std::to_string(GetDlgCtrlID(Window)) + "; error=" + std::to_string(GetLastError()));
     return static_cast<LRESULT>(Result);
+}
+std::wstring ControlText(HWND Control) {
+    const auto Size = Send(Control, WM_GETTEXTLENGTH) + 1;
+    std::wstring Text(static_cast<std::size_t>(Size), L'\0');
+    Text.resize(static_cast<std::size_t>(Send(Control, WM_GETTEXT, Size, reinterpret_cast<LPARAM>(Text.data()))));
+    return Text;
+}
+
+// Preserve all duplicable clipboard formats, and remove test licenses on exit.
+class ClipboardFixture {
+    struct Entry { UINT Format; HANDLE Data; };
+    HWND Owner{CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr)};
+    std::vector<Entry> Saved;
+    bool Open() {
+        for (int I = 0; I < 50; ++I) { if (OpenClipboard(Owner)) return true; Sleep(20); }
+        return false;
+    }
+    static void Free(Entry Item) {
+        if (Item.Format == CF_BITMAP || Item.Format == CF_PALETTE) DeleteObject(Item.Data);
+        else if (Item.Format == CF_ENHMETAFILE) DeleteEnhMetaFile(static_cast<HENHMETAFILE>(Item.Data));
+        else if (Item.Format == CF_METAFILEPICT) {
+            if (const auto Picture = static_cast<METAFILEPICT*>(GlobalLock(Item.Data))) {
+                DeleteMetaFile(Picture->hMF); GlobalUnlock(Item.Data);
+            }
+            GlobalFree(Item.Data);
+        } else GlobalFree(Item.Data);
+    }
+public:
+    ClipboardFixture() {
+        Require(Owner != nullptr, "clipboard fixture window failed");
+        Require(Open(), "cannot snapshot clipboard");
+        try {
+            for (UINT Format = EnumClipboardFormats(0); Format; Format = EnumClipboardFormats(Format)) {
+                const auto Data = OleDuplicateData(GetClipboardData(Format), static_cast<CLIPFORMAT>(Format), 0);
+                Require(Data != nullptr, "cannot preserve clipboard format");
+                Saved.push_back({Format, Data});
+            }
+            CloseClipboard();
+        } catch (...) {
+            CloseClipboard(); for (const auto Item : Saved) Free(Item);
+            DestroyWindow(Owner); throw;
+        }
+    }
+    ~ClipboardFixture() {
+        if (Open()) {
+            if (EmptyClipboard()) for (auto& Item : Saved)
+                if (SetClipboardData(Item.Format, Item.Data)) Item.Data = nullptr;
+            CloseClipboard();
+        }
+        for (const auto Item : Saved) if (Item.Data) Free(Item);
+        DestroyWindow(Owner);
+    }
+    void Put(const std::wstring& Text) {
+        const auto Data = GlobalAlloc(GMEM_MOVEABLE, (Text.size() + 1) * sizeof(wchar_t));
+        Require(Data != nullptr, "clipboard allocation failed");
+        const auto Buffer = GlobalLock(Data);
+        Require(Buffer != nullptr, "clipboard lock failed");
+        std::memcpy(Buffer, Text.c_str(), (Text.size() + 1) * sizeof(wchar_t)); GlobalUnlock(Data);
+        if (!Open()) { GlobalFree(Data); throw std::runtime_error("clipboard busy in test"); }
+        const bool Success = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, Data);
+        CloseClipboard(); if (!Success) GlobalFree(Data);
+        Require(Success, "cannot set test clipboard");
+    }
+    std::wstring Read() {
+        Require(Open(), "cannot read copied machine ID");
+        const auto Data = GetClipboardData(CF_UNICODETEXT);
+        const auto Buffer = Data ? static_cast<const wchar_t*>(GlobalLock(Data)) : nullptr;
+        std::wstring Text = Buffer ? Buffer : L"";
+        if (Buffer) GlobalUnlock(Data); CloseClipboard();
+        return Text;
+    }
+};
+
+void ExpectFocus(HWND Window, HWND Expected) {
+    GUITHREADINFO Info{sizeof(Info)};
+    const auto Thread = GetWindowThreadProcessId(Window, nullptr);
+    for (unsigned I = 0; I < 100; ++I) {
+        if (GetGUIThreadInfo(Thread, &Info) && Info.hwndFocus == Expected) return;
+        Sleep(20);
+    }
+    Require(false, "keyboard focus moved to the wrong control");
 }
 void Capture(HWND Window, const fs::path& Path) {
     const auto PreviousDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -196,9 +395,42 @@ void DriveDialog(DWORD Process, const std::string& Token, bool Cancel, const fs:
     }
     Require(Found.Window != nullptr, "native license dialog not found");
     const auto Window = Found.Window, Input = GetDlgItem(Window, KLicenseInput);
+    const auto RequireInput = [&](const std::wstring& Expected, const char* Message) {
+        // Windows blocks cross-process WM_GETTEXT on password controls. Check exact
+        // text in local dialogs; wrappers additionally prove the token by launching.
+        Require(Process == GetCurrentProcessId() ? ControlText(Input) == Expected :
+            static_cast<std::size_t>(Send(Input, WM_GETTEXTLENGTH)) == Expected.size(), Message);
+    };
     try {
+        Send(Window, WM_NULL); // WM_INITDIALOG must finish before checking initial state.
         Require((GetWindowLongPtrW(Input, GWL_STYLE) & ES_PASSWORD) != 0, "license input is not masked");
-        if (Cancel) { Send(Window, WM_CLOSE); return; }
+        Require(!IsWindowEnabled(GetDlgItem(Window, IDOK)), "empty input enabled activation");
+        ExpectFocus(Window, Input);
+        if (Cancel) { PostMessageW(Input, WM_KEYDOWN, VK_ESCAPE, 0); return; }
+        ClipboardFixture Clipboard;
+        if (!Screenshot.empty()) Capture(Window, Screenshot.parent_path() / (Screenshot.stem().wstring() + L"-empty.bmp"));
+        PostMessageW(Input, WM_KEYDOWN, VK_TAB, 0);
+        ExpectFocus(Window, GetDlgItem(Window, KPasteLicense));
+        Send(Window, WM_NEXTDLGCTL, reinterpret_cast<WPARAM>(Input), TRUE);
+        Send(GetDlgItem(Window, KCopyMachine), BM_CLICK);
+        Require(Clipboard.Read() == Wide(pevm::crypto::Hex(MachineId())), "copy machine ID changed its value");
+        Require(ControlText(GetDlgItem(Window, KCopyMachine)).find(L"复制机器码") == std::wstring::npos &&
+                ControlText(GetDlgItem(Window, KCopyMachine)) != L"&Copy ID", "copy confirmation missing");
+        Send(Input, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"preserve-input"));
+        for (const auto& Invalid : {std::wstring(), std::wstring(L"非ASCII"), std::wstring(4097, L'A')}) {
+            Clipboard.Put(Invalid); Send(GetDlgItem(Window, KPasteLicense), BM_CLICK);
+            RequireInput(L"preserve-input", "invalid paste replaced existing input");
+            Require(!ControlText(GetDlgItem(Window, KLicenseReason)).empty(), "invalid paste had no feedback");
+        }
+        Clipboard.Put(L"bad");
+        Send(Input, EM_SETSEL, 0, -1);
+        Send(Input, WM_PASTE);
+        RequireInput(L"bad", "keyboard paste did not use clipboard text");
+        Send(Input, EM_SETSEL, 1, 2); Clipboard.Put(L"oo"); Send(Input, WM_PASTE);
+        RequireInput(L"bood", "keyboard paste did not replace only the selection");
+        Send(Input, EM_UNDO);
+        RequireInput(L"bad", "pasting could not be undone");
+        Require(IsWindowEnabled(GetDlgItem(Window, IDOK)) != FALSE, "nonempty input did not enable activation");
         for (const auto& Invalid : {std::wstring(), std::wstring(L"bad"), std::wstring(L"非ASCII"), std::wstring(4097, L'A')}) {
             Send(Input, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(Invalid.c_str()));
             Send(Window, WM_COMMAND, IDOK);
@@ -206,17 +438,23 @@ void DriveDialog(DWORD Process, const std::string& Token, bool Cancel, const fs:
             wchar_t Reason[512]{};
             Send(GetDlgItem(Window, KLicenseReason), WM_GETTEXT, 512, reinterpret_cast<LPARAM>(Reason));
             Require(Reason[0] != 0, "invalid submission missing reason");
+            ExpectFocus(Window, Input);
+            if (Invalid == L"bad" && !Screenshot.empty())
+                Capture(Window, Screenshot.parent_path() / (Screenshot.stem().wstring() + L"-error.bmp"));
         }
         Send(GetDlgItem(Window, KShowLicense), BM_CLICK);
         Require(Send(Input, EM_GETPASSWORDCHAR) == 0, "show license failed");
         Send(GetDlgItem(Window, KShowLicense), BM_CLICK);
         Require(Send(Input, EM_GETPASSWORDCHAR) != 0, "hide license failed");
         Send(Input, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L""));
-        Send(Window, WM_COMMAND, IDOK);
-        if (!Screenshot.empty()) Capture(Window, Screenshot);
+        Require(!IsWindowEnabled(GetDlgItem(Window, IDOK)), "clearing input kept activation enabled");
         const auto Text = Wide(" \t" + Token + " \r\n");
-        Send(Input, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(Text.c_str()));
-        Send(Window, WM_COMMAND, IDOK);
+        Clipboard.Put(Text); Send(GetDlgItem(Window, KPasteLicense), BM_CLICK);
+        RequireInput(Wide(Token), "paste failed to normalize boundary whitespace");
+        ExpectFocus(Window, Input);
+        Require(Send(Input, EM_GETPASSWORDCHAR) != 0, "pasting exposed the license");
+        if (!Screenshot.empty()) Capture(Window, Screenshot);
+        PostMessageW(Input, WM_KEYDOWN, VK_RETURN, 0);
     } catch (...) { PostMessageW(Window, WM_COMMAND, IDCANCEL, 0); throw; }
 }
 
@@ -300,6 +538,10 @@ void TestWrapper(const fs::path& Wrapper, const fs::path& TokenFile, const fs::p
     // The caller provides a freshly built, unique test wrapper. Only its exact cache is touched.
     Require(!fs::exists(Path), "wrapper test cache already exists");
     struct Cleanup { fs::path Path; ~Cleanup() { DeleteFileW(Path.c_str()); RemoveDirectoryW(Path.c_str()); } } Clean{Path};
+    const auto ClockPath = LicenseClockPath(Policy, MachineId(), LicenseClockDirectory());
+    struct CleanupClock { fs::path Path; ~CleanupClock() {
+        DeleteFileW(Path.c_str()); DeleteFileW((Path.wstring() + L".lock").c_str());
+    } } ClockClean{ClockPath};
     Require(RunWrapper(Wrapper, Token, 2) == ERROR_CANCELLED, "cancelled wrapper exit code");
     Require(!fs::exists(Path), "cancel created cache");
     Require(!fs::exists(Wrapper.wstring() + L".vmbridge-hit"), "cancel executed protected payload");
@@ -343,12 +585,46 @@ int wmain(int Argc, wchar_t** Argv) {
             const auto Private = Work / "issuer.private", Public = Work / "issuer.pub";
             GenerateKeyFiles(Private, Public);
             const auto Policy = MakePolicy(Public, "runtime.test");
+            const auto ClockFile = LicenseClockPath(Policy, MachineId(), LicenseClockDirectory());
+            struct CleanupClock { fs::path Path; ~CleanupClock() {
+                DeleteFileW(Path.c_str()); DeleteFileW((Path.wstring() + L".lock").c_str());
+            } } ClockCleanup{ClockFile};
             const auto Token = FormatLicense(IssueLicense(Private, "runtime.test", MachineId(), 30, CurrentFileTime()));
             TestCache(Work, Private, Policy, Token);
             TestDialog(Work, Policy, Token);
-            std::wcout << L"Artifacts: " << Work.wstring() << L"\n";
+            TestPersistentClock(Work, Private, Policy);
+            const auto ExpiringPayload = IssueLicense(Private, "runtime.test", MachineId(), 1,
+                CurrentFileTime() - KTicksPerDay + 50000000);
+            const auto Expiring = FormatLicense(ExpiringPayload);
+            InitializeLicenseSession(Policy, Expiring);
+            Require(HasLicenseSession(), "signed license session created");
+            RevalidateLicenseSession(true);
+            Reject([&] { InitializeLicenseSession(Policy, "forged"); });
+            const auto BaseTime = CurrentFileTime();
+            Require(MonotonicLicenseTime(BaseTime, BaseTime, 30000, 0) == BaseTime + 300000000,
+                    "monotonic time prevents expiry delay");
+            Reject([&] { MonotonicLicenseTime(BaseTime - KClockSkewTicks - 1, BaseTime, 0, 0); });
+            Reject([&] { MonotonicLicenseTime(BaseTime, BaseTime, 0, 1); });
+            Reject([&] { MonotonicLicenseTime(BaseTime, KMaximumTimestamp, 1, 0); });
+            Reject([&] { MonotonicLicenseTime(0, BaseTime, 0, 0); });
+            Reject([&] { MonotonicLicenseTime(KMaximumTimestamp + 1, BaseTime, 0, 0); });
+            const auto Forward = MonotonicLicenseTime(BaseTime + KTicksPerDay, BaseTime, 30000, 0);
+            Reject([&] { MonotonicLicenseTime(BaseTime + 600000000, Forward, 60000, 30000); });
+            Require(LicenseCheckDue(100, 100, 0), "initial session check skipped");
+            Require(!LicenseCheckDue(30099, 100, 30100), "early scheduled check");
+            Require(LicenseCheckDue(30100, 100, 30100), "due scheduled check skipped");
+            Reject([&] { LicenseCheckDue(100, 100, UINT64_MAX); });
+            Reject([&] { LicenseCheckDue(99, 100, 30100); });
+            Reject([&] { LicenseCheckDue(UINT64_MAX, UINT64_MAX - 1, 0); });
+            while (CurrentFileTime() < ExpiringPayload.ExpiresFileTime) Sleep(20);
+            RejectWith([&] { RevalidateLicenseSession(true); }, "license expired");
+            RejectWith([&] { RevalidateLicenseSession(); }, "invalid license session state");
+            RejectWith([&] { InitializeLicenseSession(Policy, Token); }, "license session already initialized");
+            const auto Utf8Path = Work.u8string();
+            std::clog << "Artifacts: " << std::string(Utf8Path.begin(), Utf8Path.end()) << '\n';
+            std::ofstream(Work / "result.txt") << "License runtime: " << Checks << " checks passed\n";
         }
-        std::cout << "License runtime: " << Checks << " checks passed\n";
+        std::clog << "License runtime: " << Checks << " checks passed\n";
         return 0;
     } catch (const std::exception& Error) { std::cerr << "License runtime FAILED: " << Error.what() << '\n'; return 1; }
 }

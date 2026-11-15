@@ -48,6 +48,7 @@ int main(int Argc, char** Argv) {
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, Artifacts);
     QSettings().setValue("Language", 1);
+    QSettings().remove("VM");
     const auto Font = QFontDatabase::addApplicationFont("C:/Windows/Fonts/msyh.ttc");
     const auto Families = QFontDatabase::applicationFontFamilies(Font);
     if (!Families.isEmpty()) App.setFont(QFont(Families.front(), 9));
@@ -63,6 +64,11 @@ int main(int Argc, char** Argv) {
         const auto Button = [&](const char* Name) { return Find<QPushButton>(Window, Name); };
         const auto Edit = [&](const char* Name) { return Find<QLineEdit>(Window, Name); };
         const auto Box = [&](const char* Name) { return Find<QCheckBox>(Window, Name); };
+        auto* Instances = Find<QSpinBox>(Window, "VmInstances");
+        auto* Complexity = Find<QSpinBox>(Window, "VmComplexity");
+        Check(Instances->minimum() == 0 && Instances->maximum() == 10 && Instances->value() == 1 &&
+              Complexity->minimum() == 0 && Complexity->maximum() == 100 && Complexity->value() == 50,
+              "VM option ranges/defaults incorrect");
         QSet<QString> Commands;
         int Starts{};
         QObject::connect(Runner, &QProcess::started, &Window, [&] { ++Starts; Commands.insert(Runner->arguments().front()); });
@@ -134,9 +140,20 @@ int main(int Argc, char** Argv) {
         Button("IssueLicense")->click(); QApplication::processEvents();
         Check(Starts == Before && LicenseText->toPlainText().isEmpty(), "Invalid machine accepted or stale card retained");
         Edit("IssueMachine")->setText(Machine);
+        const auto BuildKey = Work.filePath("product.buildkey");
+        Edit("SigningBuildKeyPath")->clear();
+        Button("ApplyLicensePolicy")->click(); QApplication::processEvents();
+        Check(!Box("RequireLicense")->isChecked() && Button("LicensePage")->isChecked(), "Blank build key applied a weak license policy");
+        Edit("SigningBuildKeyPath")->setText(BuildKey);
+        Button("ApplyLicensePolicy")->click(); QApplication::processEvents();
+        Check(!Box("RequireLicense")->isChecked() && Button("LicensePage")->isChecked(), "Missing build key applied a license policy");
+        Edit("SigningBuildKeyPath")->setText(BuildKey);
+        Run("ExportBuildKey", "license-export-build-key");
+        Check(Read(BuildKey).startsWith("PEVM-BUILDKEY."), "product build key export missing");
         Button("ApplyLicensePolicy")->click();
         Check(Box("RequireLicense")->isChecked() && Edit("ProtectionPublicKey")->text() == Edit("SigningPublicPath")->text() &&
-              Edit("ProtectionProduct")->text() == "gui.regression" && Button("ProtectionSettingsPage")->isChecked(), "Apply protection did not transfer policy");
+              Edit("ProtectionProduct")->text() == "gui.regression" && Edit("ProtectionBuildKey")->text() == BuildKey &&
+              Button("ProtectionSettingsPage")->isChecked(), "Apply protection did not transfer policy");
 
         const auto Fixture = QCoreApplication::applicationDirPath() + "/LifterFixture.exe";
         Edit("InputPath")->setText(Fixture);
@@ -145,8 +162,16 @@ int main(int Argc, char** Argv) {
         Box("CompressPayload")->setChecked(true);
         Edit("Watermark")->setText("gui-watermark");
         Button("ContainerPage")->click();
+        Before = Starts;
+        for (const auto& InvalidBuildKey : {QString{}, Work.filePath("missing.buildkey"), Public}) {
+            Edit("ProtectionBuildKey")->setText(InvalidBuildKey);
+            Button("Wrap")->click(); QApplication::processEvents();
+            Check(Starts == Before && !QFileInfo::exists(Edit("OutputPath")->text()), "GUI launched protection with an invalid build key");
+        }
+        Edit("ProtectionBuildKey")->setText(BuildKey);
         Run("Wrap", "wrap");
         Check(Runner->arguments().contains("--license-product=gui.regression") && Runner->arguments().contains("--compress") &&
+              Runner->arguments().contains("--license-build-key=" + BuildKey) &&
               Runner->arguments().contains("--watermark=gui-watermark") && !Runner->arguments().contains(Private), "Wrapper lost protection options");
         Check(QFile::copy(License, Edit("OutputPath")->text() + ".license"), "Cannot attach test license");
         QProcess Execute;
@@ -159,6 +184,7 @@ int main(int Argc, char** Argv) {
         Edit("InputPath")->setText(Edit("OutputPath")->text());
         Run("Inspect", "inspect");
         Check(Log->toPlainText().contains("license: ECDSA P-256") && Log->toPlainText().contains("watermark: gui-watermark"), "Policy or watermark missing from wrapper");
+        Check(Log->toPlainText().contains("AES-256-GCM (license-held key)"), "GUI wrapper omitted license-held payload encryption");
         Edit("InputPath")->setText(Fixture);
         Edit("OutputPath")->setText(Work.filePath("payload.pvm"));
         Run("Pack", "pack");
@@ -212,16 +238,37 @@ int main(int Argc, char** Argv) {
         Button("ViewJson")->click();
         Check(Log->toPlainText().contains("---- manifest:"), "Manifest viewer did not read custom path");
         Edit("OutputPath")->setText(Work.filePath("single.exe"));
+        Instances->setValue(10); Complexity->setValue(100);
         Run("VirtualizeManual", "protect-function");
+        Check(Runner->arguments().contains("--vm-instances=10") && Runner->arguments().contains("--vm-complexity=100"),
+              "Single-function VM options missing");
         Edit("FunctionRvas")->setText(First + ", " + Second);
         Edit("OutputPath")->setText(Work.filePath("multi.exe"));
+        Instances->setValue(2); Complexity->setValue(0);
         Run("VirtualizeManual", "protect-functions");
         Check(Runner->arguments().mid(4, 2) == QStringList{First, Second}, "Manual multi-function RVAs changed");
+        Check(Runner->arguments().contains("--vm-instances=2") && Runner->arguments().contains("--vm-complexity=0"),
+              "Multi-function VM options missing");
         Edit("OutputPath")->setText(Work.filePath("all.exe"));
         Find<QSpinBox>(Window, "ProtectMinimumBytes")->setValue(12);
         Box("AllowMemory")->setChecked(true);
+        Instances->setValue(3); Complexity->setValue(75); Edit("FunctionSeed")->clear();
         Run("ProtectAll", "protect-all");
         Check(Runner->arguments().contains("--min-bytes=12") && Runner->arguments().contains("--allow-mem"), "Protect ALL options missing");
+        Check(Runner->arguments().contains("--vm-instances=3") && Runner->arguments().contains("--vm-complexity=75") &&
+              !Runner->arguments().join(' ').contains("--seed="), "Protect ALL VM options or automatic seed incorrect");
+        Instances->setValue(0);
+        Check(!Complexity->isEnabled(), "Zero instances did not disable complexity control");
+        Edit("OutputPath")->setText(Work.filePath("vm-disabled.exe"));
+        Run("ProtectAll", "protect-all");
+        Check(Log->toPlainText().contains("function virtualization: off"), "Zero instances did not disable virtualization");
+        {
+            MainWindow Restored;
+            Check(Find<QSpinBox>(Restored, "VmInstances")->value() == 0 &&
+                  Find<QSpinBox>(Restored, "VmComplexity")->value() == 75, "VM settings were not persisted");
+        }
+        Instances->setValue(1); Complexity->setValue(50);
+        Check(Complexity->isEnabled(), "Complexity did not re-enable");
 
         Button("RawPage")->click();
         Edit("RawRcx")->setText("0x2a");
@@ -263,7 +310,7 @@ int main(int Argc, char** Argv) {
         // Capture clean bilingual pages without transient notifications or card data.
         MainWindow Preview;
         Preview.show();
-        for (const auto* Id : {"LicensePage", "RawPage", "DemoPage", "ProtectionSettingsPage", "ContainerPage"}) {
+        for (const auto* Id : {"LicensePage", "RawPage", "DemoPage", "ProtectionSettingsPage", "ContainerPage", "FunctionPage"}) {
             Find<QPushButton>(Preview, Id)->click();
             QApplication::processEvents();
             Check(Preview.grab().save(Artifacts + "/" + Id + "-zh.png"), "Cannot render Chinese page");

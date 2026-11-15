@@ -134,20 +134,22 @@ bin\Release\PeVm.exe scan-functions app.exe scan.json
 bin\Release\PeVm.exe lift-raw 4887D14889D0C3 0 --rcx=0x11 --rdx=0x22   # lift raw hex machine code
 bin\Release\PeVm.exe license-machine-id
 bin\Release\PeVm.exe license-keygen issuer.private issuer.pub
+bin\Release\PeVm.exe license-export-build-key issuer.private product.buildkey --product=my-product
 bin\Release\PeVm.exe license-issue issuer.private 30 --machine=<64hex> --product=my-product --output=customer.license
+bin\Release\PeVm.exe wrap app.exe app.secure.exe "build password" --license --license-public-key=issuer.pub --license-product=my-product --license-build-key=product.buildkey
 ```
 
 The GUI is a bilingual Qt6 / QFluent front-end driving the sibling `PeVm.exe`
-with QProcess. All 22 existing CLI commands have GUI entries:
+with QProcess. All 23 CLI commands have GUI entries:
 
 | Page | Operations |
 | --- | --- |
 | Container & Wrapper | `wrap`, `pack`, `unpack`, `inspect`, `vm-dump` |
 | Function Virtualization | `scan-functions`, `protect-function`, `protect-functions`, `protect-all`, `lift-x64`, `lift-x64-multi` |
-| License issuance | `license-keygen`, `license-export-public`, `license-machine-id`, `license-issue`, `license-verify` |
+| License issuance | `license-keygen`, `license-export-public`, `license-export-build-key`, `license-machine-id`, `license-issue`, `license-verify` |
 | Raw machine code | `lift-raw`, with entry RVA, seed, RCX/RDX/R8/R9 and trace |
 | VM Demo | `virtualize-demo`, `call-memory-demo`, `vm-demo`, `vm2-self-test`, `self-test` |
-| Protection options | Shared compression, watermark, signed-license public key and product ID |
+| Protection options | Shared compression, watermark, signed-license public key, product ID and required build credential |
 
 Input/output/password fields appear on the container and function pages;
 drag-and-drop, automatic output suggestion and password visibility remain
@@ -162,9 +164,12 @@ or open existing keys. Enter the product ID, customer machine ID and days
 (0 = perpetual), then issue a license. A blank license path displays the card
 for copying; a new file path also saves it. Verification uses the selected
 license file and defaults to this machine when its ID field is blank.
-**Use for protection** transfers the public key and product ID into Protection
-options and enables licensing. Private keys use the current Windows user's
-DPAPI; existing key/license files are never overwritten. See
+Export a product `.buildkey` to a new path to enable license-held payload
+encryption. **Use for protection** transfers the public key, product ID and
+build credential into Protection options and enables licensing. New licensed
+builds require the matching build credential. Private keys and
+build credentials use the current Windows user's DPAPI and stay on the issuing
+or build machine; existing key/license files are never overwritten. See
 [Licensing](Docs/Licensing.md) for deployment and recovery details.
 
 The shared log supports clear/save, busy status and command timing. Build and
@@ -223,18 +228,30 @@ the container itself.
   enables ECDSA P-256/SHA-256 verification before payload execution.
   The wrapper contains a public key; the signing key stays in a DPAPI-protected
   file on the issuing machine. Licenses bind a case-sensitive product ID and
-  a 64-hex-digit device ID, with optional expiry. Only `PEVM-LICENSE` is accepted;
-  reissue all old cards and rebuild/distribute wrappers. There is no legacy
-  compatibility switch. See [license issuance and migration](Docs/Licensing.md).
+  a 64-hex-digit device ID, with optional expiry. Licensed builds require
+  `--license-build-key=<product.buildkey>` to encrypt the build password using
+  AES-256-GCM and the product key held in a signed v3 license. The EXE does not
+  contain that product key; the entire embedded image and footer are authenticated.
+  Rebuild EXEs to apply the updated loader; existing v3 cards remain usable.
+  Signed v2 cards remain verifiable and usable in previously built legacy EXEs;
+  new builds always require v3 cards. Obsolete numbered prefixes and shared-secret
+  formats are rejected. See [license issuance and migration](Docs/Licensing.md).
   Startup checks `PEVM_LICENSE`, then `<wrapper.exe>.license`, then a DPAPI-encrypted
   per-user cache. Invalid sources fall through only after their own signature,
   product, device and time checks fail. If no source validates, a native Windows
   dialog accepts and verifies a license; a successful entry is cached for that
   user and wrapper path. Cache entries are revalidated on every startup.
   The dialog uses Windows controls and needs no Qt/QFluent DLLs. Rebuild protected
-  EXEs with the updated stub to enable it; existing valid signed licenses still work.
-  Verification runs at startup. This offline scheme has no trusted time source
-  or online revocation and does not prevent arbitrary clock rollback or client patching.
+  EXEs with the updated stub to enable it. Signed sessions are encrypted in
+  process memory and rechecked at decryption/mapping boundaries and every 30
+  seconds during execution. Monotonic anchors and an independent DPAPI-protected
+  per-product/device high-water clock detect rollback across runs while the
+  record is retained. Corrupt or unavailable clock state denies execution.
+  Same-user record deletion/resealing and machine snapshots remain offline
+  limitations; this scheme has no online revocation or trusted server clock.
+  Any historical v3 card exposes its stable product
+  key to its holder, and a fully controlled client remains susceptible to patching
+  and memory extraction.
 - **Import protection**: manual mapping plus runtime resolution means the
   on-disk IAT is never used — import protection is inherent.
 - **Anti-debug / anti-dump**: see below.
@@ -269,9 +286,10 @@ Container v5 adds a Compression byte (0=stored, 1=LZSS) over v4 and
 redefines OriginalSize as the decompressed size; only v5 is accepted, older
 containers fail with "unsupported container version". `.vmp2` metadata v5 replaces the shared license secret with a public verification key and product digest; older wrapper metadata is rejected.
 
-The wrapper runs by double-click without a password. The build password is
-sealed into per-build salt + stub/payload fingerprint key material with its
-own integrity tag; the stub recovers it, decrypts the in-memory payload and
+The wrapper needs no user-entered build password. In the legacy mode that
+password is sealed using per-build salt and stub/payload fingerprints; license-held
+encryption instead requires the product key from a verified v3 card. The stub
+decrypts the in-memory payload and
 the `.vmp3` instruction table, then wipes the key buffers and the whole
 wrapper image. Relocations/imports/TLS/unwind are processed before execution
 — no temporary `Payload.exe` is created. Dependency DLLs load from the
@@ -292,10 +310,9 @@ wrapper's directory; working directory and command line stay compatible.
     are determined by DR7 enable bits; stale disabled Dr0-Dr3 addresses
     do not count. An unavailable context fails the startup check. This
     runs at the two startup checkpoints, not in the periodic watchdog;
-  - Process scan (x64dbg/x32dbg/OllyDbg/IDA/WinDbg/dnSpy/Cheat Engine names)
-    and loaded-module scan (Sandboxie/CE injection DLLs via the PEB LDR walk);
-  - Classic debugger window-class scan (best effort, skipped when user32 is
-    absent);
+  - Known analysis-tool process and top-level window identities, using the
+    independent rules and schedule below;
+  - Loaded-module scan (Sandboxie/CE injection DLLs via the PEB LDR walk);
   - `OutputDebugString` last-error trick;
   - `int3` delivery check (a debugger swallowing the breakpoint counts as a
     hit);
@@ -316,11 +333,35 @@ wrapper's directory; working directory and command line stay compatible.
   License/integrity verification and the separate 10-second unpack budget
   remain active even with the Debug opt-out. `PEVM_TEST_FAKE_DEBUGGER=1`
   simulates a hit for integration tests.
+- **Analysis-tool checks**: process names use case-insensitive, exact executable
+  basename matching, excluding the protected process's own PID. Strong window
+  classes such as `x64dbgClass` match directly; Qt, Windows Forms, AWT and Delphi
+  framework classes require an anchored analysis-tool brand title. Accepted
+  titles include exact brands, numeric versions (optionally `v`-prefixed),
+  descriptions introduced by `:` or ` - `, and titles ending in ` - <brand>`
+  or ` - <brand version>`. Hidden top-level windows are included, preserving
+  the former `FindWindow` visibility behavior. Checks are forced at startup,
+  after unpacking and immediately before payload entry; the watchdog scans on
+  an independent two-second schedule. VM entries only read the atomic failure
+  latch without taking the analysis guard's mutex or enumerating processes and
+  windows, avoiding new scans in payload TLS/DllMain callbacks. `Detected` and
+  `Unavailable` both latch failure and stop the protected process, including
+  missing APIs or an incomplete scan. The strict policy applies even when a
+  known analyzer is working on another program. Ordinary browser and AI app
+  names are not detection rules; renaming tools or disguising their identities
+  can bypass some matches. This identifies known tools, with no reliable AI
+  attribution or real-time detection guarantee. Rebuild existing wrappers
+  from the original PE to apply these rules.
 - `AntiDebugRegression` tests the production probe with real hardware
   breakpoints in each slot, disabled stale addresses, failure recovery,
   handle lifetime, and the Debug/Release policy. It is included in
   `Tests/RunTests.ps1`; use `-BinDirectory <path>` for an isolated build.
   Existing protected executables need to be regenerated with the new stub.
+- Analysis-tool regressions cover process/window identity rules, API failures,
+  handle cleanup and preservation of the caller's `GetLastError`. Six disposable
+  fixture integrations exercise startup process detection, renamed strong-class
+  and Qt-brand windows, an ordinary browser/document negative case, and process
+  and window detection after startup.
 - Every bridge trampoline is read back after patching; function entries and
   the thunk page converge to `PAGE_EXECUTE_READ`; double-wrapping (entry
   already a trampoline) is rejected explicitly.
@@ -348,26 +389,39 @@ wrapper's directory; working directory and command line stay compatible.
   plaintext image. Limitations: an executed page stays plaintext for the
   process lifetime; the VEH is user-mode and payload-registered front VEHs
   sort after it.
-- Error messages exposing the protection internals (`.vmp*` integrity, VM
+- Selected error messages exposing the protection internals (`.vmp*` integrity, VM
   bridge, anti-debug, import/relocation) are compiled in as `consteval` XOR
   blobs and only reassembled at runtime; `PEVM_*` environment variable names
   and window class names are obfuscated the same way. None of these strings
   are greppable in the binary.
-- **Sensitive IAT fully cleared**: all intent-revealing APIs (anti-debug,
-  `VirtualAlloc/VirtualProtect`, VEH, Toolhelp, `NtQuery*`,
-  `GetEnvironmentVariableW`, and the payload-import `LoadLibraryA`) are
+- **Runtime API resolution**: existing anti-debug probes, payload mapping,
+  VEH, Toolhelp, `NtQuery*`, `GetEnvironmentVariableW`, and the payload-import `LoadLibraryA` are
   resolved at runtime via a **PEB LDR walk + export-table FNV-1a hash match**
   — never `GetModuleHandleW`/`GetProcAddress`/`LoadLibraryA`; forwarded
-  exports (kernel32 → KERNELBASE etc.) are followed. The import table keeps
-  only CRT boilerplate and fully generic runtime entries; module, function,
-  environment-variable and window-class names are absent from the binary.
-- Extra checks: `NtQuerySystemInformation(SystemKernelDebuggerInformation)`
-  kernel-debugger detection and a classic debugger window-class scan.
+  exports (kernel32 → KERNELBASE etc.) are followed. The native code guard uses
+  ordinary Windows memory APIs, so its imports remain visible. Import and
+  string hiding reduce analysis hints; they do not establish a trust boundary.
+- Extra check: `NtQuerySystemInformation(SystemKernelDebuggerInformation)`
+  kernel-debugger detection.
 - **VM program runtime validation**: the loader authenticates and validates the
   lifted image, compiles it once, then freezes encrypted bytecode, maps, offsets
   and tags in read-only pages. Source IR is released after compilation.
   Instruction tags, boundary CFI and fuel are checked during execution; calls
   no longer rescan the entire IR or bytecode.
+- **Automated-analysis hardening**: all four wrapper commands strip carrier
+  CodeView/PDB paths, selected debugger records and COFF symbols before sealing.
+  Loader code is checked against disk-derived executable bytes, with ASLR
+  fixups, a read-only manifest and page-permission checks at launch boundaries
+  and on a one-second runtime schedule. Licensed v3 wrappers authenticate the
+  disk baseline with AES-256-GCM first; code or permission failures latch and
+  stop execution. Windows CNG supplies build IDs, default VM seeds and wrapper
+  nonces. Explicit seeds remain supported; native loader instructions are
+  shared across builds. Rebuild protected EXEs and keep PDBs internal.
+
+These measures raise the cost of AI-assisted and other automated analysis;
+they do not identify an AI analyst or guarantee resistance to a specific model.
+Full client control remains an offline protection boundary. Details and
+regression coverage are in [Licensing.md](Docs/Licensing.md).
 
 Container password derivation (scrypt) happens at unpack time; the runtime
 key material must ultimately be recoverable by the local loader, so this
@@ -403,13 +457,11 @@ decode state with plaintext-prefix feedback; existing arithmetic handler
 variants are selected per instruction. This is interpreter obfuscation;
 whole-image HMAC authentication remains a separate layer.
 
-On a same-machine Release microbenchmark, a four-IR instruction cached call
-rose from about 265 ns to 287 ns; compiling on every call costs about 2,516 ns.
-A cached sum loop with 16 iterations costs about 2.76 microseconds. Generated
-link instructions consume fuel, so limits count emitted VM instructions.
-These measurements are not whole-application estimates. Build output lists
-authentication, decoding mode and per-function block/relocation/link/bytecode
-counts. See `Docs/VmProtection.md` for implementation and verification details.
+Generated links and padding consume fuel, so limits count emitted VM
+instructions. Use `VmRegression.exe --benchmark` to measure the selected build;
+old measurements do not describe the new default complexity. Build output
+lists authentication, decoding mode and per-function compilation metrics.
+See `Docs/VmProtection.md` for implementation and verification details.
 
 ## VM instruction set
 
@@ -466,10 +518,34 @@ is assembled into VM2 bytecode first:
 `call-memory-demo` covers the virtual data stack, CALL/RET, encrypted branch
 targets, virtual memory `STORE64/LOAD64` and instruction-boundary CFI.
 
+## VM instances and complexity
+
+The function page and all `protect-*` commands accept `--vm-instances=0..10`
+(default 1) and `--vm-complexity=0..100` (default 50). Zero instances disables
+function virtualization while retaining the encrypted wrapper. GUI settings
+persist, and an empty seed field requests a fresh build seed.
+
+Each function has N independently compiled bytecode instances, selected in
+rotation by the loader. They share the native C++ interpreter; they are not
+N generated native interpreters or N nested execution layers. More instances
+increase startup compilation and memory use. Higher complexity enables more
+operand layouts, block splitting and randomized padding, increasing execution
+cost. The actual lifted `Sized` path now uses masked sub-opcodes and up to four
+encodings, including reordered, masked and variable-length immediates.
+
+```powershell
+PeVm protect-all app.exe protected.exe "build key" --vm-instances=4 --vm-complexity=75
+```
+
+Both options are covered by image authentication (internal revision 7).
+`inspect` reports them and build logs aggregate the actual compilation metrics
+across instances. See [VM protection](Docs/VmProtection.md) for format details,
+zero semantics, costs and verification.
+
 ## x64 function lifting (VM2)
 
-The loader calls `CompileLiftedProgram` once per function when loading
-`.vmp3`; subsequent bridge calls reuse encrypted bytecode in read-only pages
+The loader calls `CompileProgramInstances` per function when loading
+`.vmp3`; subsequent bridge calls select an instance and reuse its encrypted bytecode in read-only pages
 through `InvokeCompiledProgram`. Registers, flags and VM state remain local
 to each invocation. Full layout/integrity validation happens before publication;
 instruction authentication, CFI and fuel remain active during execution.
@@ -480,10 +556,10 @@ Rebuild existing wrappers with matching CLI and loader binaries.
 
 `VmRegression.exe` checks reuse, snapshot independence from modified source
 IR, 4,000 concurrent calls, state isolation, OOB/fuel rejection, a non-first
-entry address, 5,808 image tamper/truncation/structural rejections, and 4,608
+entry address, 4,950 image tamper/truncation/structural rejections, and 4,608
 mutation/flags differential cases. Another 9,536 native-result/control-flow
 checks cover all conditional branches, shuffled loops, nested calls and
-terminal fallthrough; 64 seeds produce 23 distinct loop layouts.
+terminal fallthrough; 64 seeds produce 64 distinct loop layouts.
 `--benchmark` compares compilation per call against reuse for four IR
 instructions and reports a cached loop workload; it is not an application-level
 speedup measurement. GUI command logs redact build passwords. License settings accept only a public key file and product ID; private signing keys are never passed to protection commands.
@@ -501,7 +577,7 @@ PeVm lift-x64 Input.exe 0x1000 Function.vm2.json 0x1234 --rcx=1 --rdx=2 --r8=4 -
 The bridge captures all 16 integer registers, XMM0–XMM15 and flags. The entry
 uses a five-byte relative jump to a nearby thunk, with registered x64 unwind
 metadata. The instruction stream carries explicit operand widths (VM image
-revision 6; rebuild older wrappers to use the new runtime).
+revision 7; rebuild older wrappers to use the new runtime).
 
 Supported integer operations include 8/16/32/64-bit MOV and ALU operations,
 ADC/SBB, IMUL, NEG/NOT, INC/DEC, shifts/rotates, MOVZX/MOVSX/MOVSXD,
@@ -531,7 +607,8 @@ memory access, MOVZX/MOVSX/MOVSXD, NEG/NOT, SETcc, Group1 memory+immediate,
 accumulator short forms), plus 34 deterministic `lift-raw` decode differentials
 over hand-assembled bytes (XCHG, PUSH imm, SETcc, ADC/SBB carry chains, rotations,
 etc.); it verifies stack-parameter execution and explicitly rejects CPUID and
-LOCK operations. `VmRegression.exe` also compares 164,640 operand-width cases
+LOCK operations. `VmRegression.exe` also compares 493,920 operand-width cases
+across complexity levels 0, 50 and 100
 against native CPU execution, checks a byte load beside a guard page, and
 exercises six-argument calls, XMM returns and C++ exception unwinding.
 `loader_tls_and_qt` explicitly virtualizes `LoaderCallWithStack`, `LoaderSimd`,
@@ -557,7 +634,8 @@ add/subtract, comparisons, low-word multiply, unpack and shuffle. The bridge
 preserves XMM0–XMM15 and MXCSR. Scalar memory access uses its actual 4/8-byte
 width. This is a subset of SSE/SSE2, not complete AVX/AVX2/AVX-512 support.
 
-`VmRegression.exe` compares 85,632 SIMD cases against the CPU, including four
+`VmRegression.exe` compares 256,896 SIMD cases against the CPU across complexity
+levels 0, 50 and 100, including four
 rounding modes, DAZ/FTZ, NaN payloads, flags and memory boundaries. It also tests
 SIMD image round trips, authenticated EH resume metadata and unsafe-fragment
 rejection. `Tests/QtPerformance.ps1` measures 31 Qt timer callbacks with 2,000

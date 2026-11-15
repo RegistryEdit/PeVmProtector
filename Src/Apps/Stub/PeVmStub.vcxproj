@@ -29,7 +29,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>shell32.lib;comctl32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -39,9 +39,13 @@
     <ClCompile Include="Stub.cpp" />
     <ClCompile Include="AntiDebug.cpp" />
     <ClInclude Include="AntiDebug.h" />
+    <ClCompile Include="AnalysisTools.cpp" />
+    <ClInclude Include="AnalysisTools.h" />
     <ClCompile Include="LicenseCache.cpp" />
     <ClCompile Include="LicenseDialog.cpp" />
     <ClCompile Include="LicenseRuntime.cpp" />
+    <ClCompile Include="LicenseClock.cpp" />
+    <ClInclude Include="LicenseClock.h" />
     <ClInclude Include="LicenseRuntime.h" />
     <ClInclude Include="LicenseDialog.h" />
   </ItemGroup>

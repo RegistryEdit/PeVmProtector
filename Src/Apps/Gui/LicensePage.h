@@ -24,7 +24,7 @@ class LicensePage final : public QWidget {
 public:
     using Completion = std::function<void(bool, const QByteArray&)>;
     std::function<bool(const QStringList&, Completion)> Run;
-    std::function<void(const QString&, const QString&)> ApplyProtection;
+    std::function<void(const QString&, const QString&, const QString&)> ApplyProtection;
 
     explicit LicensePage(QWidget* Parent = nullptr) : QWidget(Parent) {
         const auto Layout = new QVBoxLayout(this);
@@ -39,10 +39,12 @@ public:
         const auto Form = new QFormLayout;
         PrivatePath = PathRow(Form, "Signing private key", "签发私钥", "SigningPrivatePath", "Private key (*.private);;All files (*)");
         PublicPath = PathRow(Form, "Verification public key", "验证公钥", "SigningPublicPath", "Public key (*.pub);;All files (*)");
+        BuildKeyPath = PathRow(Form, "Product build key", "产品保护密钥", "SigningBuildKeyPath", "Build key (*.buildkey);;All files (*)");
         Layout->addLayout(Form);
         const auto KeyActions = new QHBoxLayout;
         auto* Generate = Button(KeyActions, "GenerateKeyPair", "Generate key pair", "生成密钥对");
         auto* Export = Button(KeyActions, "ExportPublicKey", "Export public key", "从私钥导出公钥");
+        auto* ExportBuild = Button(KeyActions, "ExportBuildKey", "Export product build key", "导出产品保护密钥");
         Layout->addLayout(KeyActions);
 
         const auto Policy = new QFormLayout;
@@ -102,6 +104,10 @@ public:
             if (!ExistingFile(PrivatePath->text()) || !NewFile(PublicPath->text())) return;
             Execute({"license-export-public", PrivatePath->text(), PublicPath->text()});
         });
+        connect(ExportBuild, &QPushButton::clicked, this, [this] {
+            if (!ExistingFile(PrivatePath->text()) || !NewFile(BuildKeyPath->text()) || !ValidProduct()) return;
+            Execute({"license-export-build-key", PrivatePath->text(), BuildKeyPath->text(), "--product=" + Product->text().trimmed()});
+        });
         connect(GetMachine, &QPushButton::clicked, this, [this] {
             if (!Run) return;
             Run({"license-machine-id"}, [this](bool Success, const QByteArray& Output) {
@@ -147,8 +153,8 @@ public:
             Execute(Arguments);
         });
         connect(Apply, &QPushButton::clicked, this, [this] {
-            if (!ExistingFile(PublicPath->text()) || !ValidProduct()) return;
-            if (ApplyProtection) ApplyProtection(PublicPath->text(), Product->text().trimmed());
+            if (!ExistingFile(PublicPath->text()) || !ExistingFile(BuildKeyPath->text().trimmed()) || !ValidProduct()) return;
+            if (ApplyProtection) ApplyProtection(PublicPath->text(), Product->text().trimmed(), BuildKeyPath->text().trimmed());
         });
         connect(Copy, &QPushButton::clicked, this, [this] { QApplication::clipboard()->setText(LicenseText->toPlainText()); });
         SetChinese(false);
@@ -159,11 +165,12 @@ public:
         for (const auto& Update : Translations) Update();
         Machine->setPlaceholderText(Tr("64 hex digits; blank verifies this machine", "64 位十六进制；验证时留空使用本机"));
         LicensePath->setPlaceholderText(Tr("Optional when issuing; required for verification", "签发时可留空显示卡密；验证时必填"));
+        BuildKeyPath->setPlaceholderText(Tr("Required for protection; export and keep on the build machine", "程序保护必填；导出后仅保留在构建端"));
     }
 
 private:
     bool Chinese{};
-    LineEdit *PrivatePath{}, *PublicPath{}, *Product{}, *Machine{}, *LicensePath{};
+    LineEdit *PrivatePath{}, *PublicPath{}, *Product{}, *Machine{}, *LicensePath{}, *BuildKeyPath{};
     SpinBox* Days{};
     BodyLabel* Result{};
     PlainTextEdit* LicenseText{};

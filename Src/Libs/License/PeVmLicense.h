@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "WrapperFormat.h"
 #include "PeVmLicenseFormat.h"
 
@@ -29,11 +30,13 @@ struct LicensePayload {
     Digest Machine{};
     std::uint64_t IssuedFileTime{};
     std::uint64_t ExpiresFileTime{}; // zero means perpetual
+    Digest UnlockKey{}; // v3: issuer-derived product secret, covered by the signature
     std::array<std::uint8_t, 64> Signature{};
 };
 #pragma pack(pop)
-static_assert(sizeof(LicensePayload) == 196);
-static_assert(offsetof(LicensePayload, Signature) == 132);
+static_assert(sizeof(LicensePayload) == 228);
+static_assert(offsetof(LicensePayload, UnlockKey) == 132);
+static_assert(offsetof(LicensePayload, Signature) == 164);
 
 std::uint64_t CurrentFileTime();
 Digest MachineId();
@@ -48,7 +51,18 @@ PublicKey ReadPublicKey(const std::filesystem::path& Path);
 LicensePolicy MakePolicy(const std::filesystem::path& PublicPath, std::string_view Product);
 void ValidatePolicy(const LicensePolicy& Policy);
 LicensePayload IssueLicense(const std::filesystem::path& PrivatePath, std::string_view Product,
-                            const Digest& Machine, std::uint32_t Days, std::uint64_t IssuedFileTime);
+                            const Digest& Machine, std::uint32_t Days, std::uint64_t IssuedFileTime,
+                            bool Legacy = false);
+// The signing key stays on the issuing machine. The build credential is DPAPI
+// sealed for the build user, product/key bound and independently issuer signed.
+void ExportBuildKeyFile(const std::filesystem::path& PrivatePath, const std::filesystem::path& Output,
+                        std::string_view Product);
+Digest ReadBuildKey(const std::filesystem::path& Path, const LicensePolicy& Policy);
+// Authenticates the entire embedded image and footer; the key is absent from EXE.
+std::vector<std::uint8_t> SealLicensedSecret(const Digest& UnlockKey, std::span<const std::uint8_t> Image,
+                                          WrapperFooter& Footer, std::string_view Secret);
+std::string OpenLicensedSecret(const Digest& UnlockKey, std::span<const std::uint8_t> Image,
+                              const WrapperFooter& Footer, std::span<const std::uint8_t> Sealed);
 std::string FormatLicense(const LicensePayload& Payload);
 LicensePayload ParseLicense(std::string_view Text);
 // Empty means valid; throws on platform/key failures. Reject either kind of failure.

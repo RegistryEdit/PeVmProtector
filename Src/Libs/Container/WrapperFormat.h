@@ -6,7 +6,7 @@
 
 #pragma pack(push, 1)
 struct LicensePolicy {
-    std::uint32_t Required{};
+    std::uint32_t Required{}; // 0 off, 1 legacy startup gate, 2 license-held payload key
     std::array<std::uint8_t, 72> PublicKey{}; // P-256 BCRYPT_ECCPUBLIC_BLOB
     std::array<std::uint8_t, 32> ProductId{};
 };
@@ -50,7 +50,9 @@ struct Vmp3Header {
     std::uint32_t FunctionCount;
     std::uint64_t Seed;
     std::uint32_t DecoySize;
-    std::uint32_t Reserved;
+    std::uint8_t Instances;
+    std::uint8_t Complexity;
+    std::uint16_t Reserved;
 };
 
 // One VM image entry per virtualized function. InstructionOffset indexes the

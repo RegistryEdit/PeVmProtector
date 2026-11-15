@@ -89,7 +89,10 @@ template <typename T> T Read(std::span<const std::uint8_t> Data, std::size_t Off
 crypto::Bytes EncodeVmImage(std::span<const vmprotect::LiftedProgram> Programs,
                            std::uint64_t Seed, std::string_view BuildSecret,
                            std::span<const std::uint8_t> HandlerProfile, bool Decoys,
-                           std::vector<vmprotect::CompilationStats>* Statistics) {
+                           std::vector<vmprotect::CompilationStats>* Statistics,
+                           const vmprotect::ProtectionOptions& Options) {
+    vmprotect::ValidateProtectionOptions(Options);
+    if (Options.Instances == 0) throw std::runtime_error("VM image requires at least one instance");
     if (Programs.empty() || Programs.size() > UINT32_MAX) throw std::runtime_error("VM image function count invalid");
     const auto Keys = MakeKeys(BuildSecret, Seed, HandlerProfile);
     std::size_t Count = 0;
@@ -102,12 +105,26 @@ crypto::Bytes EncodeVmImage(std::span<const vmprotect::LiftedProgram> Programs,
         }
         if (!Entries.insert(Program.EntryAddress).second) throw std::runtime_error("VM image duplicate function entry");
         // Use the same validator/assembler that the loader will use.
-        const auto Compiled = vmprotect::CompileLiftedProgram(Program, FunctionSeed(Keys, Program.EntryAddress));
-        if (Statistics) CompiledStats.push_back(vmprotect::GetCompilationStats(Compiled));
+        const auto Instances = vmprotect::CompileProgramInstances(Program, FunctionSeed(Keys, Program.EntryAddress), Options);
+        vmprotect::CompilationStats Total{};
+        for (const auto& Compiled : Instances) {
+            const auto Stats = vmprotect::GetCompilationStats(Compiled);
+            Total.BasicBlocks += Stats.BasicBlocks;
+            Total.RelocatedBlocks += Stats.RelocatedBlocks;
+            Total.LinkInstructions += Stats.LinkInstructions;
+            Total.BytecodeInstructions += Stats.BytecodeInstructions;
+            Total.BytecodeBytes += Stats.BytecodeBytes;
+            Total.SplitBlocks += Stats.SplitBlocks;
+            Total.PaddingBytes += Stats.PaddingBytes;
+            Total.EncodingMask |= Stats.EncodingMask;
+        }
+        if (Statistics) CompiledStats.push_back(Total);
         Count += Program.Instructions.size();
     }
-    const std::uint32_t DecoySize = Decoys ? 128U : 0U;
-    const Vmp3Header Header{KVmp3Magic, KVmImageVersion, static_cast<std::uint32_t>(Programs.size()), Seed, DecoySize, 0};
+    const std::uint32_t DecoySize = Decoys ? 32U + 16U * static_cast<std::uint32_t>(
+        WrapperMix64(Seed ^ 0xA5F1523D9E3779B9ULL) % (1 + Options.Complexity / 4)) : 0U;
+    const Vmp3Header Header{KVmp3Magic, KVmImageVersion, static_cast<std::uint32_t>(Programs.size()), Seed,
+        DecoySize, static_cast<std::uint8_t>(Options.Instances), static_cast<std::uint8_t>(Options.Complexity), 0};
     const auto EntryBytes = Programs.size() * sizeof(Vmp3Entry);
     WipedTable Table{Bytes(Count * sizeof(Vmp3Instruction))};
     Bytes Data(sizeof(Header) + EntryBytes + Table.Data.size() + DecoySize + KVmImageTagSize);
@@ -130,9 +147,7 @@ crypto::Bytes EncodeVmImage(std::span<const vmprotect::LiftedProgram> Programs,
     auto* DecoyData = Data.data() + Data.size() - KVmImageTagSize - DecoySize;
     for (std::uint32_t I = 0; I < DecoySize; ++I) {
         State = WrapperMix64(State + I);
-        static constexpr std::array<std::uint8_t, 4> Patterns = {0x90, 0xCC, 0x0F, 0x0B};
-        DecoyData[I] = (I + 1 < DecoySize && (I % 11U) == 0) ? 0x0F : Patterns[State & 3U];
-        if (DecoyData[I] == 0x0F && I + 1 < DecoySize && (I % 11U) == 0) DecoyData[++I] = 0x0B;
+        DecoyData[I] = static_cast<std::uint8_t>(State >> 32);
     }
     const auto Tag = ImageTag(std::span(Data).first(Data.size() - KVmImageTagSize), Keys);
     std::memcpy(Data.data() + Data.size() - Tag.size(), Tag.data(), Tag.size());
@@ -152,7 +167,8 @@ std::vector<DecodedVmFunction> DecodeVmImage(std::span<const std::uint8_t> Data,
     const auto Body = Data.first(Data.size() - KVmImageTagSize);
     const auto Tag = ImageTag(Body, Keys);
     if (!ConstantEqual(Tag, Data.last(KVmImageTagSize))) throw std::runtime_error("VM image authentication failed");
-    if (Header.Reserved != 0 || (Header.DecoySize != 0 && Header.DecoySize != 128) ||
+    if (Header.Reserved != 0 || Header.Instances == 0 || Header.Instances > 10 || Header.Complexity > 100 ||
+        (Header.DecoySize != 0 && (Header.DecoySize < 32 || Header.DecoySize > 432 || Header.DecoySize % 16 != 0)) ||
         Header.FunctionCount == 0 || Header.FunctionCount > (Body.size() - sizeof(Header)) / sizeof(Vmp3Entry)) {
         throw std::runtime_error("VM image header invalid");
     }
@@ -187,6 +203,7 @@ std::vector<DecodedVmFunction> DecodeVmImage(std::span<const std::uint8_t> Data,
         Function.Program.EntryAddress = Entry.FunctionRva;
         Function.Program.ResumeAddress = Entry.ResumeRva;
         Function.Seed = FunctionSeed(Keys, Entry.FunctionRva);
+        Function.Options = {Header.Instances, Header.Complexity};
         Function.Program.Instructions.reserve(Entry.InstructionCount);
         for (std::size_t I = 0; I < Entry.InstructionCount; ++I) {
             const auto Record = Read<Vmp3Instruction>(Table.Data, (Entry.InstructionOffset + I) * sizeof(Vmp3Instruction));

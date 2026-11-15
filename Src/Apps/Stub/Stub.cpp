@@ -1,5 +1,6 @@
 #include "VmImageCodec.h"
 #include "PeRelocations.h"
+#include "PeCodeIntegrity.h"
 #include "PeTls.h"
 #include "WindowsResources.h"
 #include <windows.h>
@@ -29,6 +30,7 @@
 #include "PeVmLicense.h"
 #include "LicenseRuntime.h"
 #include "AntiDebug.h"
+#include "AnalysisTools.h"
 #include "VmProtect.h"
 #include "WrapperFormat.h"
 
@@ -286,7 +288,6 @@ using Process32FirstWFn = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
 using Process32NextWFn = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
 using OutputDebugStringWFn = void(WINAPI*)(const wchar_t*);
 using CloseHandleFn = BOOL(WINAPI*)(HANDLE);
-using FindWindowWFn = HWND(WINAPI*)(const wchar_t*, const wchar_t*);
 using VirtualAllocFn = LPVOID(WINAPI*)(LPVOID, SIZE_T, DWORD, DWORD);
 using VirtualProtectFn = BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD, PDWORD);
 using AddVectoredExceptionHandlerFn = void*(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
@@ -387,35 +388,6 @@ void CheckHardwareBreakpoints() {
         IntegrityFailure();
 }
 
-// Coarse scan of the process list for well-known debugger executables.
-void CheckDebuggerProcesses() {
-    static constexpr std::array<std::wstring_view, 8> Known = {
-        L"x64dbg", L"x32dbg", L"ollydbg", L"ida64", L"ida32", L"windbg", L"dnspy", L"cheatengine"};
-    const auto Snapshot = PEVM_API(CreateToolhelp32SnapshotFn, KKernel32Module,
-                                   "CreateToolhelp32Snapshot");
-    const auto First = PEVM_API(Process32FirstWFn, KKernel32Module, "Process32FirstW");
-    const auto Next = PEVM_API(Process32NextWFn, KKernel32Module, "Process32NextW");
-    const auto Close = PEVM_API(CloseHandleFn, KKernel32Module, "CloseHandle");
-    if (Snapshot == nullptr || First == nullptr || Next == nullptr || Close == nullptr) return;
-    const auto Handle = Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (Handle == INVALID_HANDLE_VALUE) return;
-    PROCESSENTRY32W Entry{};
-    Entry.dwSize = sizeof(Entry);
-    if (First(Handle, &Entry)) {
-        do {
-            std::wstring Lower(Entry.szExeFile);
-            std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::towlower);
-            for (const auto Name : Known) {
-                if (Lower.find(Name) != std::wstring::npos) {
-                    Close(Handle);
-                    IntegrityFailure();
-                }
-            }
-        } while (Next(Handle, &Entry));
-    }
-    Close(Handle);
-}
-
 // OutputDebugString resets the last error to zero when a debugger consumes
 // the message; without one the previous error survives.
 void CheckOutputDebugString() {
@@ -424,16 +396,6 @@ void CheckOutputDebugString() {
     SetLastError(0x1337);
     Output(PEVM_WTEXT(L"PeVmProtector").c_str());
     if (GetLastError() == 0) IntegrityFailure();
-}
-
-// Window scan for classic debugger main windows (best effort; user32 may not
-// be mapped in console-subsystem processes).
-void CheckDebuggerWindows() {
-    const auto Find = PEVM_API(FindWindowWFn, KUser32Module, "FindWindowW");
-    if (Find == nullptr) return;
-    if (Find(PEVM_WTEXT(L"OLLYDBG").c_str(), nullptr) != nullptr) IntegrityFailure();
-    if (Find(PEVM_WTEXT(L"x64dbgClass").c_str(), nullptr) != nullptr) IntegrityFailure();
-    if (Find(PEVM_WTEXT(L"x32dbgClass").c_str(), nullptr) != nullptr) IntegrityFailure();
 }
 
 // Without a debugger the breakpoint exception reaches our own handler; one
@@ -577,19 +539,110 @@ bool DebuggerLightHit() {
     return false;
 }
 
-std::atomic<bool> GWatchdogStop{false};
+constexpr std::uint64_t KAnalysisCheckIntervalMs = 2000;
+struct RuntimeAnalysisSession {
+    std::mutex Mutex;
+    std::uint64_t LastCheck{}, NextCheck{};
+    std::atomic_bool Failed{false};
+};
+RuntimeAnalysisSession& GRuntimeAnalysis = *new RuntimeAnalysisSession;
+
+const PeVm::Stub::AnalysisToolApis& AnalysisApis() {
+    // First resolved at startup, before the watchdog exists. Keep the API
+    // table alive through CRT teardown together with both integrity sessions.
+    static const auto* const Apis = new PeVm::Stub::AnalysisToolApis{
+        PEVM_API(CreateToolhelp32SnapshotFn, KKernel32Module, "CreateToolhelp32Snapshot"),
+        PEVM_API(Process32FirstWFn, KKernel32Module, "Process32FirstW"),
+        PEVM_API(Process32NextWFn, KKernel32Module, "Process32NextW"),
+        PEVM_API(CloseHandleFn, KKernel32Module, "CloseHandle"),
+        PEVM_API(decltype(&::EnumWindows), KUser32Module, "EnumWindows"),
+        PEVM_API(decltype(&::GetClassNameW), KUser32Module, "GetClassNameW"),
+        PEVM_API(decltype(&::GetWindowTextW), KUser32Module, "GetWindowTextW"),
+        PEVM_API(decltype(&::GetWindowThreadProcessId), KUser32Module, "GetWindowThreadProcessId"),
+    };
+    return *Apis;
+}
+
+void CheckAnalysisEnvironment(bool Force = false) {
+    if (AllowDevelopmentDebugger()) return;
+    const std::lock_guard Lock(GRuntimeAnalysis.Mutex);
+    try {
+        const auto Ticks = GetTickCount64();
+        if (GRuntimeAnalysis.Failed.load(std::memory_order_acquire) || Ticks < GRuntimeAnalysis.LastCheck ||
+            Ticks > UINT64_MAX - KAnalysisCheckIntervalMs ||
+            GRuntimeAnalysis.LastCheck > UINT64_MAX - KAnalysisCheckIntervalMs ||
+            (GRuntimeAnalysis.NextCheck != 0 &&
+             GRuntimeAnalysis.NextCheck != GRuntimeAnalysis.LastCheck + KAnalysisCheckIntervalMs))
+            throw std::runtime_error(PEVM_TEXT("invalid analysis guard state"));
+        if (!Force && Ticks < GRuntimeAnalysis.NextCheck) return;
+        const auto Result = PeVm::Stub::ProbeAnalysisTools(AnalysisApis(), GetCurrentProcessId());
+        if (Result.Status == PeVm::Stub::AnalysisToolStatus::Unavailable)
+            throw std::runtime_error(PEVM_TEXT("analysis environment check unavailable"));
+        if (Result.Status != PeVm::Stub::AnalysisToolStatus::Clear) IntegrityFailure();
+        GRuntimeAnalysis.LastCheck = Ticks;
+        GRuntimeAnalysis.NextCheck = Ticks + KAnalysisCheckIntervalMs;
+    } catch (...) {
+        GRuntimeAnalysis.Failed.store(true, std::memory_order_release);
+        throw;
+    }
+}
+
+void CheckRuntimeAnalysisState() {
+    // A virtualized function can run from TLS/DllMain under the loader lock.
+    // Leave inventory and its mutex to the watchdog and normal loader boundaries.
+    if (GRuntimeAnalysis.Failed.load(std::memory_order_acquire)) IntegrityFailure();
+}
+
+struct RuntimeCodeSession {
+    std::mutex Mutex;
+    std::unique_ptr<pevm::pe::ExecutableImageGuard> Guard;
+    std::uint64_t LastCheck{}, NextCheck{};
+    bool Failed{};
+};
+// The watchdog can run after CRT teardown begins. Keep its immutable baseline
+// and synchronization alive until the OS terminates this process.
+RuntimeCodeSession& GRuntimeCode = *new RuntimeCodeSession;
+
+void InitializeRuntimeCode(std::span<const std::uint8_t> DiskImage) {
+    auto Guard = std::make_unique<pevm::pe::ExecutableImageGuard>(DiskImage, GetModuleHandleW(nullptr));
+    const std::lock_guard Lock(GRuntimeCode.Mutex);
+    if (GRuntimeCode.Guard) throw std::runtime_error("runtime code guard already initialized");
+    GRuntimeCode.Guard = std::move(Guard);
+}
+void RevalidateRuntimeCode(bool Force = false) {
+    const std::lock_guard Lock(GRuntimeCode.Mutex);
+    try {
+        const auto Ticks = GetTickCount64();
+        if (GRuntimeCode.Failed || !GRuntimeCode.Guard || Ticks < GRuntimeCode.LastCheck || Ticks > UINT64_MAX - 1000 ||
+            GRuntimeCode.LastCheck > UINT64_MAX - 1000 ||
+            (GRuntimeCode.NextCheck != 0 && GRuntimeCode.NextCheck != GRuntimeCode.LastCheck + 1000))
+            throw std::runtime_error("invalid runtime code guard state");
+        if (!Force && Ticks < GRuntimeCode.NextCheck) return;
+        GRuntimeCode.Guard->Check();
+        GRuntimeCode.LastCheck = Ticks;
+        GRuntimeCode.NextCheck = Ticks + 1000;
+    } catch (...) {
+        GRuntimeCode.Failed = true;
+        throw;
+    }
+}
 
 DWORD WINAPI WatchdogThread(void*) {
+    // License validation has an independent monotonic 30-second schedule.
     using TerminateProcessFn = BOOL(WINAPI*)(HANDLE, UINT);
-    while (!GWatchdogStop.load(std::memory_order_relaxed)) {
-        if (DebuggerLightHit()) {
+    for (;;) {
+        bool Violation = DebuggerLightHit();
+        if (!Violation) {
+            try { RevalidateRuntimeCode(); pevm::activation::RevalidateLicenseSession(); CheckAnalysisEnvironment(); }
+            catch (...) { Violation = true; }
+        }
+        if (Violation) {
             const auto Kill = PEVM_API(TerminateProcessFn, KKernel32Module, "TerminateProcess");
             if (Kill != nullptr) (void)Kill(GetCurrentProcess(), 1U);
             ExitProcess(1U);
         }
         Sleep(250);
     }
-    return 0;
 }
 
 void StartWatchdog() {
@@ -598,10 +651,10 @@ void StartWatchdog() {
     using CreateThreadFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE,
                                            LPVOID, DWORD, LPDWORD);
     const auto Create = PEVM_API(CreateThreadFn, KKernel32Module, "CreateThread");
-    if (Create == nullptr) return;
-    GWatchdogStop.store(false);
+    if (Create == nullptr) throw std::runtime_error("cannot start runtime integrity watchdog");
     const auto Thread = Create(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
     if (Thread != nullptr) CloseHandle(Thread);
+    else throw std::runtime_error("cannot start runtime integrity watchdog");
 }
 
 void RunAntiDebugChecks(bool Light = false) {
@@ -612,9 +665,8 @@ void RunAntiDebugChecks(bool Light = false) {
     CheckDebugObjects();
     CheckKernelDebugger();
     CheckHardwareBreakpoints();
+    CheckAnalysisEnvironment(true);
     if (Light) return;
-    CheckDebuggerProcesses();
-    CheckDebuggerWindows();
     CheckInjectedModules();
     CheckOutputDebugString();
     CheckInt3Delivery();
@@ -629,13 +681,21 @@ void RunAntiDebugChecks(bool Light = false) {
 constexpr std::uint64_t KUnpackBudgetMs = 10000;
 
 std::string RecoverBuildSecret(std::span<const std::uint8_t> Image, const WrapperFooter& Footer,
-                               std::size_t PayloadOffset, std::size_t SecretOffset) {
+                               std::size_t PayloadOffset, std::size_t SecretOffset,
+                               const LicensePolicy& Policy, std::string_view LicenseText) {
     if (Footer.StubSize != SecretOffset || Footer.SecretSize > Image.size() - SecretOffset) {
         throw std::runtime_error(PEVM_TEXT("wrapper layout invalid"));
     }
     const auto Stub = Image.first(static_cast<std::size_t>(Footer.StubSize));
     const auto Payload = Image.subspan(PayloadOffset, static_cast<std::size_t>(Footer.PayloadSize));
     const auto Sealed = Image.subspan(SecretOffset, Footer.SecretSize);
+    if (Footer.Version == 3) {
+        auto LicensePayload = pevm::license::ParseLicense(LicenseText);
+        struct Erase { pevm::license::LicensePayload& Payload; ~Erase() { SecureZeroMemory(&Payload, sizeof(Payload)); } } Eraser{LicensePayload};
+        const auto Reason = pevm::license::VerifyPayload(LicensePayload, Policy, pevm::license::MachineId(), pevm::license::CurrentFileTime());
+        if (!Reason.empty() || Policy.Required != 2) throw std::runtime_error("licensed payload authorization failed: " + Reason);
+        return pevm::license::OpenLicensedSecret(LicensePayload.UnlockKey, Stub, Footer, Sealed);
+    }
     const auto Fingerprint = WrapperFingerprint(Stub, Payload, Footer.Salt);
     if (Footer.SecretTag != WrapperSecretTag(Sealed, Fingerprint)) {
         throw std::runtime_error(PEVM_TEXT("wrapper secret integrity failed"));
@@ -688,7 +748,8 @@ VmpMetadata ValidateProtectionMetadata(std::span<const std::uint8_t> Image, cons
 }
 
 struct VmProgram {
-    vmprotect::CompiledProgram Compiled;
+    std::vector<vmprotect::CompiledProgram> Instances;
+    alignas(std::atomic_ref<std::uint64_t>::required_alignment) mutable std::uint64_t NextInstance{};
     std::uint32_t EntryAddress{};
     std::uint32_t ResumeAddress{};
     bool NeedsStack{};
@@ -717,7 +778,7 @@ std::uint64_t GVmImageBase{};
 // that switch and can incorrectly skip a first-time initialization.
 struct VmBridgeTrace {
     std::mutex Mutex;
-    std::vector<std::uint8_t> Seen;
+    std::vector<std::uint16_t> Seen;
     std::ofstream Log;
     bool Enabled{};
 } GVmBridgeTrace;
@@ -750,15 +811,30 @@ extern "C" void VirtualizedFunctionBridge(vmprotect::VmBridgeContext* State,
     if (Index >= GVirtualizedPrograms.size()) {
         throw std::runtime_error(PEVM_TEXT("VM bridge function index invalid"));
     }
+    {
+        struct ThreadErrorRestore {
+            DWORD Value{GetLastError()};
+            ~ThreadErrorRestore() { SetLastError(Value); }
+        } PreserveError;
+        pevm::activation::RevalidateLicenseSession();
+        RevalidateRuntimeCode();
+        CheckRuntimeAnalysisState();
+    }
+    const auto& Virtualized = GVirtualizedPrograms[static_cast<std::size_t>(Index)];
+    if (Virtualized.Instances.empty()) throw std::runtime_error("VM bridge instance pool empty");
+    const auto Instance = Virtualized.Instances.size() == 1 ? 0 :
+        std::atomic_ref(Virtualized.NextInstance).fetch_add(1, std::memory_order_relaxed) % Virtualized.Instances.size();
+    const auto& Compiled = Virtualized.Instances[Instance];
     if (GVmBridgeTrace.Enabled) {
         const std::lock_guard Lock(GVmBridgeTrace.Mutex);
-        if (!GVmBridgeTrace.Seen[Index]) {
-            GVmBridgeTrace.Seen[Index] = 1;
-            GVmBridgeTrace.Log << "VM2 bridge invoked index=" << Index << "\n";
+        const auto Bit = static_cast<std::uint16_t>(1U << Instance);
+        if (!(GVmBridgeTrace.Seen[Index] & Bit)) {
+            GVmBridgeTrace.Seen[Index] |= Bit;
+            GVmBridgeTrace.Log << "VM2 bridge invoked index=" << Index << " instance=" << Instance
+                              << " instances=" << Virtualized.Instances.size() << "\n";
             GVmBridgeTrace.Log.flush();
         }
     }
-    const auto& Virtualized = GVirtualizedPrograms[static_cast<std::size_t>(Index)];
     auto& Context = *State;
     const auto NativeSp = Context.Registers[4];
     const auto* Tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
@@ -772,7 +848,7 @@ extern "C" void VirtualizedFunctionBridge(vmprotect::VmBridgeContext* State,
         Context.Registers[4]=NativeSp+(Virtualized.ResumeAddress?8:0);
         vmprotect::RunConfig Config;
         Config.NativeMemory=true; Config.NativeContext=&Context; Config.ImageBase=GVmImageBase;
-        vmprotect::InvokeCompiledProgram(Virtualized.Compiled,Context,false,Config);
+        vmprotect::InvokeCompiledProgram(Compiled,Context,false,Config);
         Context.Registers[4]=NativeSp;
         return;
     }
@@ -790,7 +866,7 @@ extern "C" void VirtualizedFunctionBridge(vmprotect::VmBridgeContext* State,
     Config.NativeContext = &Context;
     Config.StackLower = Lower;
     Config.StackUpper = Lower + VmStackLease::Size;
-    vmprotect::InvokeCompiledProgram(Virtualized.Compiled, Context, false, Config);
+    vmprotect::InvokeCompiledProgram(Compiled, Context, false, Config);
     Context.Registers[4] = NativeSp;
 }
 
@@ -812,7 +888,7 @@ void LoadVmp3(std::span<const std::uint8_t> Data, std::string_view BuildSecret,
             using O=vmprotect::LiftedOp;
             return I.Op==O::Push || I.Op==O::Pop || I.Op==O::Call || I.Op==O::NativeCall || I.Dst==4 || I.Src==4;
         });
-        Virtualized.Compiled = vmprotect::CompileLiftedProgram(Function.Program, Function.Seed);
+        Virtualized.Instances = vmprotect::CompileProgramInstances(Function.Program, Function.Seed, Function.Options);
         Programs.push_back(std::move(Virtualized));
     }
     // Publish only after every function has passed decoding and compilation.
@@ -1400,7 +1476,7 @@ private:
     if (Image.size() < sizeof(WrapperFooter)) throw std::runtime_error(PEVM_TEXT("wrapper footer missing"));
     WrapperFooter Footer{};
     std::memcpy(&Footer, Image.data() + Image.size() - sizeof(Footer), sizeof(Footer));
-    if (Footer.Magic != KWrapperMagic || Footer.Version != 2) throw std::runtime_error(PEVM_TEXT("unsupported wrapper version"));
+    if (Footer.Magic != KWrapperMagic || (Footer.Version != 2 && Footer.Version != 3)) throw std::runtime_error(PEVM_TEXT("unsupported wrapper version"));
     const auto TrailerSize = static_cast<std::uint64_t>(sizeof(Footer)) + Footer.SecretSize;
     if (TrailerSize > Image.size()) throw std::runtime_error(PEVM_TEXT("invalid wrapper sizes"));
     const auto PayloadOffset = static_cast<std::size_t>(Footer.PayloadOffset);
@@ -1408,9 +1484,21 @@ private:
     if (Footer.PayloadOffset > Image.size() || Footer.PayloadSize > Image.size() - PayloadOffset ||
         Footer.StubSize != SecretOffset) throw std::runtime_error(PEVM_TEXT("invalid wrapper payload location"));
     const auto Metadata = ValidateProtectionMetadata(Image, Footer);
-    if (Metadata.License.Required != 0) pevm::activation::EnsureLicense(Metadata.License, WrapperPath,
-        HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_NO_DIALOG").c_str()) == 0);
-    auto Password = RecoverBuildSecret(Image, Footer, PayloadOffset, SecretOffset);
+    if ((Footer.Version == 3) != (Metadata.License.Required == 2)) throw std::runtime_error("wrapper license encryption policy mismatch");
+    std::string LicenseText;
+    if (Metadata.License.Required != 0) {
+        LicenseText = pevm::activation::EnsureLicense(Metadata.License, WrapperPath,
+            HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_NO_DIALOG").c_str()) == 0);
+        pevm::activation::InitializeLicenseSession(Metadata.License, LicenseText);
+        pevm::activation::RevalidateLicenseSession(true);
+    }
+    auto Password = RecoverBuildSecret(Image, Footer, PayloadOffset, SecretOffset, Metadata.License, LicenseText);
+    // For licensed v3 wrappers, RecoverBuildSecret has authenticated this disk
+    // image with AES-GCM. Never establish the baseline by trusting current RAM.
+    InitializeRuntimeCode(std::span(Image).first(static_cast<std::size_t>(Footer.StubSize)));
+    RevalidateRuntimeCode(true);
+    if (!LicenseText.empty()) SecureZeroMemory(LicenseText.data(), LicenseText.size());
+    LicenseText.clear();
 
     const auto WrapperDirectory = WrapperPath.parent_path();
     SetDllDirectoryW(WrapperDirectory.c_str());
@@ -1420,6 +1508,8 @@ private:
                                                           static_cast<std::size_t>(Footer.PayloadSize)),
                                  Password);
     MappedImage Payload(Plain);
+    RevalidateRuntimeCode(true);
+    pevm::activation::RevalidateLicenseSession(true);
     if (UnpackClock.Milliseconds() > KUnpackBudgetMs) IntegrityFailure();
     // Re-run the cheap debugger checks now that the payload exists: a
     // debugger that attached (or a race) during unpacking is still caught.
@@ -1461,6 +1551,9 @@ private:
     // Test-only residency hook: lets a debugger attach and inspect the
     // at-rest (sealed) state of the mapped payload before the entry runs.
     if (HideGetEnv(PEVM_WTEXT(L"PEVM_TEST_HOLD").c_str()) != 0) Sleep(20000);
+    RevalidateRuntimeCode(true);
+    pevm::activation::RevalidateLicenseSession(true);
+    CheckAnalysisEnvironment(true);
     Payload.RunEntryPoint();
 }
 
